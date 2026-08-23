@@ -1,0 +1,19 @@
+{
+  "result": "PASS",
+  "injected_exit_code": 1,
+  "service_state": "Running",
+  "service_path": "\"C:\\Program Files\\WinSched\\winsched-service.exe\" service --config \\\\?\\C:\\ProgramData\\WinSched\\winsched.toml",
+  "service_sha256": "6993e8627c5290f3a85ed2620b413b862118b567b1a4a5860524e1b5ef749adf",
+  "config_sha256": "d6e02f4aecfca8cbc36bb4df52d6f6a0dc17a4001472378dbc30cbc4d67c4926",
+  "restored_fields": [
+    "path_name",
+    "start_mode",
+    "start_name",
+    "display_name",
+    "state",
+    "description",
+    "failure_actions",
+    "failure_flag",
+    "sddl"
+  ]
+}

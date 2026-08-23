@@ -1,0 +1,14 @@
+{
+  "result": "PASS",
+  "scenario": "Preserve",
+  "setup_sha256": "a63dbad5bfe9bdd36cf03d613ef509f92a26d21f6081bf16bc3352300d9e1367",
+  "setup_exit_code": 0,
+  "uninstall_exit_code": 0,
+  "service_removed": true,
+  "program_files_removed": true,
+  "shortcuts_removed": true,
+  "data_preserved": true,
+  "data_purged": false,
+  "config_sha256_before": "d217cbde9db866318af58e254135b1816bc699bcb055d3c93e9e05ce77df225b",
+  "config_sha256_after": "d217cbde9db866318af58e254135b1816bc699bcb055d3c93e9e05ce77df225b"
+}

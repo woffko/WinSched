@@ -1,0 +1,17 @@
+{
+  "result": "PASS",
+  "setup_sha256": "a63dbad5bfe9bdd36cf03d613ef509f92a26d21f6081bf16bc3352300d9e1367",
+  "setup_exit_code": 0,
+  "config_sha256_before": "d6e02f4aecfca8cbc36bb4df52d6f6a0dc17a4001472378dbc30cbc4d67c4926",
+  "config_sha256_after": "d6e02f4aecfca8cbc36bb4df52d6f6a0dc17a4001472378dbc30cbc4d67c4926",
+  "config_byte_identical": true,
+  "marker": "# gui-upgrade-preserve-marker-5e7579bf220a46ffb7b55906d2d07e9e",
+  "service_state": "Running",
+  "service_path": "\"C:\\Program Files\\WinSched\\winsched-service.exe\" service --config \\\\?\\C:\\ProgramData\\WinSched\\winsched.toml",
+  "installed_sha256": {
+    "winsched.exe": "d6939b899eeab02198cbd3a6aaccbf1981c485fd9fdf5714e30f18782512bc65",
+    "winsched-service.exe": "6993e8627c5290f3a85ed2620b413b862118b567b1a4a5860524e1b5ef749adf",
+    "winsched-tray.exe": "7536299e76c8594d6736ff6d686e1f3cfd5d396cb3491b7c7014c3408eac6e2a",
+    "winsched-settings.exe": "3609b2e1fe5e83d4b2cd6882313573e99dc621dae2cd05463e23e8a3712e90ad"
+  }
+}

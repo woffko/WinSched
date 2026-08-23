@@ -1,0 +1,7 @@
+/target/
+/dist/
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe

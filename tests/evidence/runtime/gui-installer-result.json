@@ -1,0 +1,25 @@
+{
+  "result": "PASS",
+  "setup_sha256": "a63dbad5bfe9bdd36cf03d613ef509f92a26d21f6081bf16bc3352300d9e1367",
+  "setup_exit_code": null,
+  "service_state": "Running",
+  "service_path": "\"C:\\Program Files\\WinSched\\winsched-service.exe\" service --config \\\\?\\C:\\ProgramData\\WinSched\\winsched.toml",
+  "config_marker_preserved": false,
+  "startup_shortcut": true,
+  "desktop_shortcut": false,
+  "settings_shortcut": true,
+  "launch_option_present": true,
+  "installed_sha256": {
+    "winsched": "d6939b899eeab02198cbd3a6aaccbf1981c485fd9fdf5714e30f18782512bc65",
+    "service": "6993e8627c5290f3a85ed2620b413b862118b567b1a4a5860524e1b5ef749adf",
+    "tray": "7536299e76c8594d6736ff6d686e1f3cfd5d396cb3491b7c7014c3408eac6e2a",
+    "settings": "3609b2e1fe5e83d4b2cd6882313573e99dc621dae2cd05463e23e8a3712e90ad"
+  },
+  "screenshots": [
+    "installer-welcome.png",
+    "installer-license.png",
+    "installer-tasks.png",
+    "installer-ready.png",
+    "installer-finish.png"
+  ]
+}

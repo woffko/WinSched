@@ -1,0 +1,45 @@
+{
+  "result": "PASS",
+  "cleanup_completed": true,
+  "session_id": 1,
+  "settings_pid": 9284,
+  "second_launch_pid": 3716,
+  "second_launch_exit_code": 0,
+  "single_instance_notice_dismissed": true,
+  "single_instance_verified": true,
+  "languages": [
+    "EN",
+    "RU"
+  ],
+  "pages": [
+    "General",
+    "Adaptive",
+    "Process rules"
+  ],
+  "controls": [
+    "Tray autostart",
+    "Restore defaults...",
+    "Confirm restore defaults",
+    "Apply",
+    "Reload from disk",
+    "Close"
+  ],
+  "controller_defaults_applied": true,
+  "service_reload_observed": true,
+  "original_config_sha256": "d217cbde9db866318af58e254135b1816bc699bcb055d3c93e9e05ce77df225b",
+  "screenshots": [
+    "settings-general-en.png",
+    "settings-adaptive-en.png",
+    "settings-process-rules-en.png",
+    "settings-general-ru.png",
+    "settings-adaptive-ru.png",
+    "settings-process-rules-ru.png",
+    "settings-restore-confirmation-en.png",
+    "settings-defaults-applied-en.png"
+  ],
+  "accesskit_note": "UI Automation names and action patterns were resolved through egui/eframe AccessKit.",
+  "phase": "complete",
+  "original_config_restored": true,
+  "restored_config_sha256": "d217cbde9db866318af58e254135b1816bc699bcb055d3c93e9e05ce77df225b",
+  "cleanup_errors": []
+}

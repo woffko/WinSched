@@ -1,0 +1,67 @@
+final stage: service and adaptive acceptance
+installed WinSched
+WinSched installed in C:\ProgramData\WinSched
+Service: Automatic; tray autostart: True
+Configuration: C:\ProgramData\WinSched\winsched.toml
+acceptance stage: Session 0 exclusions
+acceptance stage: interactive CPU burner
+acceptance stage: adaptive LLC move
+{
+    "result":  "PASS",
+    "windows_version":  "Microsoft Windows NT 10.0.26340.0",
+    "package":  "payload",
+    "service_pid_after_recovery":  11884,
+    "llc_domains":  2,
+    "install_directory":  "C:\\ProgramData\\WinSched"
+}
+final stage: lifecycle acceptance
+lifecycle stage: upgrade preserves implicit configuration
+installed WinSched
+WinSched installed in C:\ProgramData\WinSched
+Service: Automatic; tray autostart: True
+Configuration: C:\ProgramData\WinSched\winsched.toml
+lifecycle stage: normal uninstall preserves data
+WinSched was removed. Configuration and logs remain in C:\ProgramData\WinSched
+lifecycle stage: purge uninstall removes data
+installed WinSched
+WinSched installed in C:\ProgramData\WinSched
+Service: Automatic; tray autostart: True
+Configuration: C:\ProgramData\WinSched\winsched.toml
+WinSched and its data were removed.
+lifecycle stage: default interactive install launches limited tray
+lifecycle stage: Startup shortcut launches tray
+{
+    "result":  "PASS",
+    "upgrade_preserved_threshold_bps":  777,
+    "normal_uninstall_preserved_data":  true,
+    "purge_removed_data":  true,
+    "default_tray_integrity_rid":  8192,
+    "startup_tray_integrity_rid":  8192,
+    "final_tray_pid":  6520
+}
+final stage: tray UI acceptance
+{
+    "result":  "PASS",
+    "session_id":  1,
+    "tray_pid":  4564,
+    "managed_processes":  3,
+    "menu_items":  [
+                       "Disable Scheduling",
+                       "Stop Service",
+                       "Mode: Auto",
+                       "Settings...",
+                       "Open Configuration (Advanced)",
+                       "Open Logs",
+                       "Refresh Status",
+                       "Exit Tray"
+                   ],
+    "screenshot":  "C:\\Users\\Public\\WinSchedFinalAcceptance\\tests\\output\\tray-menu.png",
+    "extracted_icon":  "C:\\Users\\Public\\WinSchedFinalAcceptance\\tests\\output\\embedded-icon.png"
+}
+{
+    "result":  "PASS",
+    "package":  "payload",
+    "service_adaptive":  "PASS",
+    "lifecycle":  "PASS",
+    "tray_ui":  "PASS"
+}

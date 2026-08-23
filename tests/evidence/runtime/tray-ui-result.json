@@ -1,0 +1,18 @@
+{
+  "result": "PASS",
+  "session_id": 1,
+  "tray_pid": 10084,
+  "managed_processes": 3,
+  "menu_items": [
+    "Disable Scheduling",
+    "Stop Service",
+    "Mode: Auto",
+    "Settings...",
+    "Open Configuration (Advanced)",
+    "Open Logs",
+    "Refresh Status",
+    "Exit Tray"
+  ],
+  "screenshot": "C:\\Users\\Public\\WinSchedFinalAcceptance\\output\\tray-menu.png",
+  "extracted_icon": "C:\\Users\\Public\\WinSchedFinalAcceptance\\output\\embedded-icon.png"
+}
