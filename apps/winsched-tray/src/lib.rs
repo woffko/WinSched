@@ -145,7 +145,8 @@ fn menu_text(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winsched_control::{ControllerStatus, STATUS_SCHEMA_VERSION};
+    use winsched_config::{ControllerConfig, LoggingConfig};
+    use winsched_control::{ConfigReloadResult, ControllerStatus, STATUS_SCHEMA_VERSION};
 
     fn status(enabled: bool, mode: ControllerMode) -> ControllerStatus {
         ControllerStatus {
@@ -158,6 +159,11 @@ mod tests {
             service_pid: 42,
             scheduling_enabled: enabled,
             configured_mode: mode,
+            config_reload_sequence: 0,
+            config_reload_result: ConfigReloadResult::Initial,
+            config_reload_error: None,
+            applied_config_fingerprint: ControllerConfig::default().fingerprint(),
+            applied_logging: LoggingConfig::default(),
             iteration: 7,
             managed_processes: 3,
             llc_domains: 2,

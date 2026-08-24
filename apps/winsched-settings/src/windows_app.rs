@@ -3,14 +3,17 @@ use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Color32, RichText};
-use winsched_config::{ControllerConfig, ControllerMode, ProcessRule, RuleMode};
-use winsched_control::{ControllerStatus, STATUS_SCHEMA_VERSION};
+use winsched_config::{
+    CONFIG_SCHEMA_VERSION, ControllerConfig, ControllerMode, LoggingConfig, MAX_LOG_FILE_SIZE_MIB,
+    MAX_RETAINED_LOG_ARCHIVES, MIN_LOG_FILE_SIZE_MIB, ProcessRule, RuleMode,
+};
+use winsched_control::{ConfigReloadResult, ControllerStatus, STATUS_SCHEMA_VERSION};
 use winsched_settings::{
-    ConfigReloadLogEvent, EventLogCursor, SettingsPaths, load_config, read_config_reload_event,
-    restore_defaults, save_config_atomic, set_tray_autostart, tray_autostart_enabled,
+    SettingsPaths, config_reload_wait_ms, load_config, restore_defaults, save_config_atomic,
+    set_tray_autostart, tray_autostart_enabled,
 };
 
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -133,6 +136,7 @@ enum SettingsTab {
     General,
     Adaptive,
     Rules,
+    Logging,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +144,12 @@ enum BannerKind {
     Information,
     Success,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceReloadState {
+    InSync,
+    RetryRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,10 +166,11 @@ struct Banner {
 }
 
 struct PendingReload {
-    baseline_status_ms: u64,
+    baseline: Option<(u32, u64)>,
+    not_before_unix_ms: u64,
     expected_mode: ControllerMode,
-    log_cursor: EventLogCursor,
-    observed_event: Option<ConfigReloadLogEvent>,
+    expected_config_fingerprint: u64,
+    expected_logging: LoggingConfig,
     deadline: Instant,
     next_poll: Instant,
 }
@@ -168,9 +179,8 @@ enum ReloadPollOutcome {
     Pending(Duration),
     Reloaded,
     Rejected(Option<String>),
-    LogReadFailed(String),
-    TimedOutWithoutEvent,
-    TimedOutAfterReloadEvent,
+    TimedOutWithoutReceipt,
+    TimedOutAfterMismatchedReceipt,
 }
 
 impl PendingReload {
@@ -179,52 +189,34 @@ impl PendingReload {
             return ReloadPollOutcome::Pending(self.next_poll - now);
         }
         self.next_poll = now + STATUS_POLL_INTERVAL;
-        if self.observed_event.is_none() {
-            match read_config_reload_event(&paths.log, &mut self.log_cursor) {
-                Ok(event) => self.observed_event = event,
-                Err(error) => return ReloadPollOutcome::LogReadFailed(error.to_string()),
-            }
-        }
-
         let status = read_status(&paths.status);
-        if let Some(event) = &self.observed_event {
-            let event_timestamp_ms = event.timestamp_ms().unwrap_or(0);
-            let current_status = status.as_ref().filter(|status| {
-                status.schema_version == STATUS_SCHEMA_VERSION
-                    && status.updated_at_unix_ms > self.baseline_status_ms
-                    && status.updated_at_unix_ms >= event_timestamp_ms
-            });
-            match event {
-                ConfigReloadLogEvent::Reloaded { .. }
-                    if current_status
-                        .is_some_and(|status| status.configured_mode == self.expected_mode) =>
+        let current_receipt = status.as_ref().filter(|status| {
+            status.is_reload_receipt_after(self.baseline, self.not_before_unix_ms)
+        });
+        if let Some(status) = current_receipt {
+            match status.config_reload_result {
+                ConfigReloadResult::Reloaded
+                    if status.configured_mode == self.expected_mode
+                        && status.applied_config_fingerprint
+                            == self.expected_config_fingerprint
+                        && status.applied_logging == self.expected_logging =>
                 {
                     return ReloadPollOutcome::Reloaded;
                 }
-                ConfigReloadLogEvent::Rejected { error, .. } if current_status.is_some() => {
-                    let detail = current_status
-                        .and_then(|status| status.last_error.clone())
-                        .or_else(|| error.clone());
-                    return ReloadPollOutcome::Rejected(detail);
+                ConfigReloadResult::Rejected => {
+                    return ReloadPollOutcome::Rejected(status.config_reload_error.clone());
                 }
-                _ => {}
+                ConfigReloadResult::Initial | ConfigReloadResult::Reloaded => {}
             }
         }
 
         if now < self.deadline {
             return ReloadPollOutcome::Pending(STATUS_POLL_INTERVAL);
         }
-        match &self.observed_event {
-            Some(ConfigReloadLogEvent::Rejected { error, .. }) => {
-                let detail = status
-                    .and_then(|status| status.last_error)
-                    .or_else(|| error.clone());
-                ReloadPollOutcome::Rejected(detail)
-            }
-            Some(ConfigReloadLogEvent::Reloaded { .. }) => {
-                ReloadPollOutcome::TimedOutAfterReloadEvent
-            }
-            None => ReloadPollOutcome::TimedOutWithoutEvent,
+        if current_receipt.is_some() {
+            ReloadPollOutcome::TimedOutAfterMismatchedReceipt
+        } else {
+            ReloadPollOutcome::TimedOutWithoutReceipt
         }
     }
 }
@@ -240,6 +232,7 @@ struct SettingsApp {
     confirmation: Confirmation,
     allow_close: bool,
     pending_reload: Option<PendingReload>,
+    service_reload_state: ServiceReloadState,
     language: Language,
 }
 
@@ -265,6 +258,7 @@ impl SettingsApp {
             confirmation: Confirmation::None,
             allow_close: false,
             pending_reload: None,
+            service_reload_state: ServiceReloadState::InSync,
             language,
         }
     }
@@ -345,6 +339,8 @@ impl SettingsApp {
     fn apply(&mut self) {
         let language = self.language;
         let config_changed = self.config != self.persisted;
+        let config_write_required =
+            config_changed || self.service_reload_state == ServiceReloadState::RetryRequired;
         let autostart_changed = self.tray_autostart != self.persisted_tray_autostart;
         if let Err(error) = self.config.clone().validate() {
             self.set_banner(
@@ -377,7 +373,7 @@ impl SettingsApp {
             return;
         }
 
-        if !config_changed {
+        if !config_write_required {
             self.persisted_tray_autostart = self.tray_autostart;
             self.confirmation = Confirmation::None;
             self.pending_reload = None;
@@ -398,23 +394,23 @@ impl SettingsApp {
             return;
         }
 
-        let log_cursor = match EventLogCursor::capture(&self.paths.log) {
-            Ok(cursor) => cursor,
-            Err(error) => {
-                self.report_config_save_failure(&error, autostart_changed);
-                return;
-            }
-        };
-        let baseline_status = read_status(&self.paths.status);
-        let baseline_status_ms = baseline_status
+        let baseline_status = read_status(&self.paths.status)
+            .filter(|status| status.schema_version == STATUS_SCHEMA_VERSION);
+        let baseline = baseline_status
             .as_ref()
-            .map_or(0, |status| status.updated_at_unix_ms);
+            .map(|status| (status.service_pid, status.config_reload_sequence));
+        let not_before_unix_ms = unix_time_ms();
+        let reload_wait_ms = config_reload_wait_ms(
+            self.persisted.sample_interval_ms,
+            self.config.sample_interval_ms,
+        );
         match save_config_atomic(&self.paths.config, &self.config) {
             Ok(validated) => {
                 self.config.clone_from(&validated);
                 self.persisted = validated;
                 self.persisted_tray_autostart = self.tray_autostart;
                 self.confirmation = Confirmation::None;
+                self.service_reload_state = ServiceReloadState::InSync;
                 self.set_banner(
                     BannerKind::Information,
                     if autostart_changed {
@@ -430,14 +426,12 @@ impl SettingsApp {
                     },
                 );
                 self.pending_reload = Some(PendingReload {
-                    baseline_status_ms,
+                    baseline,
+                    not_before_unix_ms,
                     expected_mode: self.config.controller_mode,
-                    log_cursor,
-                    observed_event: None,
-                    deadline: Instant::now()
-                        + Duration::from_millis(
-                            self.config.sample_interval_ms.saturating_add(5_000),
-                        ),
+                    expected_config_fingerprint: self.config.fingerprint(),
+                    expected_logging: self.config.logging,
+                    deadline: Instant::now() + Duration::from_millis(reload_wait_ms),
                     next_poll: Instant::now(),
                 });
             }
@@ -454,6 +448,7 @@ impl SettingsApp {
             ReloadPollOutcome::Pending(delay) => context.request_repaint_after(delay),
             ReloadPollOutcome::Reloaded => {
                 self.pending_reload = None;
+                self.service_reload_state = ServiceReloadState::InSync;
                 self.set_banner(
                     BannerKind::Success,
                     language.text(
@@ -464,6 +459,7 @@ impl SettingsApp {
             }
             ReloadPollOutcome::Rejected(detail) => {
                 self.pending_reload = None;
+                self.service_reload_state = ServiceReloadState::RetryRequired;
                 let detail = detail.unwrap_or_else(|| {
                     language
                         .text(
@@ -483,36 +479,25 @@ impl SettingsApp {
                     ),
                 );
             }
-            ReloadPollOutcome::LogReadFailed(error) => {
+            ReloadPollOutcome::TimedOutWithoutReceipt => {
                 self.pending_reload = None;
-                self.set_banner(
-                    BannerKind::Error,
-                    format!(
-                        "{}: {error}",
-                        language.text(
-                            "Configuration was saved, but the durable service confirmation log could not be read",
-                            "Конфигурация сохранена, но не удалось прочитать журнал подтверждения службы"
-                        )
-                    ),
-                );
-            }
-            ReloadPollOutcome::TimedOutWithoutEvent => {
-                self.pending_reload = None;
+                self.service_reload_state = ServiceReloadState::RetryRequired;
                 self.set_banner(
                     BannerKind::Information,
                     language.text(
-                        "Configuration was saved, but the service did not log a reload within the expected interval. Check that the WinSched service is running.",
-                        "Конфигурация сохранена, но служба не записала событие загрузки за ожидаемое время. Проверьте, что служба WinSched запущена.",
+                        "Configuration was saved, but the service did not publish a newer reload receipt within the expected interval. Check that the WinSched service is running.",
+                        "Конфигурация сохранена, но служба не опубликовала новое подтверждение загрузки за ожидаемое время. Проверьте, что служба WinSched запущена.",
                     ),
                 );
             }
-            ReloadPollOutcome::TimedOutAfterReloadEvent => {
+            ReloadPollOutcome::TimedOutAfterMismatchedReceipt => {
                 self.pending_reload = None;
+                self.service_reload_state = ServiceReloadState::RetryRequired;
                 self.set_banner(
                     BannerKind::Information,
                     language.text(
-                        "The service logged a configuration reload, but status.json did not confirm the expected mode within the expected interval.",
-                        "Служба записала событие загрузки конфигурации, но status.json не подтвердил ожидаемый режим за отведённое время.",
+                        "The service published a newer reload receipt, but it did not match the complete saved configuration.",
+                        "Служба опубликовала новое подтверждение загрузки, но оно не соответствует всей сохранённой конфигурации.",
                     ),
                 );
             }
@@ -527,6 +512,12 @@ impl SettingsApp {
             let state = if self.is_dirty() {
                 RichText::new(language.text("Unsaved changes", "Есть несохранённые изменения"))
                     .color(Color32::from_rgb(210, 145, 30))
+            } else if self.service_reload_state == ServiceReloadState::RetryRequired {
+                RichText::new(language.text(
+                    "Saved; Apply to retry service",
+                    "Сохранено; нажмите «Применить» для повтора",
+                ))
+                .color(Color32::from_rgb(210, 145, 30))
             } else {
                 RichText::new(language.text("Saved", "Сохранено"))
                     .color(Color32::from_rgb(45, 160, 85))
@@ -554,6 +545,11 @@ impl SettingsApp {
                 &mut self.tab,
                 SettingsTab::Rules,
                 language.text("Process rules", "Правила процессов"),
+            );
+            ui.selectable_value(
+                &mut self.tab,
+                SettingsTab::Logging,
+                language.text("Logging", "Журнал"),
             );
         });
         ui.separator();
@@ -735,6 +731,85 @@ impl SettingsApp {
                 "Ограничение числа изменений размещения за одну оценку.",
             ),
         );
+    }
+
+    fn logging_tab(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.heading(language.text("Diagnostic logging", "Диагностический журнал"));
+        ui.label(language.text(
+            "Control how much service diagnostic history is kept on this computer.",
+            "Настройте объём истории диагностики службы, сохраняемой на этом компьютере.",
+        ));
+        ui.add_space(8.0);
+        ui.checkbox(
+            &mut self.config.logging.enabled,
+            language.text(
+                "Enable detailed service logging",
+                "Включить подробный журнал службы",
+            ),
+        );
+        ui.label(language.text(
+            "Diagnostic events are written as JSON lines to:",
+            "Диагностические события записываются строками JSON в:",
+        ));
+        ui.monospace(self.paths.log.display().to_string());
+        ui.add_space(8.0);
+
+        if !self.config.logging.enabled {
+            ui.group(|ui| {
+                ui.label(language.text(
+                    "Detailed logging is off. Existing log and archive files are preserved, and no new diagnostic events are written.",
+                    "Подробный журнал выключен. Существующие файлы журнала и архивы сохраняются, новые диагностические события не записываются.",
+                ));
+            });
+            ui.add_space(8.0);
+        }
+
+        logging_value_u16(
+            ui,
+            language.text(
+                "Maximum active log size (MiB)",
+                "Максимальный размер активного журнала (МиБ)",
+            ),
+            &mut self.config.logging.max_file_size_mib,
+            self.config.logging.enabled,
+            language.text(
+                "The active log is rotated before a new diagnostic record would exceed this size.",
+                "Активный журнал ротируется до записи диагностического события, которое превысило бы этот размер.",
+            ),
+            language.text(" MiB", " МиБ"),
+        );
+        logging_value_u8(
+            ui,
+            language.text(
+                "Retained circular archives",
+                "Сохраняемые циклические архивы",
+            ),
+            &mut self.config.logging.retained_archives,
+            self.config.logging.enabled,
+            language.text(
+                "0 reuses the active file without archives. Otherwise winsched.log.1 is newest and the oldest retained archive is removed.",
+                "0 означает повторное использование активного файла без архивов. В остальных случаях winsched.log.1 — самый новый архив, а самый старый сохраняемый архив удаляется.",
+            ),
+        );
+
+        let file_count = u64::from(self.config.logging.retained_archives) + 1;
+        let estimated_mib = u64::from(self.config.logging.max_file_size_mib) * file_count;
+        ui.label(match language {
+            Language::English => format!(
+                "Estimated maximum log storage: {estimated_mib} MiB ({} MiB per file, {file_count} files).",
+                self.config.logging.max_file_size_mib
+            ),
+            Language::Russian => format!(
+                "Расчётный максимальный объём журнала: {estimated_mib} МиБ (размер файла {} МиБ, файлов: {file_count}).",
+                self.config.logging.max_file_size_mib
+            ),
+        });
+        ui.add_space(8.0);
+        ui.label(language.text(
+            "Critical startup failures may still be written to the separate winsched-emergency.log file.",
+            "Критические ошибки запуска могут по-прежнему записываться в отдельный файл winsched-emergency.log.",
+        ));
     }
 
     fn rules_tab(&mut self, ui: &mut egui::Ui) {
@@ -985,7 +1060,9 @@ impl SettingsApp {
                 }
                 if ui
                     .add_enabled(
-                        self.is_dirty() && self.pending_reload.is_none(),
+                        (self.is_dirty()
+                            || self.service_reload_state == ServiceReloadState::RetryRequired)
+                            && self.pending_reload.is_none(),
                         egui::Button::new(language.text("Apply", "Применить")),
                     )
                     .clicked()
@@ -995,6 +1072,14 @@ impl SettingsApp {
             });
         });
     }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 impl eframe::App for SettingsApp {
@@ -1024,6 +1109,7 @@ impl eframe::App for SettingsApp {
                         SettingsTab::General => self.general_tab(ui),
                         SettingsTab::Adaptive => self.adaptive_tab(ui),
                         SettingsTab::Rules => self.rules_tab(ui),
+                        SettingsTab::Logging => self.logging_tab(ui),
                     });
             });
         });
@@ -1039,10 +1125,14 @@ fn general_values(ui: &mut egui::Ui, config: &mut ControllerConfig, language: La
                 .label(language.text("Configuration schema version", "Версия схемы конфигурации"));
             ui.add_enabled(false, egui::DragValue::new(&mut config.schema_version))
                 .labelled_by(schema_label.id)
-                .on_hover_text(language.text(
-                    "The service currently supports schema version 1.",
-                    "Служба сейчас поддерживает схему версии 1.",
-                ));
+                .on_hover_text(match language {
+                    Language::English => format!(
+                        "The service currently supports schema version {CONFIG_SCHEMA_VERSION}."
+                    ),
+                    Language::Russian => {
+                        format!("Служба сейчас поддерживает схему версии {CONFIG_SCHEMA_VERSION}.")
+                    }
+                });
             ui.end_row();
 
             let sample_label = ui.label(language.text(
@@ -1267,6 +1357,53 @@ fn policy_value_u64(ui: &mut egui::Ui, label: &str, value: &mut u64, explanation
         ui.add_space(4.0);
         ui.add_sized([180.0, 24.0], egui::DragValue::new(value).speed(100))
             .labelled_by(response.id);
+    });
+    ui.add_space(6.0);
+}
+
+fn logging_value_u16(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u16,
+    enabled: bool,
+    explanation: &str,
+    suffix: &str,
+) {
+    let row_width = (ui.available_width() - 16.0).max(240.0);
+    ui.group(|ui| {
+        ui.set_width(row_width);
+        let response = ui.label(RichText::new(label).strong());
+        ui.label(explanation);
+        ui.add_space(4.0);
+        ui.add_enabled(
+            enabled,
+            egui::DragValue::new(value)
+                .range(MIN_LOG_FILE_SIZE_MIB..=MAX_LOG_FILE_SIZE_MIB)
+                .suffix(suffix),
+        )
+        .labelled_by(response.id);
+    });
+    ui.add_space(6.0);
+}
+
+fn logging_value_u8(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u8,
+    enabled: bool,
+    explanation: &str,
+) {
+    let row_width = (ui.available_width() - 16.0).max(240.0);
+    ui.group(|ui| {
+        ui.set_width(row_width);
+        let response = ui.label(RichText::new(label).strong());
+        ui.label(explanation);
+        ui.add_space(4.0);
+        ui.add_enabled(
+            enabled,
+            egui::DragValue::new(value).range(0..=MAX_RETAINED_LOG_ARCHIVES),
+        )
+        .labelled_by(response.id);
     });
     ui.add_space(6.0);
 }

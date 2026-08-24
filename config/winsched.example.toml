@@ -1,9 +1,14 @@
-schema_version = 1
+schema_version = 2
 controller_mode = "observe"
 sample_interval_ms = 1000
 minimum_process_utilization_bps = 500
 all_user_processes = false
 default_rule_mode = "auto"
+
+[logging]
+enabled = true
+max_file_size_mib = 10
+retained_archives = 1
 
 [policy]
 overload_threshold_bps = 8500

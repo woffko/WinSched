@@ -33,6 +33,12 @@ $script:ui = @{
     RuRules = Expand-UnicodeEscapes "\u041f\u0440\u0430\u0432\u0438\u043b\u0430 \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u043e\u0432"
     RuAddRule = Expand-UnicodeEscapes "\u0414\u043e\u0431\u0430\u0432\u0438\u0442\u044c \u043f\u0440\u0430\u0432\u0438\u043b\u043e \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u0430"
     RuNoRules = Expand-UnicodeEscapes "\u042f\u0432\u043d\u044b\u0435 \u043f\u0440\u0430\u0432\u0438\u043b\u0430 \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u043e\u0432 \u043d\u0435 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d\u044b."
+    RuLogging = Expand-UnicodeEscapes "\u0416\u0443\u0440\u043d\u0430\u043b"
+    RuLoggingHeading = Expand-UnicodeEscapes "\u0414\u0438\u0430\u0433\u043d\u043e\u0441\u0442\u0438\u0447\u0435\u0441\u043a\u0438\u0439 \u0436\u0443\u0440\u043d\u0430\u043b"
+    RuLoggingEnabled = Expand-UnicodeEscapes "\u0412\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043f\u043e\u0434\u0440\u043e\u0431\u043d\u044b\u0439 \u0436\u0443\u0440\u043d\u0430\u043b \u0441\u043b\u0443\u0436\u0431\u044b"
+    RuLogSize = Expand-UnicodeEscapes "\u041c\u0430\u043a\u0441\u0438\u043c\u0430\u043b\u044c\u043d\u044b\u0439 \u0440\u0430\u0437\u043c\u0435\u0440 \u0430\u043a\u0442\u0438\u0432\u043d\u043e\u0433\u043e \u0436\u0443\u0440\u043d\u0430\u043b\u0430 (\u041c\u0438\u0411)"
+    RuLogArchives = Expand-UnicodeEscapes "\u0421\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u043c\u044b\u0435 \u0446\u0438\u043a\u043b\u0438\u0447\u0435\u0441\u043a\u0438\u0435 \u0430\u0440\u0445\u0438\u0432\u044b"
+    RuLoggingOff = Expand-UnicodeEscapes "\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u044b\u0439 \u0436\u0443\u0440\u043d\u0430\u043b \u0432\u044b\u043a\u043b\u044e\u0447\u0435\u043d. \u0421\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u044e\u0449\u0438\u0435 \u0444\u0430\u0439\u043b\u044b \u0436\u0443\u0440\u043d\u0430\u043b\u0430 \u0438 \u0430\u0440\u0445\u0438\u0432\u044b \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u044e\u0442\u0441\u044f, \u043d\u043e\u0432\u044b\u0435 \u0434\u0438\u0430\u0433\u043d\u043e\u0441\u0442\u0438\u0447\u0435\u0441\u043a\u0438\u0435 \u0441\u043e\u0431\u044b\u0442\u0438\u044f \u043d\u0435 \u0437\u0430\u043f\u0438\u0441\u044b\u0432\u0430\u044e\u0442\u0441\u044f."
 }
 
 function Assert-True([bool]$Condition, [string]$Message) {
@@ -73,12 +79,12 @@ function Read-ServiceStatus {
     }
 }
 
-function Get-StatusTimestamp {
+function Get-StatusSequence {
     $status = Read-ServiceStatus
     if ($null -eq $status) {
         return [uint64]0
     }
-    return [uint64]$status.updated_at_unix_ms
+    return [uint64]$status.config_reload_sequence
 }
 
 function Set-FileAtomically([string]$Path, [byte[]]$Bytes) {
@@ -105,68 +111,45 @@ function Set-Utf8FileAtomically([string]$Path, [string]$Text) {
 }
 
 function Wait-ServiceReload(
-    [uint64]$AfterTimestamp,
-    [int64]$AfterLogLength,
+    [uint64]$AfterSequence,
     [string]$ExpectedMode,
+    [bool]$ExpectedLoggingEnabled,
+    [int]$ExpectedLogSizeMiB,
+    [int]$ExpectedLogArchives,
     [string]$Description,
     [int]$TimeoutSeconds = 20
 ) {
     Wait-Condition $Description {
         $status = Read-ServiceStatus
-        $logTail = Read-FileTail $script:logPath $AfterLogLength
         $null -ne $status -and
-            [uint64]$status.updated_at_unix_ms -gt $AfterTimestamp -and
+            [int]$status.schema_version -eq 2 -and
+            [uint64]$status.config_reload_sequence -gt $AfterSequence -and
+            $status.config_reload_result -eq "reloaded" -and
             $status.configured_mode -eq $ExpectedMode -and
-            $status.last_activity -ne "Configuration rejected; fail-closed" -and
-            $logTail.Contains('"event":"config_reloaded"')
+            [bool]$status.applied_logging.enabled -eq $ExpectedLoggingEnabled -and
+            [int]$status.applied_logging.max_file_size_mib -eq $ExpectedLogSizeMiB -and
+            [int]$status.applied_logging.retained_archives -eq $ExpectedLogArchives
     } $TimeoutSeconds
 }
 
-function Get-FileLength([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return [int64]0
-    }
-    return [int64](Get-Item -LiteralPath $Path).Length
-}
-
-function Read-FileTail([string]$Path, [int64]$Offset) {
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return ""
-    }
-    $stream = [System.IO.File]::Open(
-        $Path,
-        [System.IO.FileMode]::Open,
-        [System.IO.FileAccess]::Read,
-        ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
-    )
-    try {
-        if ($stream.Length -lt $Offset) {
-            return ""
-        }
-        [void]$stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
-        $remaining = [int]($stream.Length - $Offset)
-        $bytes = New-Object byte[] $remaining
-        $read = $stream.Read($bytes, 0, $remaining)
-        return [System.Text.Encoding]::UTF8.GetString($bytes, 0, $read)
-    } finally {
-        $stream.Dispose()
-    }
-}
-
 function Wait-RestoreReload(
-    [uint64]$AfterTimestamp,
-    [int64]$AfterLogLength,
+    [uint64]$AfterSequence,
     [string]$ExpectedMode,
+    [bool]$ExpectedLoggingEnabled,
+    [int]$ExpectedLogSizeMiB,
+    [int]$ExpectedLogArchives,
     [int]$TimeoutSeconds = 25
 ) {
     Wait-Condition "service reload after restoring original configuration" {
         $status = Read-ServiceStatus
-        $logTail = Read-FileTail $script:logPath $AfterLogLength
         $null -ne $status -and
-            [uint64]$status.updated_at_unix_ms -gt $AfterTimestamp -and
+            [int]$status.schema_version -eq 2 -and
+            [uint64]$status.config_reload_sequence -gt $AfterSequence -and
+            $status.config_reload_result -eq "reloaded" -and
             $status.configured_mode -eq $ExpectedMode -and
-            $status.last_activity -ne "Configuration rejected; fail-closed" -and
-            $logTail.Contains('"event":"config_reloaded"')
+            [bool]$status.applied_logging.enabled -eq $ExpectedLoggingEnabled -and
+            [int]$status.applied_logging.max_file_size_mib -eq $ExpectedLogSizeMiB -and
+            [int]$status.applied_logging.retained_archives -eq $ExpectedLogArchives
     } $TimeoutSeconds
 }
 
@@ -362,6 +345,104 @@ function Invoke-AccessibleElement($Element) {
     throw "Accessible element '$($Element.Current.Name)' exposes no supported action pattern"
 }
 
+function Get-ToggleState($Element) {
+    $pattern = $null
+    if ($Element.TryGetCurrentPattern(
+        [System.Windows.Automation.TogglePattern]::Pattern,
+        [ref]$pattern
+    )) {
+        return $pattern.Current.ToggleState.ToString()
+    }
+    throw "Accessible element '$($Element.Current.Name)' exposes no TogglePattern"
+}
+
+function Set-NamedToggleState(
+    $Root,
+    [string[]]$Names,
+    [ValidateSet("On", "Off")]
+    [string]$ExpectedState
+) {
+    $element = Wait-AccessibleElement $Root $Names $true
+    if ((Get-ToggleState $element) -ne $ExpectedState) {
+        Invoke-AccessibleElement $element
+    }
+    Wait-Condition ("toggle '{0}' state $ExpectedState" -f ($Names -join "' or '")) {
+        $current = Find-AccessibleElement $Root $Names $true
+        $null -ne $current -and (Get-ToggleState $current) -eq $ExpectedState
+    }
+}
+
+function Find-NamedNumericControl($Root, [string[]]$Names) {
+    foreach ($element in @(Get-NamedAccessibleElements $Root $Names)) {
+        $pattern = $null
+        try {
+            if ($element.TryGetCurrentPattern(
+                [System.Windows.Automation.RangeValuePattern]::Pattern,
+                [ref]$pattern
+            )) {
+                return $element
+            }
+            $pattern = $null
+            if ($element.TryGetCurrentPattern(
+                [System.Windows.Automation.ValuePattern]::Pattern,
+                [ref]$pattern
+            )) {
+                return $element
+            }
+        } catch {
+            continue
+        }
+    }
+    return $null
+}
+
+function Get-NumericControlValue($Element) {
+    $pattern = $null
+    if ($Element.TryGetCurrentPattern(
+        [System.Windows.Automation.RangeValuePattern]::Pattern,
+        [ref]$pattern
+    )) {
+        return [double]$pattern.Current.Value
+    }
+    $pattern = $null
+    if ($Element.TryGetCurrentPattern(
+        [System.Windows.Automation.ValuePattern]::Pattern,
+        [ref]$pattern
+    )) {
+        $match = [regex]::Match($pattern.Current.Value, '-?\d+(?:[\.,]\d+)?')
+        if ($match.Success) {
+            return [double]::Parse(
+                $match.Value.Replace(',', '.'),
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+    }
+    throw "Accessible element '$($Element.Current.Name)' exposes no numeric value"
+}
+
+function Assert-NumericControl(
+    $Root,
+    [string[]]$Names,
+    [bool]$ExpectedEnabled,
+    [double]$ExpectedValue
+) {
+    $script:numericControlCandidate = $null
+    Wait-Condition ("numeric control '{0}'" -f ($Names -join "' or '")) {
+        $candidate = Find-NamedNumericControl $Root $Names
+        if ($null -ne $candidate) {
+            $script:numericControlCandidate = $candidate
+            return $true
+        }
+        return $false
+    }
+    $control = $script:numericControlCandidate
+    Assert-True ([bool]$control.Current.IsEnabled -eq $ExpectedEnabled) `
+        "Numeric control '$($control.Current.Name)' enabled state is not $ExpectedEnabled"
+    $actual = Get-NumericControlValue $control
+    Assert-True ([Math]::Abs($actual - $ExpectedValue) -lt 0.001) `
+        "Numeric control '$($control.Current.Name)' value is $actual, expected $ExpectedValue"
+}
+
 function Invoke-NamedAccessibleElement($Root, [string[]]$Names) {
     $element = Wait-AccessibleElement $Root $Names $true
     Invoke-AccessibleElement $element
@@ -407,14 +488,32 @@ function Get-ConfigScalar([string]$Text, [string]$Name) {
     return $match.Groups[1].Value.Trim().Trim('"')
 }
 
+function Get-ConfigLogging([string]$Text) {
+    if (-not [regex]::IsMatch($Text, "(?m)^\s*\[logging\]\s*$")) {
+        return [pscustomobject]@{
+            enabled = $true
+            max_file_size_mib = 10
+            retained_archives = 1
+        }
+    }
+    return [pscustomobject]@{
+        enabled = (Get-ConfigScalar $Text "enabled") -eq "true"
+        max_file_size_mib = [int](Get-ConfigScalar $Text "max_file_size_mib")
+        retained_archives = [int](Get-ConfigScalar $Text "retained_archives")
+    }
+}
+
 function Assert-ProductDefaults([string]$Text) {
     $expected = [ordered]@{
-        schema_version = "1"
+        schema_version = "2"
         controller_mode = "auto"
         sample_interval_ms = "1000"
         minimum_process_utilization_bps = "500"
         all_user_processes = "true"
         default_rule_mode = "auto"
+        enabled = "true"
+        max_file_size_mib = "10"
+        retained_archives = "1"
         overload_threshold_bps = "8500"
         minimum_improvement_bps = "2000"
         stability_samples = "3"
@@ -502,7 +601,6 @@ $script:resultPath = Join-Path $OutputDirectory "settings-ui-result.json"
 $script:settingsPath = Join-Path $InstallDirectory "winsched-settings.exe"
 $script:configPath = Join-Path $DataDirectory "winsched.toml"
 $script:statusPath = Join-Path $DataDirectory "status.json"
-$script:logPath = Join-Path $DataDirectory "winsched.log"
 $script:currentSessionId = (Get-Process -Id $PID).SessionId
 $script:marker = "settings-ui-acceptance-{0}" -f [Guid]::NewGuid().ToString("N")
 $backupPath = Join-Path $env:TEMP ("winsched-settings-ui-{0}.bak" -f [Guid]::NewGuid().ToString("N"))
@@ -534,8 +632,6 @@ try {
         "WinSched configuration is missing"
     Assert-True (Test-Path -LiteralPath $script:statusPath -PathType Leaf) `
         "WinSched status file is missing"
-    Assert-True (Test-Path -LiteralPath $script:logPath -PathType Leaf) `
-        "WinSched event log is missing"
     $service = Get-Service -Name "WinSched" -ErrorAction SilentlyContinue
     Assert-True ($null -ne $service -and $service.Status -eq "Running") `
         "WinSched service must be running"
@@ -548,12 +644,17 @@ try {
 
     $workingConfig = @"
 # External backup marker: $($script:marker)
-schema_version = 1
+schema_version = 2
 controller_mode = "observe"
 sample_interval_ms = 2500
 minimum_process_utilization_bps = 500
 all_user_processes = false
 default_rule_mode = "auto"
+
+[logging]
+enabled = false
+max_file_size_mib = 2
+retained_archives = 2
 
 [policy]
 overload_threshold_bps = 8500
@@ -563,14 +664,15 @@ minimum_residency_ms = 10000
 cooldown_ms = 30000
 max_mutations_per_evaluation = 1
 "@
-    $workingBaseline = Get-StatusTimestamp
-    $workingLogBaseline = Get-FileLength $script:logPath
+    $workingBaseline = Get-StatusSequence
     Set-Utf8FileAtomically $script:configPath $workingConfig
     $workingConfigInstalled = $true
     Wait-ServiceReload `
         $workingBaseline `
-        $workingLogBaseline `
         "observe" `
+        $false `
+        2 `
+        2 `
         "service reload of non-default acceptance configuration"
     $workingOnDisk = Get-Content -LiteralPath $script:configPath -Raw
     Assert-True ($workingOnDisk.Contains($script:marker)) `
@@ -652,7 +754,47 @@ max_mutations_per_evaluation = 1
     Capture-Window $primaryWindow $path
     [void]$screenshots.Add((Split-Path -Leaf $path))
 
+    Invoke-NamedAccessibleElement $primaryWindow @("Logging")
+    [void](Wait-AccessibleElement $primaryWindow @("Diagnostic logging") $false)
+    $loggingToggle = Wait-AccessibleElement `
+        $primaryWindow `
+        @("Enable detailed service logging") `
+        $true
+    Assert-True ((Get-ToggleState $loggingToggle) -eq "Off") `
+        "Working configuration did not load logging as disabled"
+    Assert-NumericControl `
+        $primaryWindow `
+        @("Maximum active log size (MiB)") `
+        $false `
+        2
+    Assert-NumericControl `
+        $primaryWindow `
+        @("Retained circular archives") `
+        $false `
+        2
+    [void](Wait-AccessibleElement $primaryWindow @(
+        "Detailed logging is off. Existing log and archive files are preserved, and no new diagnostic events are written."
+    ) $false)
+    $path = Join-Path $OutputDirectory "settings-logging-disabled-en.png"
+    Capture-Window $primaryWindow $path
+    [void]$screenshots.Add((Split-Path -Leaf $path))
+
     Invoke-NamedAccessibleElement $primaryWindow @($script:ui.RuLanguage)
+    [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuLogging) $true)
+    [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuLoggingHeading) $false)
+    $loggingToggle = Wait-AccessibleElement `
+        $primaryWindow `
+        @($script:ui.RuLoggingEnabled) `
+        $true
+    Assert-True ((Get-ToggleState $loggingToggle) -eq "Off") `
+        "Russian Logging tab did not preserve the disabled toggle"
+    Assert-NumericControl $primaryWindow @($script:ui.RuLogSize) $false 2
+    Assert-NumericControl $primaryWindow @($script:ui.RuLogArchives) $false 2
+    [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuLoggingOff) $false)
+    $path = Join-Path $OutputDirectory "settings-logging-disabled-ru.png"
+    Capture-Window $primaryWindow $path
+    [void]$screenshots.Add((Split-Path -Leaf $path))
+
     [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuGeneral) $true)
     Invoke-NamedAccessibleElement $primaryWindow @($script:ui.RuGeneral)
     [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuController) $false)
@@ -675,6 +817,75 @@ max_mutations_per_evaluation = 1
     [void]$screenshots.Add((Split-Path -Leaf $path))
 
     Invoke-NamedAccessibleElement $primaryWindow @("EN")
+    [void](Wait-AccessibleElement $primaryWindow @("Logging") $true)
+    Invoke-NamedAccessibleElement $primaryWindow @("Logging")
+    [void](Wait-AccessibleElement $primaryWindow @("Diagnostic logging") $false)
+    Set-NamedToggleState $primaryWindow @("Enable detailed service logging") "On"
+    Assert-NumericControl $primaryWindow @("Maximum active log size (MiB)") $true 2
+    Assert-NumericControl $primaryWindow @("Retained circular archives") $true 2
+    $path = Join-Path $OutputDirectory "settings-logging-enabled-en.png"
+    Capture-Window $primaryWindow $path
+    [void]$screenshots.Add((Split-Path -Leaf $path))
+
+    $loggingOnBaseline = Get-StatusSequence
+    $apply = Wait-AccessibleElement $primaryWindow @("Apply") $true
+    Assert-True $apply.Current.IsEnabled "Apply is disabled after enabling detailed logging"
+    Invoke-AccessibleElement $apply
+    Wait-Condition "enabled logging persisted by GUI Apply" {
+        try {
+            $text = Get-Content -LiteralPath $script:configPath -Raw
+            (Get-ConfigScalar $text "enabled") -eq "true" -and
+                (Get-ConfigScalar $text "max_file_size_mib") -eq "2" -and
+                (Get-ConfigScalar $text "retained_archives") -eq "2"
+        } catch {
+            $false
+        }
+    }
+    Wait-ServiceReload `
+        $loggingOnBaseline `
+        "observe" `
+        $true `
+        2 `
+        2 `
+        "service receipt after enabling logging in the GUI"
+
+    Set-NamedToggleState $primaryWindow @("Enable detailed service logging") "Off"
+    Assert-NumericControl $primaryWindow @("Maximum active log size (MiB)") $false 2
+    Assert-NumericControl $primaryWindow @("Retained circular archives") $false 2
+    $loggingOffBaseline = Get-StatusSequence
+    $apply = Wait-AccessibleElement $primaryWindow @("Apply") $true
+    Assert-True $apply.Current.IsEnabled "Apply is disabled after disabling detailed logging"
+    Invoke-AccessibleElement $apply
+    Wait-Condition "disabled logging persisted by GUI Apply" {
+        try {
+            $text = Get-Content -LiteralPath $script:configPath -Raw
+            (Get-ConfigScalar $text "enabled") -eq "false" -and
+                (Get-ConfigScalar $text "max_file_size_mib") -eq "2" -and
+                (Get-ConfigScalar $text "retained_archives") -eq "2"
+        } catch {
+            $false
+        }
+    }
+    Wait-ServiceReload `
+        $loggingOffBaseline `
+        "observe" `
+        $false `
+        2 `
+        2 `
+        "service receipt after disabling logging in the GUI"
+    Invoke-NamedAccessibleElement $primaryWindow @("Reload from disk")
+    [void](Wait-AccessibleElement $primaryWindow @(
+        "Configuration reloaded from disk."
+    ) $false)
+    $loggingToggle = Wait-AccessibleElement `
+        $primaryWindow `
+        @("Enable detailed service logging") `
+        $true
+    Assert-True ((Get-ToggleState $loggingToggle) -eq "Off") `
+        "Reload from disk did not preserve disabled logging"
+    Assert-NumericControl $primaryWindow @("Maximum active log size (MiB)") $false 2
+    Assert-NumericControl $primaryWindow @("Retained circular archives") $false 2
+
     [void](Wait-AccessibleElement $primaryWindow @("General") $true)
     Invoke-NamedAccessibleElement $primaryWindow @("General")
     Invoke-NamedAccessibleElement $primaryWindow @("Restore defaults...")
@@ -695,8 +906,7 @@ max_mutations_per_evaluation = 1
     $apply = Wait-AccessibleElement $primaryWindow @("Apply") $true
     Assert-True $apply.Current.IsEnabled "Apply is not enabled after restoring defaults in the editor"
 
-    $applyBaseline = Get-StatusTimestamp
-    $applyLogBaseline = Get-FileLength $script:logPath
+    $applyBaseline = Get-StatusSequence
     Invoke-AccessibleElement $apply
     Wait-Condition "product defaults persisted by Apply" {
         try {
@@ -707,7 +917,14 @@ max_mutations_per_evaluation = 1
             return $false
         }
     } 20
-    Wait-ServiceReload $applyBaseline $applyLogBaseline "auto" "service confirmation of GUI Apply" 20
+    Wait-ServiceReload `
+        $applyBaseline `
+        "auto" `
+        $true `
+        10 `
+        1 `
+        "service confirmation of GUI Apply" `
+        20
     [void](Wait-AccessibleElement $primaryWindow @(
         "Configuration applied and reloaded by the WinSched service."
     ) $false 20)
@@ -741,9 +958,12 @@ max_mutations_per_evaluation = 1
         single_instance_notice_dismissed = $singleInstanceNoticeDismissed
         single_instance_verified = $true
         languages = @("EN", "RU")
-        pages = @("General", "Adaptive", "Process rules")
+        pages = @("General", "Adaptive", "Process rules", "Logging")
         controls = @(
             "Tray autostart",
+            "Enable detailed service logging",
+            "Maximum active log size (MiB)",
+            "Retained circular archives",
             "Restore defaults...",
             "Confirm restore defaults",
             "Apply",
@@ -751,6 +971,8 @@ max_mutations_per_evaluation = 1
             "Close"
         )
         controller_defaults_applied = $true
+        logging_enabled_disabled_persistence = $true
+        logging_defaults_applied = $true
         service_reload_observed = $true
         original_config_sha256 = $originalHash
         screenshots = @($screenshots)
@@ -808,12 +1030,18 @@ max_mutations_per_evaluation = 1
 
     if ($workingConfigInstalled -and $null -ne $originalBytes) {
         try {
-            $restoreBaseline = Get-StatusTimestamp
-            $restoreLogBaseline = Get-FileLength $script:logPath
+            $restoreBaseline = Get-StatusSequence
             $originalText = [System.Text.Encoding]::UTF8.GetString($originalBytes)
             $originalMode = Get-ConfigScalar $originalText "controller_mode"
+            $originalLogging = Get-ConfigLogging $originalText
             Set-FileAtomically $script:configPath $originalBytes
-            Wait-RestoreReload $restoreBaseline $restoreLogBaseline $originalMode 25
+            Wait-RestoreReload `
+                $restoreBaseline `
+                $originalMode `
+                ([bool]$originalLogging.enabled) `
+                ([int]$originalLogging.max_file_size_mib) `
+                ([int]$originalLogging.retained_archives) `
+                25
             $restoredHash = (Get-FileHash -LiteralPath $script:configPath -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($restoredHash -ne $originalHash) {
                 throw "Original configuration bytes were not restored exactly"

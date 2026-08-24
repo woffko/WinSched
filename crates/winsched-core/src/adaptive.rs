@@ -10,7 +10,7 @@ use crate::{LlcDomain, LlcDomainKey, ProcessorClassPreference, Topology};
 const FULL_UTILIZATION_BPS: u16 = 10_000;
 
 /// Tuning values for the adaptive placement policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
     pub overload_threshold_bps: u16,

@@ -1,3 +1,6 @@
+#[cfg(any(windows, test))]
+mod event_logger;
+
 #[cfg(not(windows))]
 fn main() {
     eprintln!("winsched-service is only available on Windows");
@@ -17,6 +20,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(windows)]
 mod app {
+    use crate::event_logger::EventSink;
     use std::cmp::Reverse;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::{OsStr, OsString};
@@ -44,11 +48,12 @@ mod app {
     use windows_service::service_dispatcher;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     use winsched::platform::{self, MutationReport};
-    use winsched_config::{ControllerConfig, ControllerMode};
+    use winsched_config::{ControllerConfig, ControllerMode, LoggingConfig};
     use winsched_control::{
-        CONFIG_FILE_NAME, CONTROL_DISABLE, CONTROL_ENABLE, ControllerPhase, ControllerStatus,
-        INSTALL_DIRECTORY_NAME, LOG_FILE_NAME, MANAGED_STATE_FILE_NAME, RUNTIME_SCHEMA_VERSION,
-        RUNTIME_STATE_FILE_NAME, RuntimeState, SERVICE_NAME, STATUS_FILE_NAME,
+        CONFIG_FILE_NAME, CONTROL_DISABLE, CONTROL_ENABLE, ConfigReloadResult, ControllerPhase,
+        ControllerStatus, INSTALL_DIRECTORY_NAME, LOG_FILE_NAME, MANAGED_STATE_FILE_NAME,
+        RUNTIME_SCHEMA_VERSION, RUNTIME_STATE_FILE_NAME, RuntimeState, SERVICE_NAME,
+        STATUS_FILE_NAME,
     };
     use winsched_core::adaptive::{
         AssignmentOrigin, DecisionReason, PolicyAction, PolicyDecision, PolicyEngine, ProcessKey,
@@ -56,7 +61,6 @@ mod app {
 
     const SERVICE_DISPLAY_NAME: &str = "WinSched LLC-aware placement controller";
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
-    const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
     const STATE_SCHEMA_VERSION: u32 = 1;
     const INTERACTIVE_SERVICE_SDDL: &str = concat!(
         "D:",
@@ -331,7 +335,7 @@ mod app {
         let managed_state_path = install_dir.join(MANAGED_STATE_FILE_NAME);
         let runtime_state_path = install_dir.join(RUNTIME_STATE_FILE_NAME);
         let status_path = install_dir.join(STATUS_FILE_NAME);
-        let mut logger = EventLogger::file(log_path)?;
+        let mut logger = EventLogger::service(log_path, config.logging)?;
         status_handle.set_service_status(service_status(ServiceState::Running, 0))?;
 
         let result = run_controller(
@@ -388,11 +392,15 @@ mod app {
         let mut previous_cpu_times = BTreeMap::<ProcessKey, u64>::new();
         let started = Instant::now();
         let mut iteration = 0u64;
-        let mut config_modified = files.config.and_then(file_modified);
+        // Re-read once on the first tick. This closes the narrow startup race where Settings
+        // can replace the file after the service loaded it but before its first metadata read.
+        let mut config_modified = files.config.map(|_| SystemTime::UNIX_EPOCH);
         let mut status = ControllerStatus::starting(
             std::process::id(),
             runtime.scheduling_enabled,
             config.controller_mode,
+            config.fingerprint(),
+            config.logging,
             topology.llc_domains.len(),
             unix_time_ms(),
         );
@@ -414,7 +422,7 @@ mod app {
             "scheduling_enabled": runtime.scheduling_enabled,
             "llc_domains": topology.llc_domains.len(),
             "rules": config.rules.len(),
-        }))?;
+        }));
 
         let loop_result: Result<(), ServiceError> = loop {
             let interval = Duration::from_millis(config.sample_interval_ms);
@@ -469,7 +477,7 @@ mod app {
                 }
                 ControllerCommand::Tick => {}
             }
-            match reload_config_if_changed(
+            let reload = reload_config_if_changed(
                 files.config,
                 &mut config_modified,
                 &mut config,
@@ -477,18 +485,13 @@ mod app {
                 &mut managed,
                 files.managed_state,
                 logger,
-            )? {
-                ConfigReload::Unchanged => {}
-                ConfigReload::Reloaded => {
-                    status.last_activity = Some("Configuration reloaded".to_owned());
-                    status.last_error = None;
-                }
-                ConfigReload::Rejected(error) => {
-                    status.last_activity = Some("Configuration rejected; fail-closed".to_owned());
-                    status.last_error = Some(error);
-                }
+            )?;
+            if let Some(event) = apply_reload_status(&mut status, &config, reload) {
+                // This status receipt is authoritative for Settings and must reach disk before
+                // any optional event-log write or rotation can fail.
+                persist_controller_status(files.status, &mut status)?;
+                logger.emit(event);
             }
-            status.configured_mode = config.controller_mode;
             if !runtime.scheduling_enabled {
                 let cleanup = cleanup_managed(logger, &mut managed, files.managed_state)?;
                 status.phase = ControllerPhase::Disabled;
@@ -528,7 +531,7 @@ mod app {
                     Err(error) => break Err(error.into()),
                 };
             for decision in decisions {
-                log_decision(logger, &processes, &decision)?;
+                log_decision(logger, &processes, &decision);
                 status.last_activity = Some(decision_summary(&processes, &decision));
                 if decision.enforce && decision.action.is_mutation() {
                     if let Some(error) = enforce_decision(
@@ -579,7 +582,7 @@ mod app {
         logger.emit(json!({
             "event": "controller_stopped",
             "success": loop_result.is_ok(),
-        }))?;
+        }));
         match (loop_result, cleanup_result, status_result) {
             (Err(error), _, _) | (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => {
                 Err(error)
@@ -682,7 +685,7 @@ mod app {
                 "exclusion": exclusion,
                 "succeeded": result.is_ok(),
                 "error": result.as_ref().err().map(ToString::to_string),
-            }))?;
+            }));
             if result.is_ok() {
                 managed.remove(&key);
                 changed = true;
@@ -698,7 +701,52 @@ mod app {
     enum ConfigReload {
         Unchanged,
         Reloaded,
-        Rejected(String),
+        Rejected { error: String, fail_closed: bool },
+    }
+
+    fn apply_reload_status(
+        status: &mut ControllerStatus,
+        config: &ControllerConfig,
+        reload: ConfigReload,
+    ) -> Option<Value> {
+        status.configured_mode = config.controller_mode;
+        status.applied_config_fingerprint = config.fingerprint();
+        status.applied_logging = config.logging;
+        match reload {
+            ConfigReload::Unchanged => None,
+            ConfigReload::Reloaded => {
+                status.config_reload_sequence = status.config_reload_sequence.saturating_add(1);
+                status.config_reload_result = ConfigReloadResult::Reloaded;
+                status.config_reload_error = None;
+                status.last_activity = Some("Configuration reloaded".to_owned());
+                status.last_error = None;
+                Some(json!({
+                    "event": "config_reloaded",
+                    "controller_mode": config.controller_mode,
+                    "logging": config.logging,
+                    "rules": config.rules.len(),
+                }))
+            }
+            ConfigReload::Rejected { error, fail_closed } => {
+                status.config_reload_sequence = status.config_reload_sequence.saturating_add(1);
+                status.config_reload_result = ConfigReloadResult::Rejected;
+                status.config_reload_error = Some(error.clone());
+                status.last_activity = Some(if fail_closed {
+                    "Configuration rejected; fail-closed".to_owned()
+                } else {
+                    "Configuration rejected; prior configuration retained".to_owned()
+                });
+                status.last_error = Some(error.clone());
+                Some(json!({
+                    "event": if fail_closed {
+                        "config_rejected_fail_closed"
+                    } else {
+                        "config_rejected"
+                    },
+                    "error": error,
+                }))
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -720,33 +768,48 @@ mod app {
         }
 
         let result = match load_config(path) {
-            Ok(updated) => {
-                *config = updated;
-                *engine = PolicyEngine::new(config.policy)?;
-                logger.emit(json!({
-                    "event": "config_reloaded",
-                    "controller_mode": config.controller_mode,
-                    "rules": config.rules.len(),
-                }))?;
-                ConfigReload::Reloaded
-            }
+            Ok(updated) => match PolicyEngine::new(updated.policy) {
+                Err(error) => ConfigReload::Rejected {
+                    error: error.to_string(),
+                    fail_closed: false,
+                },
+                Ok(updated_engine) => {
+                    if let Err(error) = logger.reconfigure(updated.logging) {
+                        ConfigReload::Rejected {
+                            error: format!(
+                                "failed to apply logging configuration; prior configuration retained: {error}"
+                            ),
+                            fail_closed: false,
+                        }
+                    } else {
+                        *config = updated;
+                        *engine = updated_engine;
+                        ConfigReload::Reloaded
+                    }
+                }
+            },
             Err(error) => {
-                let cleanup = cleanup_managed(logger, managed, state_path)?;
-                *config = ControllerConfig::default();
+                let prior_logging = config.logging;
+                let cleanup = cleanup_managed(logger, managed, state_path);
+                *config = ControllerConfig {
+                    logging: prior_logging,
+                    ..ControllerConfig::default()
+                };
                 *engine = PolicyEngine::new(config.policy)?;
-                logger.emit(json!({
-                    "event": "config_rejected_fail_closed",
-                    "error": error.to_string(),
-                    "cleanup_failed": cleanup.failed,
-                }))?;
-                ConfigReload::Rejected(if cleanup.failed == 0 {
-                    error.to_string()
-                } else {
-                    format!(
+                let detail = match cleanup {
+                    Ok(cleanup) if cleanup.failed == 0 => error.to_string(),
+                    Ok(cleanup) => format!(
                         "{error}; {} managed assignment(s) await cleanup retry",
                         cleanup.failed
-                    )
-                })
+                    ),
+                    Err(cleanup_error) => {
+                        format!("{error}; managed-assignment cleanup failed: {cleanup_error}")
+                    }
+                };
+                ConfigReload::Rejected {
+                    error: detail,
+                    fail_closed: true,
+                }
             }
         };
         *previous_modified = modified;
@@ -794,14 +857,15 @@ mod app {
         logger.emit(json!({
             "event": "scheduling_changed",
             "scheduling_enabled": enabled,
-        }))
+        }));
+        Ok(())
     }
 
     fn log_decision(
         logger: &mut EventLogger,
         processes: &[platform::ObservedProcess],
         decision: &PolicyDecision,
-    ) -> Result<(), ServiceError> {
+    ) {
         let image = processes
             .iter()
             .find(|process| process.key == decision.process)
@@ -813,7 +877,7 @@ mod app {
             "enforce": decision.enforce,
             "action": decision.action,
             "reason": decision.reason,
-        }))
+        }));
     }
 
     fn decision_summary(
@@ -963,7 +1027,8 @@ mod app {
             "acknowledged": acknowledged,
             "report": result.as_ref().ok(),
             "error": result.as_ref().err().map(ToString::to_string),
-        }))
+        }));
+        Ok(())
     }
 
     fn cleanup_managed(
@@ -1009,11 +1074,11 @@ mod app {
             }));
         }
 
-        // Persist first: if status logging fails, the ownership journal remains
-        // conservative and still contains every assignment that was not cleared.
+        // Persist first so the ownership journal remains conservative even if optional event
+        // logging subsequently fails.
         persist_managed_state(state_path, managed)?;
         for event in events {
-            logger.emit(event)?;
+            logger.emit(event);
         }
         Ok(report)
     }
@@ -1896,41 +1961,46 @@ mod app {
     }
 
     struct EventLogger {
-        file: Option<File>,
+        sink: EventSink,
+        last_write_error: Option<String>,
     }
 
     impl EventLogger {
         const fn console() -> Self {
-            Self { file: None }
-        }
-
-        fn file(path: PathBuf) -> Result<Self, std::io::Error> {
-            if path
-                .metadata()
-                .is_ok_and(|metadata| metadata.len() > MAX_LOG_BYTES)
-            {
-                let rotated = path.with_extension("log.1");
-                if rotated.exists() {
-                    fs::remove_file(&rotated)?;
-                }
-                fs::rename(&path, rotated)?;
+            Self {
+                sink: EventSink::console(),
+                last_write_error: None,
             }
-            let file = OpenOptions::new().create(true).append(true).open(path)?;
-            Ok(Self { file: Some(file) })
         }
 
-        fn emit(&mut self, mut value: Value) -> Result<(), ServiceError> {
+        fn service(path: PathBuf, config: LoggingConfig) -> Result<Self, std::io::Error> {
+            Ok(Self {
+                sink: EventSink::service(path, config)?,
+                last_write_error: None,
+            })
+        }
+
+        fn reconfigure(&mut self, config: LoggingConfig) -> Result<(), std::io::Error> {
+            self.sink.reconfigure(config)?;
+            self.last_write_error = None;
+            Ok(())
+        }
+
+        fn emit(&mut self, mut value: Value) {
             if let Some(object) = value.as_object_mut() {
                 object.insert("timestamp_ms".to_owned(), json!(unix_time_ms()));
             }
             let line = serde_json::to_string(&value).expect("JSON Value serialization cannot fail");
-            if let Some(file) = &mut self.file {
-                writeln!(file, "{line}")?;
-                file.flush()?;
-            } else {
-                println!("{line}");
+            match self.sink.write_line(&line) {
+                Ok(()) => self.last_write_error = None,
+                Err(error) => {
+                    let error = error.to_string();
+                    if self.last_write_error.as_deref() != Some(error.as_str()) {
+                        let _ = emergency_log(&format!("event log write failed: {error}"));
+                    }
+                    self.last_write_error = Some(error);
+                }
             }
-            Ok(())
         }
     }
 
@@ -2034,6 +2104,205 @@ mod app {
                 parse_sc_description(b"SERVICE_NAME: WinSched\r\n        DESCRIPTION:     \r\n"),
                 Some(OsString::new())
             );
+        }
+
+        #[test]
+        fn reload_receipt_is_persisted_for_success_and_rejection() {
+            let directory = std::env::temp_dir().join(format!(
+                "winsched-reload-receipt-{}-{}",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("status.json");
+            let logging = LoggingConfig {
+                enabled: false,
+                max_file_size_mib: 2,
+                retained_archives: 0,
+            };
+            let config = ControllerConfig {
+                controller_mode: ControllerMode::Auto,
+                logging,
+                ..ControllerConfig::default()
+            };
+            let mut status = ControllerStatus::starting(
+                42,
+                true,
+                ControllerMode::Observe,
+                ControllerConfig::default().fingerprint(),
+                LoggingConfig::default(),
+                2,
+                unix_time_ms(),
+            );
+
+            let event = apply_reload_status(&mut status, &config, ConfigReload::Reloaded).unwrap();
+            persist_controller_status(Some(&path), &mut status).unwrap();
+            let persisted =
+                serde_json::from_slice::<ControllerStatus>(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(event["event"], "config_reloaded");
+            assert_eq!(persisted.config_reload_sequence, 1);
+            assert_eq!(persisted.config_reload_result, ConfigReloadResult::Reloaded);
+            assert_eq!(persisted.config_reload_error, None);
+            assert_eq!(persisted.applied_config_fingerprint, config.fingerprint());
+            assert_eq!(persisted.applied_logging, logging);
+
+            let event = apply_reload_status(
+                &mut status,
+                &config,
+                ConfigReload::Rejected {
+                    error: "injected invalid configuration".to_owned(),
+                    fail_closed: true,
+                },
+            )
+            .unwrap();
+            // Runtime cleanup and enforcement may update the generic error independently.
+            status.last_error = None;
+            persist_controller_status(Some(&path), &mut status).unwrap();
+            let persisted =
+                serde_json::from_slice::<ControllerStatus>(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(event["event"], "config_rejected_fail_closed");
+            assert_eq!(persisted.config_reload_sequence, 2);
+            assert_eq!(persisted.config_reload_result, ConfigReloadResult::Rejected);
+            assert_eq!(
+                persisted.config_reload_error.as_deref(),
+                Some("injected invalid configuration")
+            );
+            assert_eq!(persisted.applied_logging, logging);
+            assert_eq!(persisted.last_error, None);
+
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn invalid_reload_preserves_last_known_good_disabled_logging() {
+            let directory = std::env::temp_dir().join(format!(
+                "winsched-invalid-reload-{}-{}",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let config_path = directory.join("winsched.toml");
+            let log_path = directory.join("winsched.log");
+            fs::write(
+                &config_path,
+                "schema_version = 2\nsample_interval_ms = 999\n",
+            )
+            .unwrap();
+            let logging = LoggingConfig {
+                enabled: false,
+                max_file_size_mib: 3,
+                retained_archives: 0,
+            };
+            let mut config = ControllerConfig {
+                controller_mode: ControllerMode::Auto,
+                logging,
+                ..ControllerConfig::default()
+            };
+            let mut engine = PolicyEngine::new(config.policy).unwrap();
+            let mut managed = BTreeMap::new();
+            let mut modified = Some(UNIX_EPOCH);
+            let mut logger = EventLogger::service(log_path.clone(), logging).unwrap();
+
+            let reload = reload_config_if_changed(
+                Some(&config_path),
+                &mut modified,
+                &mut config,
+                &mut engine,
+                &mut managed,
+                None,
+                &mut logger,
+            )
+            .unwrap();
+
+            assert!(matches!(
+                reload,
+                ConfigReload::Rejected {
+                    fail_closed: true,
+                    ..
+                }
+            ));
+            assert_eq!(config.controller_mode, ControllerMode::Observe);
+            assert_eq!(config.logging, logging);
+            assert!(!log_path.exists());
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn failed_logging_reconfigure_rejects_reload_and_persists_prior_policy() {
+            let directory = std::env::temp_dir().join(format!(
+                "winsched-failed-log-reconfigure-{}-{}",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let config_path = directory.join("winsched.toml");
+            let status_path = directory.join("status.json");
+            let blocking_file = directory.join("not-a-directory");
+            fs::write(&blocking_file, "blocking file").unwrap();
+            let log_path = blocking_file.join("winsched.log");
+            let prior_logging = LoggingConfig {
+                enabled: false,
+                max_file_size_mib: 2,
+                retained_archives: 0,
+            };
+            let mut config = ControllerConfig {
+                controller_mode: ControllerMode::Auto,
+                logging: prior_logging,
+                ..ControllerConfig::default()
+            };
+            let updated = ControllerConfig {
+                logging: LoggingConfig {
+                    enabled: true,
+                    max_file_size_mib: 1,
+                    retained_archives: 1,
+                },
+                ..config.clone()
+            };
+            fs::write(&config_path, toml::to_string_pretty(&updated).unwrap()).unwrap();
+            let mut engine = PolicyEngine::new(config.policy).unwrap();
+            let mut managed = BTreeMap::new();
+            let mut modified = Some(UNIX_EPOCH);
+            let mut logger = EventLogger::service(log_path, prior_logging).unwrap();
+
+            let reload = reload_config_if_changed(
+                Some(&config_path),
+                &mut modified,
+                &mut config,
+                &mut engine,
+                &mut managed,
+                None,
+                &mut logger,
+            )
+            .unwrap();
+            assert!(matches!(
+                &reload,
+                ConfigReload::Rejected {
+                    fail_closed: false,
+                    ..
+                }
+            ));
+            assert_eq!(config.logging, prior_logging);
+
+            let mut status = ControllerStatus::starting(
+                42,
+                true,
+                config.controller_mode,
+                config.fingerprint(),
+                config.logging,
+                2,
+                unix_time_ms(),
+            );
+            let event = apply_reload_status(&mut status, &config, reload).unwrap();
+            persist_controller_status(Some(&status_path), &mut status).unwrap();
+            let persisted =
+                serde_json::from_slice::<ControllerStatus>(&fs::read(&status_path).unwrap())
+                    .unwrap();
+            assert_eq!(event["event"], "config_rejected");
+            assert_eq!(persisted.config_reload_sequence, 1);
+            assert_eq!(persisted.config_reload_result, ConfigReloadResult::Rejected);
+            assert_eq!(persisted.applied_config_fingerprint, config.fingerprint());
+            assert_eq!(persisted.applied_logging, prior_logging);
+            fs::remove_dir_all(directory).unwrap();
         }
 
         fn process(pid: u32, image: &str, cpu_time_100ns: u64) -> platform::ObservedProcess {

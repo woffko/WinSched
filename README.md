@@ -13,7 +13,8 @@ User-Mode Scheduling is not used because it is not supported on Windows 11.
 
 - `winsched-service.exe` is the automatic LocalSystem controller. It starts
   with Windows, persists owned assignments, clears them on shutdown or disable,
-  rotates its JSONL log, and recovers safely after an interrupted run.
+  keeps an optional size-bounded circular JSONL log, and recovers safely after
+  an interrupted run.
 - `winsched-tray.exe` is a per-session notification-area controller. It shows
   the current mode, service state, managed-process count, last activity, and
   last error.
@@ -95,7 +96,9 @@ Application binaries are stored under `C:\Program Files\WinSched`. Persistent
 data is stored under `C:\ProgramData\WinSched`:
 
 - `winsched.toml` — validated, fail-closed configuration
-- `winsched.log` and `winsched.log.1` — bounded JSONL controller logs
+- `winsched.log` and optional `winsched.log.1` ... `.10` archives — bounded
+  circular JSONL controller logs
+- `winsched-emergency.log` — independent critical startup and logging failures
 - `status.json` — atomic tray heartbeat/status snapshot
 - `runtime-state.json` — persisted tray enable/disable choice
 - `managed-state.json` — PID-and-creation-time ownership journal
@@ -110,6 +113,18 @@ data is stored under `C:\ProgramData\WinSched`:
 included only by `all_user_processes`; `500` means 5% of one logical CPU.
 Explicit image rules remain deterministic even while an application is idle.
 
+The `[logging]` section controls the service diagnostic log. `enabled = false`
+stops all writes, creation, rotation, and deletion of `winsched.log*` while
+preserving files already on disk. `max_file_size_mib` limits the active file to
+1–100 MiB, and `retained_archives` keeps 0–10 circular archives. Archive `.1`
+is always the newest; `0` reuses only the active file. A single diagnostic
+record is never split even if that record alone is larger than the configured
+limit. Critical startup or logging failures can still be recorded separately
+in `winsched-emergency.log`. Existing schema-1 configurations remain accepted
+and immediately use the default logging policy (`true`, 10 MiB, one archive)
+in memory. Their first save through Settings writes the current schema without
+losing existing values.
+
 An invalid hot-reloaded configuration immediately clears owned CPU Set
 assignments and switches the controller to a safe observe-only empty scope.
 External CPU Set assignments are not overridden unless a rule explicitly uses
@@ -121,12 +136,12 @@ See `config/winsched.example.toml` for a narrow observe-only example and
 `config/winsched.default.toml` for the packaged automatic configuration.
 
 Open `Settings...` from the tray or `WinSched Settings` from the Start Menu to
-edit General, Adaptive policy, and Process rules pages. The editor supports
-English and Russian, validates all policy/rule invariants, uses a two-step
-confirmation before restoring defaults, and never writes a partially updated
-TOML file. UAC is required because the configuration controls a LocalSystem
-service. `Open Configuration (Advanced)` remains available for inspection and
-manual expert editing.
+edit General, Adaptive policy, Process rules, and Logging pages. The editor
+supports English and Russian, validates all policy/rule/logging invariants,
+uses a two-step confirmation before restoring defaults, and never writes a
+partially updated TOML file. UAC is required because the configuration controls
+a LocalSystem service. `Open Configuration (Advanced)` remains available for
+inspection and manual expert editing.
 
 ## CLI
 

@@ -18,6 +18,9 @@ Write-Host "final stage: service and adaptive acceptance"
     -PackageDirectory $PackageDirectory `
     -InteractiveUser $InteractiveUser
 
+Write-Host "final stage: bounded logging acceptance"
+& (Join-Path $TestDirectory "logging-acceptance.ps1")
+
 Write-Host "final stage: lifecycle acceptance"
 & (Join-Path $TestDirectory "lifecycle-acceptance.ps1") `
     -PackageDirectory $PackageDirectory `
@@ -40,6 +43,7 @@ if ($LASTEXITCODE -ne 0) {
     result = "PASS"
     package = Split-Path -Leaf $PackageDirectory
     service_adaptive = "PASS"
+    bounded_logging = "PASS"
     lifecycle = "PASS"
     tray_ui = "PASS"
 } | ConvertTo-Json -Depth 4

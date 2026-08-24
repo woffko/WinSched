@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use atomic_write_file::AtomicWriteFile;
@@ -12,7 +12,14 @@ use winsched_config::ControllerConfig;
 use winsched_control::{CONFIG_FILE_NAME, INSTALL_DIRECTORY_NAME, LOG_FILE_NAME, STATUS_FILE_NAME};
 
 const PRODUCT_DEFAULT_CONFIG: &str = include_str!("../../../config/winsched.default.toml");
-const LOG_GUARD_BYTES: u64 = 256;
+
+/// Allows one complete old or new service interval plus a bounded receipt margin.
+#[must_use]
+pub fn config_reload_wait_ms(previous_interval_ms: u64, updated_interval_ms: u64) -> u64 {
+    previous_interval_ms
+        .max(updated_interval_ms)
+        .saturating_add(5_000)
+}
 
 /// Files used by the settings application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,216 +61,6 @@ impl SettingsPaths {
             install_dir,
         }
     }
-}
-
-/// Durable cursor identifying the end of the event log before a settings write.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventLogCursor {
-    offset: u64,
-    identity: Option<FileIdentity>,
-    guard_start: u64,
-    guard: Vec<u8>,
-}
-
-impl EventLogCursor {
-    /// Captures the current log length and a rotation/truncation guard.
-    ///
-    /// A missing log is treated as an empty log because the service may create
-    /// it after the configuration is saved.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for failures other than a missing event log.
-    pub fn capture(path: &Path) -> Result<Self, SettingsError> {
-        match fs::metadata(path) {
-            Ok(metadata) => {
-                let offset = metadata.len();
-                let (guard_start, guard) = read_log_guard(path, offset)?;
-                Ok(Self {
-                    offset,
-                    identity: Some(file_identity(&metadata)),
-                    guard_start,
-                    guard,
-                })
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    const fn empty() -> Self {
-        Self {
-            offset: 0,
-            identity: None,
-            guard_start: 0,
-            guard: Vec::new(),
-        }
-    }
-
-    #[cfg(test)]
-    const fn offset(&self) -> u64 {
-        self.offset
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileIdentity {
-    Known {
-        volume: u64,
-        file: u64,
-    },
-    #[cfg(not(any(unix, windows)))]
-    Unknown,
-}
-
-/// A durable service event proving the result of a configuration reload.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfigReloadLogEvent {
-    Reloaded {
-        timestamp_ms: Option<u64>,
-    },
-    Rejected {
-        timestamp_ms: Option<u64>,
-        error: Option<String>,
-    },
-}
-
-impl ConfigReloadLogEvent {
-    /// Returns the service timestamp attached to the JSONL event, when present.
-    #[must_use]
-    pub const fn timestamp_ms(&self) -> Option<u64> {
-        match self {
-            Self::Reloaded { timestamp_ms } | Self::Rejected { timestamp_ms, .. } => *timestamp_ms,
-        }
-    }
-}
-
-/// Reads complete JSONL records written after a captured cursor.
-///
-/// The cursor automatically restarts at byte zero when the current log is
-/// shorter, has a different file identity, or no longer matches its trailing
-/// content guard. Incomplete trailing JSONL records are left for the next poll.
-///
-/// # Errors
-///
-/// Returns an error when the log exists but cannot be inspected or read.
-pub fn read_config_reload_event(
-    path: &Path,
-    cursor: &mut EventLogCursor,
-) -> Result<Option<ConfigReloadLogEvent>, SettingsError> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            *cursor = EventLogCursor::empty();
-            return Ok(None);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let identity = Some(file_identity(&metadata));
-    let identity_changed = cursor.identity.is_some() && cursor.identity != identity;
-    let shrunk = metadata.len() < cursor.offset;
-    let guard_changed = !identity_changed && !shrunk && !log_guard_matches(path, cursor)?;
-    if identity_changed || shrunk || guard_changed {
-        cursor.offset = 0;
-        cursor.guard_start = 0;
-        cursor.guard.clear();
-    }
-    cursor.identity = identity;
-
-    let mut file = fs::File::open(path)?;
-    file.seek(SeekFrom::Start(cursor.offset))?;
-    let mut appended = Vec::new();
-    file.read_to_end(&mut appended)?;
-    let complete_len = appended
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    if complete_len == 0 {
-        return Ok(None);
-    }
-    cursor.offset = cursor
-        .offset
-        .saturating_add(u64::try_from(complete_len).unwrap_or(u64::MAX));
-    let (guard_start, guard) = read_log_guard(path, cursor.offset)?;
-    cursor.guard_start = guard_start;
-    cursor.guard = guard;
-
-    let mut found = None;
-    for line in appended[..complete_len].split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
-            continue;
-        };
-        let timestamp_ms = value
-            .get("timestamp_ms")
-            .and_then(serde_json::Value::as_u64);
-        match value.get("event").and_then(serde_json::Value::as_str) {
-            Some("config_reloaded") => {
-                found = Some(ConfigReloadLogEvent::Reloaded { timestamp_ms });
-            }
-            Some("config_rejected_fail_closed") => {
-                found = Some(ConfigReloadLogEvent::Rejected {
-                    timestamp_ms,
-                    error: value
-                        .get("error")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
-                });
-            }
-            _ => {}
-        }
-    }
-    Ok(found)
-}
-
-fn read_log_guard(path: &Path, offset: u64) -> Result<(u64, Vec<u8>), SettingsError> {
-    let guard_start = offset.saturating_sub(LOG_GUARD_BYTES);
-    let mut file = fs::File::open(path)?;
-    file.seek(SeekFrom::Start(guard_start))?;
-    let mut guard = Vec::new();
-    file.take(offset - guard_start).read_to_end(&mut guard)?;
-    Ok((guard_start, guard))
-}
-
-fn log_guard_matches(path: &Path, cursor: &EventLogCursor) -> Result<bool, SettingsError> {
-    if cursor.guard.is_empty() {
-        return Ok(true);
-    }
-    let mut file = fs::File::open(path)?;
-    file.seek(SeekFrom::Start(cursor.guard_start))?;
-    let mut current = vec![0; cursor.guard.len()];
-    match file.read_exact(&mut current) {
-        Ok(()) => Ok(current == cursor.guard),
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
-#[cfg(unix)]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    use std::os::unix::fs::MetadataExt as _;
-
-    FileIdentity::Known {
-        volume: metadata.dev(),
-        file: metadata.ino(),
-    }
-}
-
-#[cfg(windows)]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    use std::os::windows::fs::MetadataExt as _;
-
-    FileIdentity::Known {
-        volume: 0,
-        file: metadata.creation_time(),
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-const fn file_identity(_metadata: &fs::Metadata) -> FileIdentity {
-    FileIdentity::Unknown
 }
 
 /// Errors surfaced by settings load and save operations.
@@ -366,7 +163,6 @@ pub fn restore_defaults() -> Result<ControllerConfig, SettingsError> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -395,11 +191,6 @@ mod tests {
         }
     }
 
-    fn append(path: &Path, contents: &str) {
-        let mut file = OpenOptions::new().append(true).open(path).unwrap();
-        file.write_all(contents.as_bytes()).unwrap();
-    }
-
     #[test]
     fn pretty_toml_roundtrip_preserves_every_field() {
         let mut config = ControllerConfig {
@@ -416,6 +207,9 @@ mod tests {
         config.policy.minimum_residency_ms = 20_000;
         config.policy.cooldown_ms = 45_000;
         config.policy.max_mutations_per_evaluation = 2;
+        config.logging.enabled = false;
+        config.logging.max_file_size_mib = 77;
+        config.logging.retained_archives = 0;
         config.rules.push(ProcessRule {
             image: "Game.exe".to_owned(),
             mode: RuleMode::Strict,
@@ -450,6 +244,9 @@ mod tests {
         assert_eq!(edited, shipped);
         assert_eq!(edited.controller_mode, ControllerMode::Auto);
         assert!(edited.all_user_processes);
+        assert!(edited.logging.enabled);
+        assert_eq!(edited.logging.max_file_size_mib, 10);
+        assert_eq!(edited.logging.retained_archives, 1);
     }
 
     #[test]
@@ -481,6 +278,38 @@ mod tests {
         assert_eq!(saved, config);
         assert!(contents.contains("controller_mode = \"auto\""));
         assert_eq!(load_config(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn first_save_migrates_schema_one_without_losing_existing_values() {
+        let directory = TestDirectory::new("schema-one-migration");
+        let path = directory.0.join("winsched.toml");
+        fs::write(
+            &path,
+            "schema_version = 1\nsample_interval_ms = 2500\nminimum_process_utilization_bps = 777\n",
+        )
+        .unwrap();
+
+        let loaded = load_config(&path).unwrap();
+        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.sample_interval_ms, 2_500);
+        assert_eq!(loaded.minimum_process_utilization_bps, 777);
+        assert!(loaded.logging.enabled);
+        assert_eq!(loaded.logging.max_file_size_mib, 10);
+        assert_eq!(loaded.logging.retained_archives, 1);
+
+        save_config_atomic(&path, &loaded).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("schema_version = 2"));
+        assert!(saved.contains("minimum_process_utilization_bps = 777"));
+        assert!(saved.contains("[logging]"));
+        assert_eq!(load_config(&path).unwrap(), loaded);
+    }
+
+    #[test]
+    fn reload_wait_covers_the_old_interval_when_the_new_interval_is_shorter() {
+        assert_eq!(config_reload_wait_ms(60_000, 1_000), 65_000);
+        assert_eq!(config_reload_wait_ms(1_000, 60_000), 65_000);
     }
 
     #[test]
@@ -537,100 +366,5 @@ mod tests {
             "Microsoft/Windows/Start Menu/Programs/Startup/WinSched Tray.lnk"
         )));
         assert!(paths.log.ends_with(Path::new("WinSched/winsched.log")));
-    }
-
-    #[test]
-    fn reload_event_is_detected_only_after_the_captured_offset() {
-        let directory = TestDirectory::new("log-offset");
-        let log = directory.0.join("winsched.log");
-        fs::write(
-            &log,
-            "{\"event\":\"config_rejected_fail_closed\",\"timestamp_ms\":10}\n",
-        )
-        .unwrap();
-        let mut cursor = EventLogCursor::capture(&log).unwrap();
-        let baseline_length = fs::metadata(&log).unwrap().len();
-        assert_eq!(cursor.offset(), baseline_length);
-
-        append(
-            &log,
-            "{\"event\":\"sample\"}\n{\"event\":\"config_reloaded\",\"timestamp_ms\":20}\n",
-        );
-
-        assert_eq!(
-            read_config_reload_event(&log, &mut cursor).unwrap(),
-            Some(ConfigReloadLogEvent::Reloaded {
-                timestamp_ms: Some(20)
-            })
-        );
-        assert_eq!(read_config_reload_event(&log, &mut cursor).unwrap(), None);
-    }
-
-    #[test]
-    fn rejected_event_preserves_durable_error_detail() {
-        let directory = TestDirectory::new("log-rejected");
-        let log = directory.0.join("winsched.log");
-        fs::write(&log, "{\"event\":\"baseline\"}\n").unwrap();
-        let mut cursor = EventLogCursor::capture(&log).unwrap();
-        append(
-            &log,
-            "{\"event\":\"config_rejected_fail_closed\",\"timestamp_ms\":30,\"error\":\"bad config\"}\n",
-        );
-
-        assert_eq!(
-            read_config_reload_event(&log, &mut cursor).unwrap(),
-            Some(ConfigReloadLogEvent::Rejected {
-                timestamp_ms: Some(30),
-                error: Some("bad config".to_owned()),
-            })
-        );
-    }
-
-    #[test]
-    fn truncation_and_regrowth_restart_from_the_beginning() {
-        let directory = TestDirectory::new("log-truncated");
-        let log = directory.0.join("winsched.log");
-        fs::write(&log, format!("{}\n", "old".repeat(100))).unwrap();
-        let mut cursor = EventLogCursor::capture(&log).unwrap();
-        fs::write(
-            &log,
-            format!(
-                "{}\n{{\"event\":\"config_reloaded\",\"timestamp_ms\":40}}\n",
-                "new".repeat(200)
-            ),
-        )
-        .unwrap();
-
-        assert_eq!(
-            read_config_reload_event(&log, &mut cursor).unwrap(),
-            Some(ConfigReloadLogEvent::Reloaded {
-                timestamp_ms: Some(40)
-            })
-        );
-    }
-
-    #[test]
-    fn rotation_to_a_longer_file_restarts_from_the_beginning() {
-        let directory = TestDirectory::new("log-rotated");
-        let log = directory.0.join("winsched.log");
-        let rotated = directory.0.join("winsched.log.1");
-        fs::write(&log, "{\"event\":\"old baseline\"}\n").unwrap();
-        let mut cursor = EventLogCursor::capture(&log).unwrap();
-        fs::rename(&log, rotated).unwrap();
-        fs::write(
-            &log,
-            format!(
-                "{}\n{{\"event\":\"config_reloaded\",\"timestamp_ms\":50}}\n",
-                "rotated".repeat(100)
-            ),
-        )
-        .unwrap();
-
-        assert_eq!(
-            read_config_reload_event(&log, &mut cursor).unwrap(),
-            Some(ConfigReloadLogEvent::Reloaded {
-                timestamp_ms: Some(50)
-            })
-        );
     }
 }

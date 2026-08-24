@@ -124,17 +124,68 @@ $wrapper = Join-Path $publicRoot "interactive-install.ps1"
 $wrapperResult = Join-Path $publicRoot "interactive-install-result.json"
 $installTask = "WinSchedInteractiveInstallAcceptance"
 $startupTask = "WinSchedStartupShortcutAcceptance"
+$logRetentionProbe = Join-Path $InstallDirectory "winsched.log.10"
+$logRetentionProbeCreated = $false
 
 try {
-    Write-Host "lifecycle stage: upgrade preserves implicit configuration"
-    $customConfig = (Get-Content -LiteralPath $installedConfig -Raw) -replace 'minimum_process_utilization_bps\s*=\s*\d+', 'minimum_process_utilization_bps = 777'
+    Write-Host "lifecycle stage: upgrade preserves and normalizes schema-1 configuration"
+    $customConfig = Get-Content -LiteralPath $installedConfig -Raw
+    $customConfig = [regex]::Replace(
+        $customConfig,
+        '(?m)^\s*schema_version\s*=\s*\d+\s*$',
+        'schema_version = 1'
+    )
+    $customConfig = [regex]::Replace(
+        $customConfig,
+        '(?ms)^\s*\[logging\]\s*.*?(?=^\s*\[|\z)',
+        ''
+    )
+    $customConfig = $customConfig -replace `
+        'minimum_process_utilization_bps\s*=\s*\d+', `
+        'minimum_process_utilization_bps = 777'
     Write-Utf8NoBom $installedConfig $customConfig
+    $legacyConfigHash = (Get-FileHash -LiteralPath $installedConfig -Algorithm SHA256).Hash.ToLowerInvariant()
     & (Join-Path $PackageDirectory "install.ps1") -NoTrayLaunch
     Assert-True ($LASTEXITCODE -eq 0) "implicit-config upgrade failed"
     $preservedConfig = Get-Content -LiteralPath $installedConfig -Raw
+    $preservedConfigHash = (Get-FileHash -LiteralPath $installedConfig -Algorithm SHA256).Hash.ToLowerInvariant()
+    Assert-True ($preservedConfigHash -eq $legacyConfigHash) `
+        "upgrade did not preserve the schema-1 configuration byte-for-byte"
+    Assert-True ($preservedConfig -match '(?m)^\s*schema_version\s*=\s*1\s*$') `
+        "upgrade rewrote the legacy schema version"
+    Assert-True ($preservedConfig -notmatch '(?m)^\s*\[logging\]\s*$') `
+        "upgrade inserted a logging table into the preserved schema-1 file"
     Assert-True ($preservedConfig -match 'minimum_process_utilization_bps\s*=\s*777') "upgrade overwrote the existing configuration"
+    Wait-Condition "schema-1 logging defaults applied by the upgraded service" {
+        try {
+            $status = Get-Content -LiteralPath (Join-Path $InstallDirectory "status.json") -Raw |
+                ConvertFrom-Json
+            [int]$status.schema_version -eq 2 -and
+                [bool]$status.applied_logging.enabled -and
+                [int]$status.applied_logging.max_file_size_mib -eq 10 -and
+                [int]$status.applied_logging.retained_archives -eq 1
+        } catch {
+            $false
+        }
+    }
 
     Write-Host "lifecycle stage: normal uninstall preserves data"
+    if (-not (Test-Path -LiteralPath $logRetentionProbe -PathType Leaf)) {
+        Write-Utf8NoBom $logRetentionProbe "WinSched lifecycle archive preservation probe`n"
+        $logRetentionProbeCreated = $true
+    }
+    $logFilesBeforeUninstall = [ordered]@{}
+    foreach ($logFile in @(
+        Get-ChildItem -LiteralPath $InstallDirectory -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^winsched\.log(?:\.\d+)?$' }
+    )) {
+        $logFilesBeforeUninstall[$logFile.Name] = [ordered]@{
+            path = $logFile.FullName
+            sha256 = (Get-FileHash -LiteralPath $logFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+    Assert-True ($logFilesBeforeUninstall.Count -ge 2) `
+        "normal-uninstall fixture did not include an active log and an archive"
     & (Join-Path $PackageDirectory "uninstall.ps1")
     Wait-ServiceAbsent
     foreach ($binary in @(
@@ -146,11 +197,23 @@ try {
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $InstallDirectory $binary))) "normal uninstall left $binary"
     }
     Assert-True (Test-Path -LiteralPath $installedConfig -PathType Leaf) "normal uninstall removed configuration"
-    Assert-True (Test-Path -LiteralPath (Join-Path $InstallDirectory "winsched.log") -PathType Leaf) "normal uninstall removed logs"
+    foreach ($entry in $logFilesBeforeUninstall.GetEnumerator()) {
+        Assert-True (Test-Path -LiteralPath $entry.Value.path -PathType Leaf) `
+            "normal uninstall removed $($entry.Key)"
+        if ($entry.Key -ne "winsched.log") {
+            $archiveHash = (Get-FileHash -LiteralPath $entry.Value.path -Algorithm SHA256).Hash.ToLowerInvariant()
+            Assert-True ($archiveHash -eq $entry.Value.sha256) `
+                "normal uninstall modified archive $($entry.Key)"
+        }
+    }
     Assert-True (-not (Test-Path -LiteralPath $startupShortcut)) "normal uninstall left the Startup shortcut"
     Assert-True (-not (Test-Path -LiteralPath $programs)) "normal uninstall left the Start Menu directory"
 
     Write-Host "lifecycle stage: purge uninstall removes data"
+    if ($logRetentionProbeCreated -and (Test-Path -LiteralPath $logRetentionProbe)) {
+        Remove-Item -LiteralPath $logRetentionProbe -Force
+        $logRetentionProbeCreated = $false
+    }
     & (Join-Path $PackageDirectory "install.ps1") -Configuration (Join-Path $PackageDirectory "winsched.toml") -NoTrayLaunch
     Assert-True ($LASTEXITCODE -eq 0) "reinstall before purge failed"
     & (Join-Path $PackageDirectory "uninstall.ps1") -PurgeData
@@ -215,6 +278,8 @@ try {
 
     [pscustomobject]@{
         result = "PASS"
+        schema1_upgrade_preserved_bytes = $true
+        schema1_logging_defaults_applied = $true
         upgrade_preserved_threshold_bps = 777
         normal_uninstall_preserved_data = $true
         purge_removed_data = $true
@@ -223,6 +288,9 @@ try {
         final_tray_pid = $startupTray.Id
     } | ConvertTo-Json -Depth 4
 } finally {
+    if ($logRetentionProbeCreated -and (Test-Path -LiteralPath $logRetentionProbe)) {
+        Remove-Item -LiteralPath $logRetentionProbe -Force -ErrorAction SilentlyContinue
+    }
     Unregister-ScheduledTask -TaskName $installTask -Confirm:$false -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $startupTask -Confirm:$false -ErrorAction SilentlyContinue
 }

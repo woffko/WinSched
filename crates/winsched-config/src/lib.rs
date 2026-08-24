@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -11,10 +13,14 @@ use winsched_core::{
     adaptive::{EnforcementMode, PlacementMode, PolicyConfig},
 };
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const MIN_LOG_FILE_SIZE_MIB: u16 = 1;
+pub const MAX_LOG_FILE_SIZE_MIB: u16 = 100;
+pub const MAX_RETAINED_LOG_ARCHIVES: u8 = 10;
 
 /// Global mutation gate for the controller.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControllerMode {
     Off,
@@ -24,7 +30,7 @@ pub enum ControllerMode {
 }
 
 /// Placement behavior requested by one exact executable-name rule.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleMode {
     Off,
@@ -37,7 +43,7 @@ pub enum RuleMode {
 }
 
 /// One exact, case-insensitive executable-name rule.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessRule {
     pub image: String,
@@ -49,8 +55,35 @@ pub struct ProcessRule {
     pub llc: Option<u8>,
 }
 
+/// Bounded diagnostic event logging policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    pub enabled: bool,
+    pub max_file_size_mib: u16,
+    pub retained_archives: u8,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_file_size_mib: 10,
+            retained_archives: 1,
+        }
+    }
+}
+
+impl LoggingConfig {
+    /// Maximum active file length in bytes.
+    #[must_use]
+    pub fn max_file_size_bytes(self) -> u64 {
+        u64::from(self.max_file_size_mib) * 1024 * 1024
+    }
+}
+
 /// Full service configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ControllerConfig {
     pub schema_version: u32,
@@ -59,6 +92,7 @@ pub struct ControllerConfig {
     pub minimum_process_utilization_bps: u16,
     pub all_user_processes: bool,
     pub default_rule_mode: RuleMode,
+    pub logging: LoggingConfig,
     pub policy: PolicyConfig,
     pub rules: Vec<ProcessRule>,
 }
@@ -72,6 +106,7 @@ impl Default for ControllerConfig {
             minimum_process_utilization_bps: 500,
             all_user_processes: false,
             default_rule_mode: RuleMode::Auto,
+            logging: LoggingConfig::default(),
             policy: PolicyConfig::default(),
             rules: Vec::new(),
         }
@@ -97,6 +132,10 @@ pub enum ConfigError {
     ProcessUtilization,
     #[error("default_rule_mode cannot be strict because no default group and LLC are defined")]
     StrictDefaultUnsupported,
+    #[error("logging.max_file_size_mib must be between 1 and 100")]
+    LogFileSize,
+    #[error("logging.retained_archives must be <= 10")]
+    LogArchives,
     #[error("invalid policy: {0}")]
     Policy(#[from] winsched_core::adaptive::AdaptiveError),
     #[error("rule image must be an executable name without path separators")]
@@ -110,6 +149,14 @@ pub enum ConfigError {
 }
 
 impl ControllerConfig {
+    /// Stable within one `WinSched` build and used to match a live service receipt to Settings.
+    #[must_use]
+    pub fn fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Parses and validates a fail-closed TOML document.
     ///
     /// # Errors
@@ -117,7 +164,11 @@ impl ControllerConfig {
     /// Returns [`ConfigError`] for syntax errors, unknown fields, unsupported
     /// schema versions, unsafe sampling intervals, or inconsistent rules.
     pub fn from_toml(value: &str) -> Result<Self, ConfigError> {
-        toml::from_str::<Self>(value)?.validate()
+        let mut config = toml::from_str::<Self>(value)?;
+        if config.schema_version == LEGACY_CONFIG_SCHEMA_VERSION {
+            config.schema_version = CONFIG_SCHEMA_VERSION;
+        }
+        config.validate()
     }
 
     /// Validates an already-deserialized configuration.
@@ -137,6 +188,14 @@ impl ControllerConfig {
         }
         if self.default_rule_mode == RuleMode::Strict {
             return Err(ConfigError::StrictDefaultUnsupported);
+        }
+        if !(MIN_LOG_FILE_SIZE_MIB..=MAX_LOG_FILE_SIZE_MIB)
+            .contains(&self.logging.max_file_size_mib)
+        {
+            return Err(ConfigError::LogFileSize);
+        }
+        if self.logging.retained_archives > MAX_RETAINED_LOG_ARCHIVES {
+            return Err(ConfigError::LogArchives);
         }
         self.policy = self.policy.validate()?;
 
@@ -298,6 +357,60 @@ stability_samples = 5
         .unwrap();
         assert_eq!(config.policy.stability_samples, 5);
         assert_eq!(config.policy.cooldown_ms, 30_000);
+    }
+
+    #[test]
+    fn legacy_config_uses_current_logging_defaults() {
+        let config = ControllerConfig::from_toml("schema_version = 1").unwrap();
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.logging, LoggingConfig::default());
+        assert_eq!(config.logging.max_file_size_bytes(), 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn fingerprint_matches_normalized_legacy_config_and_changes_with_content() {
+        let legacy = ControllerConfig::from_toml("schema_version = 1").unwrap();
+        let current = ControllerConfig::from_toml("schema_version = 2").unwrap();
+        assert_eq!(legacy.fingerprint(), current.fingerprint());
+
+        let mut changed = current;
+        changed.logging.enabled = false;
+        assert_ne!(legacy.fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn partial_logging_table_preserves_bounded_defaults() {
+        let config = ControllerConfig::from_toml(
+            r"
+schema_version = 1
+[logging]
+enabled = false
+",
+        )
+        .unwrap();
+        assert!(!config.logging.enabled);
+        assert_eq!(config.logging.max_file_size_mib, 10);
+        assert_eq!(config.logging.retained_archives, 1);
+    }
+
+    #[test]
+    fn logging_bounds_apply_even_when_logging_is_disabled() {
+        for document in [
+            "schema_version = 1\n[logging]\nenabled = false\nmax_file_size_mib = 0\n",
+            "schema_version = 1\n[logging]\nenabled = false\nmax_file_size_mib = 101\n",
+            "schema_version = 1\n[logging]\nenabled = false\nretained_archives = 11\n",
+        ] {
+            assert!(ControllerConfig::from_toml(document).is_err());
+        }
+    }
+
+    #[test]
+    fn unsupported_config_schema_is_rejected() {
+        for schema in [0, 3] {
+            let error =
+                ControllerConfig::from_toml(&format!("schema_version = {schema}")).unwrap_err();
+            assert!(matches!(error, ConfigError::SchemaVersion(value) if value == schema));
+        }
     }
 
     #[test]
