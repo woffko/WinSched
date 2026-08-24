@@ -121,7 +121,7 @@ retained_archives = $RetainedArchives
     $result = [regex]::Replace(
         $Base,
         "(?m)^\s*schema_version\s*=\s*\d+\s*$",
-        "schema_version = 2",
+        "schema_version = 3",
         1
     )
     $result = [regex]::Replace(
@@ -170,7 +170,7 @@ function Wait-AppliedLogging(
     Wait-Condition $Description {
         $status = Read-Status
         $null -ne $status -and
-            [int]$status.schema_version -eq 2 -and
+            [int]$status.schema_version -eq 3 -and
             [uint64]$status.config_reload_sequence -gt $AfterSequence -and
             $status.config_reload_result -eq "reloaded" -and
             [bool]$status.applied_logging.enabled -eq $Enabled -and
@@ -339,7 +339,7 @@ function Wait-InitialStatus(
         $null -ne $status -and
             $null -ne $service -and
             $service.State -eq "Running" -and
-            [int]$status.schema_version -eq 2 -and
+            [int]$status.schema_version -eq 3 -and
             [int]$status.service_pid -eq [int]$service.ProcessId -and
             @("initial", "reloaded") -contains [string]$status.config_reload_result -and
             [bool]$status.applied_logging.enabled -eq $Enabled -and
@@ -490,7 +490,7 @@ try {
 
     $result = [ordered]@{
         result = "PASS"
-        status_schema = 2
+        status_schema = 3
         disabled_absent_file = $true
         disabled_hot_reload_byte_stable = $true
         disabled_restart_byte_stable = $true

@@ -85,6 +85,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Calculate the topology-aware reserve and workload partitions without applying them.
+    ResponsivenessPlan {
+        path: PathBuf,
+        /// Emit the complete plan as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect CPU Set placement for one process.
     Inspect {
         pid: u32,
@@ -172,10 +179,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
-        Command::Topology { json } => {
-            let topology = platform::system_topology()?;
-            print_topology(&topology, json)?;
-        }
+        Command::Topology { json } => print_topology(&platform::system_topology()?, json)?,
         Command::Observe {
             samples,
             interval_ms,
@@ -203,6 +207,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
             json,
         )?,
         Command::ConfigCheck { path, json } => run_config_check(&path, json)?,
+        Command::ResponsivenessPlan { path, json } => run_responsiveness_plan(&path, json)?,
         Command::Inspect { pid, json } => {
             let snapshot = platform::inspect_process(pid)?;
             if json {
@@ -292,10 +297,12 @@ fn run_observe(samples: NonZeroU16, interval_ms: NonZeroU64, json: bool) -> Resu
             println!("sample={sample}");
             for load in loads {
                 println!(
-                    "  group={} llc={} utility={:.2}%",
+                    "  group={} llc={} utility={:.2}% dpc={:.2}% interrupt={:.2}%",
                     load.domain.group,
                     load.domain.last_level_cache_index,
-                    f64::from(load.utilization_bps) / 100.0
+                    f64::from(load.utilization_bps) / 100.0,
+                    f64::from(load.dpc_time_bps) / 100.0,
+                    f64::from(load.interrupt_time_bps) / 100.0,
                 );
             }
         }
@@ -315,6 +322,65 @@ fn run_config_check(path: &PathBuf, json: bool) -> Result<(), AppError> {
             config.rules.len(),
             config.all_user_processes
         );
+    }
+    Ok(())
+}
+
+fn run_responsiveness_plan(path: &PathBuf, json_output: bool) -> Result<(), AppError> {
+    let config = winsched_config::ControllerConfig::from_toml(&fs::read_to_string(path)?)?;
+    let topology = platform::system_topology()?;
+    let reserve = if config.responsiveness.enabled {
+        topology.plan_system_reserve(
+            config.responsiveness.system_reserve_percent,
+            config.responsiveness.minimum_reserved_cores,
+            config.responsiveness.maximum_reserved_cores,
+        )
+    } else {
+        topology.plan_system_reserve(0, 0, 0)
+    };
+    let placement = topology.excluding_reserved_cpu_sets(&reserve);
+    let memory = placement.plan_spread_partition(
+        usize::from(config.responsiveness.memory.maximum_physical_cores),
+        config.responsiveness.memory.use_smt,
+    );
+    let compute = placement.plan_spread_partition(usize::MAX, true);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": config.schema_version,
+                "responsiveness": config.responsiveness,
+                "system_reserve": reserve,
+                "memory_profile": memory,
+                "compute_profile": compute,
+            }))?
+        );
+    } else {
+        println!(
+            "physical cores: {}; reserve: {} cores / {} CPU Sets across {} LLC domains",
+            reserve.physical_core_count,
+            reserve.reserved_physical_cores.len(),
+            reserve.reserved_cpu_set_ids.len(),
+            reserve.covered_llc_domains.len(),
+        );
+        if let Some(memory) = memory {
+            println!(
+                "memory profile: {} cores / {} CPU Sets across {} LLC domains; SMT={}",
+                memory.physical_cores.len(),
+                memory.cpu_set_ids.len(),
+                memory.llc_domains.len(),
+                memory.uses_smt,
+            );
+        }
+        if let Some(compute) = compute {
+            println!(
+                "compute profile: {} cores / {} CPU Sets across {} LLC domains; SMT={}",
+                compute.physical_cores.len(),
+                compute.cpu_set_ids.len(),
+                compute.llc_domains.len(),
+                compute.uses_smt,
+            );
+        }
     }
     Ok(())
 }

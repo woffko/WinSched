@@ -30,6 +30,9 @@ $script:ui = @{
     RuTrayAutostart = Expand-UnicodeEscapes "\u0410\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0442\u044c WinSched \u0432 \u043e\u0431\u043b\u0430\u0441\u0442\u0438 \u0443\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u0439 \u043f\u0440\u0438 \u0432\u0445\u043e\u0434\u0435 \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f"
     RuAdaptive = Expand-UnicodeEscapes "\u0410\u0434\u0430\u043f\u0442\u0438\u0432\u043d\u044b\u0439 \u0440\u0435\u0436\u0438\u043c"
     RuAdaptiveHeading = Expand-UnicodeEscapes "\u041f\u043e\u043b\u0438\u0442\u0438\u043a\u0430 \u0430\u0434\u0430\u043f\u0442\u0438\u0432\u043d\u043e\u0433\u043e \u0440\u0430\u0437\u043c\u0435\u0449\u0435\u043d\u0438\u044f"
+    RuResponsiveness = Expand-UnicodeEscapes "\u041e\u0442\u0437\u044b\u0432\u0447\u0438\u0432\u043e\u0441\u0442\u044c"
+    RuResponsivenessHeading = Expand-UnicodeEscapes "\u0421\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 \u0440\u0435\u0437\u0435\u0440\u0432 \u043e\u0442\u0437\u044b\u0432\u0447\u0438\u0432\u043e\u0441\u0442\u0438"
+    RuResponsivenessEnabled = Expand-UnicodeEscapes "\u0412\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0442\u043e\u043f\u043e\u043b\u043e\u0433\u0438\u0447\u0435\u0441\u043a\u0438\u0439 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 \u0440\u0435\u0437\u0435\u0440\u0432"
     RuRules = Expand-UnicodeEscapes "\u041f\u0440\u0430\u0432\u0438\u043b\u0430 \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u043e\u0432"
     RuAddRule = Expand-UnicodeEscapes "\u0414\u043e\u0431\u0430\u0432\u0438\u0442\u044c \u043f\u0440\u0430\u0432\u0438\u043b\u043e \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u0430"
     RuNoRules = Expand-UnicodeEscapes "\u042f\u0432\u043d\u044b\u0435 \u043f\u0440\u0430\u0432\u0438\u043b\u0430 \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u043e\u0432 \u043d\u0435 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d\u044b."
@@ -79,12 +82,33 @@ function Read-ServiceStatus {
     }
 }
 
-function Get-StatusSequence {
+function Get-StatusBaseline {
     $status = Read-ServiceStatus
     if ($null -eq $status) {
-        return [uint64]0
+        return [pscustomobject]@{
+            has_status = $false
+            service_pid = 0
+            sequence = [uint64]0
+        }
     }
-    return [uint64]$status.config_reload_sequence
+    return [pscustomobject]@{
+        has_status = $true
+        service_pid = [int]$status.service_pid
+        sequence = [uint64]$status.config_reload_sequence
+    }
+}
+
+function Test-NewReloadReceipt($Status, $Baseline) {
+    if ($null -eq $Status) {
+        return $false
+    }
+    if (-not [bool]$Baseline.has_status) {
+        return [uint64]$Status.config_reload_sequence -gt 0
+    }
+    if ([int]$Status.service_pid -ne [int]$Baseline.service_pid) {
+        return [uint64]$Status.config_reload_sequence -gt 0
+    }
+    return [uint64]$Status.config_reload_sequence -gt [uint64]$Baseline.sequence
 }
 
 function Set-FileAtomically([string]$Path, [byte[]]$Bytes) {
@@ -111,7 +135,7 @@ function Set-Utf8FileAtomically([string]$Path, [string]$Text) {
 }
 
 function Wait-ServiceReload(
-    [uint64]$AfterSequence,
+    $AfterBaseline,
     [string]$ExpectedMode,
     [bool]$ExpectedLoggingEnabled,
     [int]$ExpectedLogSizeMiB,
@@ -122,18 +146,20 @@ function Wait-ServiceReload(
     Wait-Condition $Description {
         $status = Read-ServiceStatus
         $null -ne $status -and
-            [int]$status.schema_version -eq 2 -and
-            [uint64]$status.config_reload_sequence -gt $AfterSequence -and
+            [int]$status.schema_version -eq 3 -and
+            (Test-NewReloadReceipt $status $AfterBaseline) -and
             $status.config_reload_result -eq "reloaded" -and
             $status.configured_mode -eq $ExpectedMode -and
             [bool]$status.applied_logging.enabled -eq $ExpectedLoggingEnabled -and
             [int]$status.applied_logging.max_file_size_mib -eq $ExpectedLogSizeMiB -and
-            [int]$status.applied_logging.retained_archives -eq $ExpectedLogArchives
+            [int]$status.applied_logging.retained_archives -eq $ExpectedLogArchives -and
+            [bool]$status.applied_responsiveness.enabled -and
+            @($status.system_reserve.reserved_physical_cores).Count -gt 0
     } $TimeoutSeconds
 }
 
 function Wait-RestoreReload(
-    [uint64]$AfterSequence,
+    $AfterBaseline,
     [string]$ExpectedMode,
     [bool]$ExpectedLoggingEnabled,
     [int]$ExpectedLogSizeMiB,
@@ -143,8 +169,8 @@ function Wait-RestoreReload(
     Wait-Condition "service reload after restoring original configuration" {
         $status = Read-ServiceStatus
         $null -ne $status -and
-            [int]$status.schema_version -eq 2 -and
-            [uint64]$status.config_reload_sequence -gt $AfterSequence -and
+            [int]$status.schema_version -eq 3 -and
+            (Test-NewReloadReceipt $status $AfterBaseline) -and
             $status.config_reload_result -eq "reloaded" -and
             $status.configured_mode -eq $ExpectedMode -and
             [bool]$status.applied_logging.enabled -eq $ExpectedLoggingEnabled -and
@@ -503,14 +529,26 @@ function Get-ConfigLogging([string]$Text) {
     }
 }
 
+function Get-ConfigSectionScalar([string]$Text, [string]$Section, [string]$Name) {
+    $sectionMatch = [regex]::Match(
+        $Text,
+        "(?ms)^\s*\[" + [regex]::Escape($Section) + "\]\s*(.*?)(?=^\s*\[|\z)"
+    )
+    if (-not $sectionMatch.Success) {
+        throw "Configuration section '$Section' was not found"
+    }
+    return Get-ConfigScalar $sectionMatch.Groups[1].Value $Name
+}
+
 function Assert-ProductDefaults([string]$Text) {
     $expected = [ordered]@{
-        schema_version = "2"
+        schema_version = "3"
         controller_mode = "auto"
         sample_interval_ms = "1000"
         minimum_process_utilization_bps = "500"
         all_user_processes = "true"
         default_rule_mode = "auto"
+        default_workload_profile = "balanced"
         enabled = "true"
         max_file_size_mib = "10"
         retained_archives = "1"
@@ -520,6 +558,34 @@ function Assert-ProductDefaults([string]$Text) {
         minimum_residency_ms = "10000"
         cooldown_ms = "30000"
         max_mutations_per_evaluation = "1"
+    }
+    $responsivenessExpected = [ordered]@{
+        enabled = "true"
+        system_reserve_percent = "10"
+        minimum_reserved_cores = "2"
+        maximum_reserved_cores = "8"
+        latency_guard_enabled = "true"
+        latency_target_p99_us = "2000"
+        latency_recovery_p99_us = "1000"
+        adjustment_stability_samples = "5"
+    }
+    foreach ($field in $responsivenessExpected.Keys) {
+        $actual = Get-ConfigSectionScalar $Text "responsiveness" $field
+        Assert-True ($actual -eq $responsivenessExpected[$field]) (
+            "Product responsiveness default '$field' is '$actual', expected '$($responsivenessExpected[$field])'"
+        )
+    }
+    $memoryExpected = [ordered]@{
+        use_smt = "false"
+        minimum_physical_cores = "8"
+        maximum_physical_cores = "28"
+        resize_cooldown_ms = "300000"
+    }
+    foreach ($field in $memoryExpected.Keys) {
+        $actual = Get-ConfigSectionScalar $Text "responsiveness.memory" $field
+        Assert-True ($actual -eq $memoryExpected[$field]) (
+            "Product memory-profile default '$field' is '$actual', expected '$($memoryExpected[$field])'"
+        )
     }
     foreach ($field in $expected.Keys) {
         $actual = Get-ConfigScalar $Text $field
@@ -644,17 +710,34 @@ try {
 
     $workingConfig = @"
 # External backup marker: $($script:marker)
-schema_version = 2
+schema_version = 3
 controller_mode = "observe"
 sample_interval_ms = 2500
 minimum_process_utilization_bps = 500
 all_user_processes = false
 default_rule_mode = "auto"
+default_workload_profile = "balanced"
 
 [logging]
 enabled = false
 max_file_size_mib = 2
 retained_archives = 2
+
+[responsiveness]
+enabled = true
+system_reserve_percent = 10
+minimum_reserved_cores = 2
+maximum_reserved_cores = 8
+latency_guard_enabled = true
+latency_target_p99_us = 2000
+latency_recovery_p99_us = 1000
+adjustment_stability_samples = 5
+
+[responsiveness.memory]
+use_smt = false
+minimum_physical_cores = 8
+maximum_physical_cores = 28
+resize_cooldown_ms = 300000
 
 [policy]
 overload_threshold_bps = 8500
@@ -664,7 +747,7 @@ minimum_residency_ms = 10000
 cooldown_ms = 30000
 max_mutations_per_evaluation = 1
 "@
-    $workingBaseline = Get-StatusSequence
+    $workingBaseline = Get-StatusBaseline
     Set-Utf8FileAtomically $script:configPath $workingConfig
     $workingConfigInstalled = $true
     Wait-ServiceReload `
@@ -745,6 +828,37 @@ max_mutations_per_evaluation = 1
     Capture-Window $primaryWindow $path
     [void]$screenshots.Add((Split-Path -Leaf $path))
 
+    Invoke-NamedAccessibleElement $primaryWindow @("Responsiveness")
+    [void](Wait-AccessibleElement $primaryWindow @("System responsiveness reserve") $false)
+    $responsivenessToggle = Wait-AccessibleElement `
+        $primaryWindow `
+        @("Enable topology-aware system reserve") `
+        $true
+    Assert-True ((Get-ToggleState $responsivenessToggle) -eq "On") `
+        "Working configuration did not enable the system reserve"
+    Assert-NumericControl $primaryWindow @("System reserve percent") $true 10
+    Assert-NumericControl $primaryWindow @("Minimum reserved cores") $true 2
+    Assert-NumericControl $primaryWindow @("Maximum reserved cores") $true 8
+    Assert-NumericControl $primaryWindow @("Latency target p99 (microseconds)") $true 2000
+    Assert-NumericControl $primaryWindow @("Latency recovery p99 (microseconds)") $true 1000
+    Assert-NumericControl $primaryWindow @("Adjustment stability samples") $true 5
+    $smtToggle = Wait-AccessibleElement `
+        $primaryWindow `
+        @("Allow both SMT threads per physical core") `
+        $true
+    Assert-True ((Get-ToggleState $smtToggle) -eq "Off") `
+        "Memory profile unexpectedly enabled both SMT siblings"
+    Assert-NumericControl $primaryWindow @("Minimum memory-profile cores") $true 8
+    Assert-NumericControl $primaryWindow @("Maximum memory-profile cores") $true 28
+    Assert-NumericControl `
+        $primaryWindow `
+        @("Memory resize cooldown (milliseconds)") `
+        $true `
+        300000
+    $path = Join-Path $OutputDirectory "settings-responsiveness-en.png"
+    Capture-Window $primaryWindow $path
+    [void]$screenshots.Add((Split-Path -Leaf $path))
+
     Invoke-NamedAccessibleElement $primaryWindow @("Process rules")
     [void](Wait-AccessibleElement $primaryWindow @("Add process rule") $true)
     [void](Wait-AccessibleElement $primaryWindow @(
@@ -780,7 +894,21 @@ max_mutations_per_evaluation = 1
     [void]$screenshots.Add((Split-Path -Leaf $path))
 
     Invoke-NamedAccessibleElement $primaryWindow @($script:ui.RuLanguage)
+    [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuResponsiveness) $true)
+    Invoke-NamedAccessibleElement $primaryWindow @($script:ui.RuResponsiveness)
+    [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuResponsivenessHeading) $false)
+    $responsivenessToggle = Wait-AccessibleElement `
+        $primaryWindow `
+        @($script:ui.RuResponsivenessEnabled) `
+        $true
+    Assert-True ((Get-ToggleState $responsivenessToggle) -eq "On") `
+        "Russian Responsiveness tab did not preserve the enabled reserve"
+    $path = Join-Path $OutputDirectory "settings-responsiveness-ru.png"
+    Capture-Window $primaryWindow $path
+    [void]$screenshots.Add((Split-Path -Leaf $path))
+
     [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuLogging) $true)
+    Invoke-NamedAccessibleElement $primaryWindow @($script:ui.RuLogging)
     [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuLoggingHeading) $false)
     $loggingToggle = Wait-AccessibleElement `
         $primaryWindow `
@@ -827,7 +955,7 @@ max_mutations_per_evaluation = 1
     Capture-Window $primaryWindow $path
     [void]$screenshots.Add((Split-Path -Leaf $path))
 
-    $loggingOnBaseline = Get-StatusSequence
+    $loggingOnBaseline = Get-StatusBaseline
     $apply = Wait-AccessibleElement $primaryWindow @("Apply") $true
     Assert-True $apply.Current.IsEnabled "Apply is disabled after enabling detailed logging"
     Invoke-AccessibleElement $apply
@@ -852,7 +980,7 @@ max_mutations_per_evaluation = 1
     Set-NamedToggleState $primaryWindow @("Enable detailed service logging") "Off"
     Assert-NumericControl $primaryWindow @("Maximum active log size (MiB)") $false 2
     Assert-NumericControl $primaryWindow @("Retained circular archives") $false 2
-    $loggingOffBaseline = Get-StatusSequence
+    $loggingOffBaseline = Get-StatusBaseline
     $apply = Wait-AccessibleElement $primaryWindow @("Apply") $true
     Assert-True $apply.Current.IsEnabled "Apply is disabled after disabling detailed logging"
     Invoke-AccessibleElement $apply
@@ -906,7 +1034,7 @@ max_mutations_per_evaluation = 1
     $apply = Wait-AccessibleElement $primaryWindow @("Apply") $true
     Assert-True $apply.Current.IsEnabled "Apply is not enabled after restoring defaults in the editor"
 
-    $applyBaseline = Get-StatusSequence
+    $applyBaseline = Get-StatusBaseline
     Invoke-AccessibleElement $apply
     Wait-Condition "product defaults persisted by Apply" {
         try {
@@ -958,9 +1086,20 @@ max_mutations_per_evaluation = 1
         single_instance_notice_dismissed = $singleInstanceNoticeDismissed
         single_instance_verified = $true
         languages = @("EN", "RU")
-        pages = @("General", "Adaptive", "Process rules", "Logging")
+        pages = @("General", "Adaptive", "Responsiveness", "Process rules", "Logging")
         controls = @(
             "Tray autostart",
+            "Enable topology-aware system reserve",
+            "System reserve percent",
+            "Minimum reserved cores",
+            "Maximum reserved cores",
+            "Latency target p99 (microseconds)",
+            "Latency recovery p99 (microseconds)",
+            "Adjustment stability samples",
+            "Allow both SMT threads per physical core",
+            "Minimum memory-profile cores",
+            "Maximum memory-profile cores",
+            "Memory resize cooldown (milliseconds)",
             "Enable detailed service logging",
             "Maximum active log size (MiB)",
             "Retained circular archives",
@@ -971,6 +1110,8 @@ max_mutations_per_evaluation = 1
             "Close"
         )
         controller_defaults_applied = $true
+        responsiveness_defaults_applied = $true
+        responsiveness_en_ru_ui = $true
         logging_enabled_disabled_persistence = $true
         logging_defaults_applied = $true
         service_reload_observed = $true
@@ -1030,7 +1171,7 @@ max_mutations_per_evaluation = 1
 
     if ($workingConfigInstalled -and $null -ne $originalBytes) {
         try {
-            $restoreBaseline = Get-StatusSequence
+            $restoreBaseline = Get-StatusBaseline
             $originalText = [System.Text.Encoding]::UTF8.GetString($originalBytes)
             $originalMode = Get-ConfigScalar $originalText "controller_mode"
             $originalLogging = Get-ConfigLogging $originalText

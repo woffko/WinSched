@@ -105,6 +105,8 @@ impl ObservedProcess {
             } else {
                 AssignmentOrigin::External
             },
+            refresh_required: false,
+            preferred_partition: None,
             exclusion: self.exclusion,
         }
     }

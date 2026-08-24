@@ -166,7 +166,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use winsched_config::{ControllerMode, ProcessRule, RuleMode};
+    use winsched_config::{ControllerMode, ProcessRule, RuleMode, WorkloadProfile};
 
     struct TestDirectory(PathBuf);
 
@@ -213,6 +213,7 @@ mod tests {
         config.rules.push(ProcessRule {
             image: "Game.exe".to_owned(),
             mode: RuleMode::Strict,
+            profile: WorkloadProfile::Memory,
             group: Some(1),
             llc: Some(2),
         });
@@ -230,6 +231,7 @@ mod tests {
         edited.rules.push(ProcessRule {
             image: "app.exe".to_owned(),
             mode: RuleMode::Auto,
+            profile: WorkloadProfile::Balanced,
             group: None,
             llc: None,
         });
@@ -247,6 +249,9 @@ mod tests {
         assert!(edited.logging.enabled);
         assert_eq!(edited.logging.max_file_size_mib, 10);
         assert_eq!(edited.logging.retained_archives, 1);
+        assert!(edited.responsiveness.enabled);
+        assert_eq!(edited.responsiveness.system_reserve_percent, 10);
+        assert!(!edited.responsiveness.memory.use_smt);
     }
 
     #[test]
@@ -291,18 +296,20 @@ mod tests {
         .unwrap();
 
         let loaded = load_config(&path).unwrap();
-        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.schema_version, 3);
         assert_eq!(loaded.sample_interval_ms, 2_500);
         assert_eq!(loaded.minimum_process_utilization_bps, 777);
         assert!(loaded.logging.enabled);
         assert_eq!(loaded.logging.max_file_size_mib, 10);
         assert_eq!(loaded.logging.retained_archives, 1);
+        assert!(!loaded.responsiveness.enabled);
 
         save_config_atomic(&path, &loaded).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("schema_version = 2"));
+        assert!(saved.contains("schema_version = 3"));
         assert!(saved.contains("minimum_process_utilization_bps = 777"));
         assert!(saved.contains("[logging]"));
+        assert!(saved.contains("[responsiveness]"));
         assert_eq!(load_config(&path).unwrap(), loaded);
     }
 

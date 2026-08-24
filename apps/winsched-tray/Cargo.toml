@@ -10,6 +10,7 @@ publish.workspace = true
 serde_json.workspace = true
 winsched-config = { path = "../../crates/winsched-config" }
 winsched-control = { path = "../../crates/winsched-control" }
+winsched-core = { path = "../../crates/winsched-core" }
 
 [target.'cfg(windows)'.dependencies]
 image = { version = "=0.25.8", default-features = false, features = ["png"] }

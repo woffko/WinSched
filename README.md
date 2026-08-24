@@ -13,8 +13,8 @@ User-Mode Scheduling is not used because it is not supported on Windows 11.
 
 - `winsched-service.exe` is the automatic LocalSystem controller. It starts
   with Windows, persists owned assignments, clears them on shutdown or disable,
-  keeps an optional size-bounded circular JSONL log, and recovers safely after
-  an interrupted run.
+  keeps an optional size-bounded circular JSONL log, reserves topology-aware
+  system capacity, and recovers safely after an interrupted run.
 - `winsched-tray.exe` is a per-session notification-area controller. It shows
   the current mode, service state, managed-process count, last activity, and
   last error.
@@ -125,6 +125,35 @@ and immediately use the default logging policy (`true`, 10 MiB, one archive)
 in memory. Their first save through Settings writes the current schema without
 losing existing values.
 
+The `[responsiveness]` section reserves whole physical cores for Windows by
+removing their CPU Sets only from WinSched-managed application assignments.
+Protected system processes remain unrestricted and may use every processor.
+The default is 10 percent, rounded upward and bounded to 2–8 physical cores;
+all SMT siblings of a reserved core stay together, and the reserve is spread
+over LLC domains. On the validated 32-core Threadripper 3970X topology this is
+four physical cores and eight logical processors across four of eight LLCs.
+
+Process rules also have an independent `profile`:
+
+- `interactive` uses stable single-LLC placement; automatic placement becomes
+  sticky.
+- `memory` uses a stable multi-LLC partition with one SMT sibling per physical
+  core by default and an adaptive physical-core width.
+- `compute` uses both SMT siblings across all non-reserved assignable cores.
+- `background` and `balanced` retain LLC-aware behavior outside the reserve.
+
+A 10 ms normal-priority latency probe publishes bounded p50/p95/p99 wake
+lateness. Optional DPC and interrupt PDH counters are aggregated per LLC. When
+the configured p99 or interrupt pressure stays elevated, the memory profile
+shrinks by ten percent; sustained recovery restores one core after cooldown.
+This changes concurrency, not memory placement, and does not claim to measure
+per-process DRAM bandwidth without an external hardware-counter calibration.
+In the validated 48-worker/1-GiB Threadripper contention gate, the 28-core
+memory profile reduced reserve-local scheduler wake p99 from 5858.3 to 980.3
+microseconds while increasing synthetic random-memory operation throughput by
+15.10 percent. The unmanaged workload used about 74 percent of total logical
+CPU capacity rather than fully saturating the processor.
+
 An invalid hot-reloaded configuration immediately clears owned CPU Set
 assignments and switches the controller to a safe observe-only empty scope.
 External CPU Set assignments are not overridden unless a rule explicitly uses
@@ -136,7 +165,8 @@ See `config/winsched.example.toml` for a narrow observe-only example and
 `config/winsched.default.toml` for the packaged automatic configuration.
 
 Open `Settings...` from the tray or `WinSched Settings` from the Start Menu to
-edit General, Adaptive policy, Process rules, and Logging pages. The editor
+edit General, Adaptive policy, Responsiveness, Process rules, and Logging
+pages. The editor
 supports English and Russian, validates all policy/rule/logging invariants,
 uses a two-step confirmation before restoring defaults, and never writes a
 partially updated TOML file. UAC is required because the configuration controls
@@ -149,6 +179,7 @@ Useful read-only commands:
 
 ```text
 winsched topology
+winsched responsiveness-plan C:\Path\To\winsched.toml
 winsched observe --samples 5
 winsched processes
 winsched inspect PID

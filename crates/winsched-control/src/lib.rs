@@ -3,7 +3,10 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use winsched_config::{ControllerMode, LoggingConfig};
+use winsched_config::{ControllerConfig, ControllerMode, LoggingConfig, ResponsivenessConfig};
+use winsched_core::SystemReservePlan;
+use winsched_core::latency::SchedulerLatencyStatus;
+use winsched_core::responsiveness::ResponsivenessPressure;
 
 pub const SERVICE_NAME: &str = "WinSched";
 pub const INSTALL_DIRECTORY_NAME: &str = "WinSched";
@@ -15,7 +18,7 @@ pub const STATUS_FILE_NAME: &str = "status.json";
 pub const CONTROL_ENABLE: u32 = 128;
 pub const CONTROL_DISABLE: u32 = 129;
 pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
-pub const STATUS_SCHEMA_VERSION: u32 = 2;
+pub const STATUS_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +76,14 @@ pub struct ControllerStatus {
     pub config_reload_error: Option<String>,
     pub applied_config_fingerprint: u64,
     pub applied_logging: LoggingConfig,
+    pub applied_responsiveness: ResponsivenessConfig,
+    pub system_reserve: SystemReservePlan,
+    pub scheduler_latency: SchedulerLatencyStatus,
+    pub maximum_dpc_time_bps: u16,
+    pub maximum_interrupt_time_bps: u16,
+    pub memory_profile_physical_cores: u16,
+    pub responsiveness_pressure: ResponsivenessPressure,
+    pub last_responsiveness_adjustment: Option<String>,
     pub iteration: u64,
     pub managed_processes: usize,
     pub llc_domains: usize,
@@ -83,12 +94,11 @@ pub struct ControllerStatus {
 
 impl ControllerStatus {
     #[must_use]
-    pub const fn starting(
+    pub fn starting(
         service_pid: u32,
         scheduling_enabled: bool,
-        configured_mode: ControllerMode,
-        applied_config_fingerprint: u64,
-        applied_logging: LoggingConfig,
+        config: &ControllerConfig,
+        system_reserve: SystemReservePlan,
         llc_domains: usize,
         updated_at_unix_ms: u64,
     ) -> Self {
@@ -97,12 +107,20 @@ impl ControllerStatus {
             phase: ControllerPhase::Starting,
             service_pid,
             scheduling_enabled,
-            configured_mode,
+            configured_mode: config.controller_mode,
             config_reload_sequence: 0,
             config_reload_result: ConfigReloadResult::Initial,
             config_reload_error: None,
-            applied_config_fingerprint,
-            applied_logging,
+            applied_config_fingerprint: config.fingerprint(),
+            applied_logging: config.logging,
+            applied_responsiveness: config.responsiveness,
+            system_reserve,
+            scheduler_latency: SchedulerLatencyStatus::default(),
+            maximum_dpc_time_bps: 0,
+            maximum_interrupt_time_bps: 0,
+            memory_profile_physical_cores: config.responsiveness.memory.maximum_physical_cores,
+            responsiveness_pressure: ResponsivenessPressure::Unknown,
+            last_responsiveness_adjustment: None,
             iteration: 0,
             managed_processes: 0,
             llc_domains,
@@ -145,15 +163,12 @@ mod tests {
 
     #[test]
     fn disabled_status_can_be_serialized_by_consumers() {
-        let mut status = ControllerStatus::starting(
-            42,
-            false,
-            ControllerMode::Auto,
-            winsched_config::ControllerConfig::default().fingerprint(),
-            LoggingConfig::default(),
-            2,
-            100,
-        );
+        let config = ControllerConfig {
+            controller_mode: ControllerMode::Auto,
+            ..ControllerConfig::default()
+        };
+        let mut status =
+            ControllerStatus::starting(42, false, &config, SystemReservePlan::default(), 2, 100);
         status.phase = ControllerPhase::Disabled;
         assert!(!status.scheduling_enabled);
         assert_eq!(status.configured_mode, ControllerMode::Auto);
@@ -167,9 +182,8 @@ mod tests {
         let mut status = ControllerStatus::starting(
             42,
             false,
-            ControllerMode::Observe,
-            winsched_config::ControllerConfig::default().fingerprint(),
-            LoggingConfig::default(),
+            &ControllerConfig::default(),
+            SystemReservePlan::default(),
             2,
             1_000,
         );

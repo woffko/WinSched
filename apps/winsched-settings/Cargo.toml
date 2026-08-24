@@ -13,6 +13,7 @@ thiserror.workspace = true
 toml.workspace = true
 winsched-config = { path = "../../crates/winsched-config" }
 winsched-control = { path = "../../crates/winsched-control" }
+winsched-core = { path = "../../crates/winsched-core" }
 
 [target.'cfg(windows)'.dependencies]
 eframe = { workspace = true, features = ["default_fonts", "glow", "accesskit"] }

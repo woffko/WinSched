@@ -19,6 +19,16 @@ function Assert-True($Condition, [string]$Message) {
     }
 }
 
+function Assert-NoReservedCpuSets(
+    [object[]]$CpuSetIds,
+    [object[]]$ReservedCpuSetIds,
+    [string]$Description
+) {
+    $overlap = @($CpuSetIds | Where-Object { $ReservedCpuSetIds -contains $_ })
+    Assert-True ($overlap.Count -eq 0) `
+        "$Description contains reserved CPU Sets: $($overlap -join ', ')"
+}
+
 function Wait-Condition(
     [string]$Description,
     [scriptblock]$Condition,
@@ -188,8 +198,27 @@ try {
         return $status -and $status.phase -eq "running" -and $status.configured_mode -eq "auto"
     }
     $status = Read-Status
+    Assert-True ([int]$status.schema_version -eq 3) "service did not publish status schema 3"
     Assert-True ([bool]$status.scheduling_enabled) "automatic package did not start with scheduling enabled"
     Assert-True ($status.llc_domains -gt 0) "status reports no LLC domains"
+    Assert-True ([bool]$status.applied_responsiveness.enabled) `
+        "packaged configuration did not enable responsiveness reserve"
+    Assert-True (@($status.system_reserve.reserved_physical_cores).Count -gt 0) `
+        "service published no reserved physical cores"
+    Assert-True (@($status.system_reserve.reserved_cpu_set_ids).Count -gt 0) `
+        "service published no reserved CPU Sets"
+    $reservedCpuSetIds = @($status.system_reserve.reserved_cpu_set_ids)
+    $topology = & $cliBinary topology --json | ConvertFrom-Json
+    foreach ($reservedCore in @($status.system_reserve.reserved_physical_cores)) {
+        $siblings = @($topology.cpu_sets | Where-Object {
+            [int]$_.group -eq [int]$reservedCore.group -and
+                [int]$_.core_index -eq [int]$reservedCore.core_index
+        })
+        Assert-True ($siblings.Count -gt 0) "reserved physical core has no CPU Sets"
+        Assert-True (@($siblings | Where-Object {
+            $reservedCpuSetIds -notcontains $_.id
+        }).Count -eq 0) "reserve split an SMT sibling pair"
+    }
 
     Write-Host "acceptance stage: Session 0 exclusions"
     $observed = & $cliBinary processes --include-excluded --json | ConvertFrom-Json
@@ -228,23 +257,114 @@ try {
     $burnerObservation = @($observedAfterBurner | Where-Object { $_.key.pid -eq $burnerId })
     Assert-True ($burnerObservation.Count -eq 1) "managed CPU burner observation is not unique"
     Assert-True ($burnerObservation[0].session_id -gt 0) "managed CPU burner is not in an interactive session"
+    Assert-NoReservedCpuSets `
+        @($inspection.default_cpu_set_ids) `
+        $reservedCpuSetIds `
+        "balanced burner assignment"
+
+    Write-Host "acceptance stage: memory and compute workload profiles"
+    $productionConfig = Get-Content -LiteralPath $packageConfig -Raw
+    $memoryConfig = ($productionConfig -replace `
+        'all_user_processes\s*=\s*true', `
+        'all_user_processes = false').TrimEnd() + @"
+
+
+[[rules]]
+image = "powershell.exe"
+mode = "sticky"
+profile = "memory"
+"@
+    Write-Utf8NoBom $installedConfig $memoryConfig
+    Wait-Condition "memory profile applied to burner" {
+        $current = Get-Inspection $burnerId
+        $ids = @($current.default_cpu_set_ids)
+        if ($ids.Count -eq 0) {
+            return $false
+        }
+        $selected = @($topology.cpu_sets | Where-Object { $ids -contains $_.id })
+        $cores = @($selected | ForEach-Object {
+            "{0}:{1}" -f $_.group, $_.core_index
+        } | Sort-Object -Unique)
+        return $ids.Count -eq $cores.Count
+    } 45
+    $memoryInspection = Get-Inspection $burnerId
+    $memoryCpuSetIds = @($memoryInspection.default_cpu_set_ids)
+    Assert-NoReservedCpuSets $memoryCpuSetIds $reservedCpuSetIds "memory-profile assignment"
+    $memorySelected = @($topology.cpu_sets | Where-Object {
+        $memoryCpuSetIds -contains $_.id
+    })
+    $memoryPhysicalCores = @($memorySelected | ForEach-Object {
+        "{0}:{1}" -f $_.group, $_.core_index
+    } | Sort-Object -Unique)
+    Assert-True ($memoryCpuSetIds.Count -eq $memoryPhysicalCores.Count) `
+        "memory profile used more than one SMT sibling per physical core"
+    Assert-True ($memoryPhysicalCores.Count -le [int](Read-Status).memory_profile_physical_cores) `
+        "memory profile exceeded its adaptive physical-core width"
+
+    $computeConfig = $memoryConfig -replace 'profile\s*=\s*"memory"', 'profile = "compute"'
+    $availableComputeIds = @($topology.cpu_sets | Where-Object {
+        -not $_.flags.parked -and
+            -not $_.flags.realtime -and
+            (-not $_.flags.allocated -or $_.flags.allocated_to_target_process) -and
+            $reservedCpuSetIds -notcontains $_.id
+    } | Select-Object -ExpandProperty id | Sort-Object)
+    Write-Utf8NoBom $installedConfig $computeConfig
+    Wait-Condition "compute profile applied to burner" {
+        $ids = @((Get-Inspection $burnerId).default_cpu_set_ids | Sort-Object)
+        return ($ids -join ',') -eq ($availableComputeIds -join ',')
+    } 45
+    $computeCpuSetIds = @((Get-Inspection $burnerId).default_cpu_set_ids)
+    Assert-NoReservedCpuSets $computeCpuSetIds $reservedCpuSetIds "compute-profile assignment"
+    Assert-True ($computeCpuSetIds.Count -ge $memoryCpuSetIds.Count) `
+        "compute profile exposed fewer CPU Sets than memory profile"
+
+    $balancedRestoreStatus = Read-Status
+    $balancedRestorePid = [int]$balancedRestoreStatus.service_pid
+    $balancedRestoreSequence = [uint64]$balancedRestoreStatus.config_reload_sequence
+    Write-Utf8NoBom $installedConfig $productionConfig
+    Wait-Condition "balanced configuration reloaded after profile acceptance" {
+        $current = Read-Status
+        return $current -and
+            (([int]$current.service_pid -ne $balancedRestorePid -and
+                [uint64]$current.config_reload_sequence -gt 0) -or
+             ([int]$current.service_pid -eq $balancedRestorePid -and
+                [uint64]$current.config_reload_sequence -gt $balancedRestoreSequence)) -and
+            $current.config_reload_result -eq "reloaded"
+    } 45
+    Wait-Condition "balanced burner assignment restored" {
+        @((Get-Inspection $burnerId).default_cpu_set_ids).Count -gt 0
+    } 45
+    Assert-NoReservedCpuSets `
+        @((Get-Inspection $burnerId).default_cpu_set_ids) `
+        $reservedCpuSetIds `
+        "restored balanced assignment"
 
     Write-Host "acceptance stage: adaptive LLC move"
-    $productionConfig = Get-Content -LiteralPath $packageConfig -Raw
     $moveConfig = $productionConfig `
-        -replace 'overload_threshold_bps\s*=\s*\d+', 'overload_threshold_bps = 5000' `
-        -replace 'minimum_improvement_bps\s*=\s*\d+', 'minimum_improvement_bps = 0' `
-        -replace 'stability_samples\s*=\s*\d+', 'stability_samples = 2' `
-        -replace 'minimum_residency_ms\s*=\s*\d+', 'minimum_residency_ms = 1000' `
-        -replace 'cooldown_ms\s*=\s*\d+', 'cooldown_ms = 1000'
+        -replace '(?m)^overload_threshold_bps\s*=\s*\d+', 'overload_threshold_bps = 5000' `
+        -replace '(?m)^minimum_improvement_bps\s*=\s*\d+', 'minimum_improvement_bps = 0' `
+        -replace '(?m)^stability_samples\s*=\s*\d+', 'stability_samples = 2' `
+        -replace '(?m)^minimum_residency_ms\s*=\s*\d+', 'minimum_residency_ms = 1000' `
+        -replace '(?m)^cooldown_ms\s*=\s*\d+', 'cooldown_ms = 1000'
+    $moveConfig = $moveConfig -replace `
+        '(?m)(^\s*\[responsiveness\]\s*\r?\n\s*)enabled\s*=\s*true', `
+        '${1}enabled = false'
+    Assert-True (
+        $moveConfig -match '(?m)^\s*\[responsiveness\]\s*\r?\n\s*enabled\s*=\s*false\s*$'
+    ) "adaptive-move fixture did not disable responsiveness reserve"
     Write-Utf8NoBom $installedConfig $moveConfig
-    Start-Sleep -Seconds 2
+    & $cliBinary config-check $installedConfig | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) "adaptive-move fixture failed config validation"
+    Wait-Condition "managed burner ready for adaptive move" {
+        $entries = @((Read-Managed).processes | Where-Object { $_.key.pid -eq $burnerId })
+        return $entries.Count -eq 1
+    } 45
     $sourceEntry = @((Read-Managed).processes | Where-Object { $_.key.pid -eq $burnerId })
     Assert-True ($sourceEntry.Count -eq 1) "managed burner ownership entry is not unique"
     $sourceEntry = $sourceEntry[0]
     Assert-True ($null -ne $sourceEntry) "managed burner ownership entry disappeared"
-    $sourceGroup = [int]$sourceEntry.domain.group
-    $sourceLlc = [int]$sourceEntry.domain.last_level_cache_index
+    $sourceGroup = [int]$sourceEntry.placement.anchor_domain.group
+    $sourceLlc = [int]$sourceEntry.placement.anchor_domain.last_level_cache_index
     $sourceSelector = "{0}:{1}" -f $sourceGroup, $sourceLlc
     Write-Utf8NoBom $loadScript "while (`$true) { [Math]::Sqrt(67890) | Out-Null }"
     $loadPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -264,12 +384,15 @@ try {
         }
         $entry = $entry[0]
         return (
-            [int]$entry.domain.group -ne $sourceGroup -or
-            [int]$entry.domain.last_level_cache_index -ne $sourceLlc
+            [int]$entry.placement.anchor_domain.group -ne $sourceGroup -or
+            [int]$entry.placement.anchor_domain.last_level_cache_index -ne $sourceLlc
         )
     } 60
     $movedEntry = @((Read-Managed).processes | Where-Object { $_.key.pid -eq $burnerId })[0]
-    Assert-True ($movedEntry.domain.last_level_cache_index -ne $sourceLlc -or $movedEntry.domain.group -ne $sourceGroup) `
+    Assert-True (
+        $movedEntry.placement.anchor_domain.last_level_cache_index -ne $sourceLlc -or
+        $movedEntry.placement.anchor_domain.group -ne $sourceGroup
+    ) `
         "adaptive controller did not change the burner LLC"
     Stop-Process -Id $loadProcessId -Force
     $loadProcessId = $null
@@ -349,6 +472,11 @@ try {
         package = Split-Path -Leaf $PackageDirectory
         service_pid_after_recovery = $newPid
         llc_domains = (Read-Status).llc_domains
+        reserved_physical_cores = @((Read-Status).system_reserve.reserved_physical_cores).Count
+        reserved_cpu_sets = @((Read-Status).system_reserve.reserved_cpu_set_ids).Count
+        memory_profile_cpu_sets = $memoryCpuSetIds.Count
+        compute_profile_cpu_sets = $computeCpuSetIds.Count
+        workload_profiles = "PASS"
         install_directory = $InstallDirectory
     } | ConvertTo-Json -Depth 4
 } finally {

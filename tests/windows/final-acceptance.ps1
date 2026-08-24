@@ -43,6 +43,7 @@ if ($LASTEXITCODE -ne 0) {
     result = "PASS"
     package = Split-Path -Leaf $PackageDirectory
     service_adaptive = "PASS"
+    responsiveness = "PASS"
     bounded_logging = "PASS"
     lifecycle = "PASS"
     tray_ui = "PASS"

@@ -7,10 +7,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Color32, RichText};
 use winsched_config::{
-    CONFIG_SCHEMA_VERSION, ControllerConfig, ControllerMode, LoggingConfig, MAX_LOG_FILE_SIZE_MIB,
-    MAX_RETAINED_LOG_ARCHIVES, MIN_LOG_FILE_SIZE_MIB, ProcessRule, RuleMode,
+    CONFIG_SCHEMA_VERSION, ControllerConfig, ControllerMode, LoggingConfig,
+    MAX_CONFIGURED_PHYSICAL_CORES, MAX_LATENCY_THRESHOLD_US, MAX_LOG_FILE_SIZE_MIB,
+    MAX_MEMORY_RESIZE_COOLDOWN_MS, MAX_RESPONSIVENESS_STABILITY_SAMPLES, MAX_RETAINED_LOG_ARCHIVES,
+    MAX_SYSTEM_RESERVE_PERCENT, MIN_LATENCY_THRESHOLD_US, MIN_LOG_FILE_SIZE_MIB,
+    MIN_MEMORY_RESIZE_COOLDOWN_MS, MIN_SYSTEM_RESERVE_PERCENT, ProcessRule, RuleMode,
+    WorkloadProfile,
 };
 use winsched_control::{ConfigReloadResult, ControllerStatus, STATUS_SCHEMA_VERSION};
+use winsched_core::responsiveness::ResponsivenessPressure;
 use winsched_settings::{
     SettingsPaths, config_reload_wait_ms, load_config, restore_defaults, save_config_atomic,
     set_tray_autostart, tray_autostart_enabled,
@@ -28,8 +33,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
-            .with_inner_size([840.0, 680.0])
-            .with_min_inner_size([720.0, 560.0]),
+            .with_inner_size([980.0, 720.0])
+            .with_min_inner_size([840.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -135,6 +140,7 @@ impl InstanceLock {
 enum SettingsTab {
     General,
     Adaptive,
+    Responsiveness,
     Rules,
     Logging,
 }
@@ -506,7 +512,7 @@ impl SettingsApp {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.heading(language.text("WinSched Settings", "Настройки WinSched"));
             ui.separator();
             let state = if self.is_dirty() {
@@ -540,6 +546,11 @@ impl SettingsApp {
                 &mut self.tab,
                 SettingsTab::Adaptive,
                 language.text("Adaptive", "Адаптивный режим"),
+            );
+            ui.selectable_value(
+                &mut self.tab,
+                SettingsTab::Responsiveness,
+                language.text("Responsiveness", "Отзывчивость"),
             );
             ui.selectable_value(
                 &mut self.tab,
@@ -812,6 +823,293 @@ impl SettingsApp {
         ));
     }
 
+    fn responsiveness_tab(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.heading(language.text(
+            "System responsiveness reserve",
+            "Системный резерв отзывчивости",
+        ));
+        ui.label(language.text(
+            "Keep whole physical cores available to Windows by excluding their CPU Sets only from managed application assignments.",
+            "Оставляет целые физические ядра доступными Windows, исключая их CPU Sets только из назначений управляемых приложений.",
+        ));
+        ui.add_space(8.0);
+        self.responsiveness_reserve_controls(ui);
+        ui.add_space(10.0);
+        self.responsiveness_memory_controls(ui);
+        ui.add_space(10.0);
+        self.responsiveness_live_status(ui);
+    }
+
+    fn responsiveness_reserve_controls(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.checkbox(
+            &mut self.config.responsiveness.enabled,
+            language.text(
+                "Enable topology-aware system reserve",
+                "Включить топологический системный резерв",
+            ),
+        );
+        ui.label(language.text(
+            "Protected system processes remain unrestricted and are never pinned to the reserve. The reserve is spread over LLC domains and always includes complete SMT sibling pairs.",
+            "Защищённые системные процессы остаются без ограничений и не закрепляются за резервом. Резерв распределяется по LLC и всегда включает полные пары SMT-потоков.",
+        ));
+        ui.add_space(8.0);
+        let controls_enabled = self.config.responsiveness.enabled;
+
+        responsiveness_value_u8(
+            ui,
+            language.text("System reserve percent", "Процент системного резерва"),
+            &mut self.config.responsiveness.system_reserve_percent,
+            MIN_SYSTEM_RESERVE_PERCENT..=MAX_SYSTEM_RESERVE_PERCENT,
+            controls_enabled,
+            language.text(
+                "The percentage is calculated from physical cores and rounded upward.",
+                "Процент рассчитывается от физических ядер и округляется вверх.",
+            ),
+            "%",
+        );
+        responsiveness_value_u16(
+            ui,
+            language.text("Minimum reserved cores", "Минимум резервных ядер"),
+            &mut self.config.responsiveness.minimum_reserved_cores,
+            1..=MAX_CONFIGURED_PHYSICAL_CORES,
+            controls_enabled,
+            language.text(
+                "Lower bound for small and medium processors.",
+                "Нижняя граница для процессоров с небольшим и средним числом ядер.",
+            ),
+        );
+        responsiveness_value_u16(
+            ui,
+            language.text("Maximum reserved cores", "Максимум резервных ядер"),
+            &mut self.config.responsiveness.maximum_reserved_cores,
+            1..=MAX_CONFIGURED_PHYSICAL_CORES,
+            controls_enabled,
+            language.text(
+                "Upper bound that prevents a percentage from consuming too much capacity.",
+                "Верхняя граница, не позволяющая проценту занять слишком большую часть CPU.",
+            ),
+        );
+        ui.add_enabled(
+            controls_enabled,
+            egui::Checkbox::new(
+                &mut self.config.responsiveness.latency_guard_enabled,
+                language.text(
+                    "Enable scheduling latency guard",
+                    "Включить контроль задержки планирования",
+                ),
+            ),
+        );
+        responsiveness_value_u64(
+            ui,
+            language.text(
+                "Latency target p99 (microseconds)",
+                "Целевая задержка p99 (мкс)",
+            ),
+            &mut self.config.responsiveness.latency_target_p99_us,
+            MIN_LATENCY_THRESHOLD_US..=MAX_LATENCY_THRESHOLD_US,
+            controls_enabled,
+            language.text(
+                "Sustained values above this threshold shrink memory-profile concurrency.",
+                "Устойчивые значения выше этого порога уменьшают параллелизм memory-профиля.",
+            ),
+        );
+        responsiveness_value_u64(
+            ui,
+            language.text(
+                "Latency recovery p99 (microseconds)",
+                "Порог восстановления p99 (мкс)",
+            ),
+            &mut self.config.responsiveness.latency_recovery_p99_us,
+            MIN_LATENCY_THRESHOLD_US..=MAX_LATENCY_THRESHOLD_US,
+            controls_enabled,
+            language.text(
+                "Sustained values at or below this threshold restore one physical core after cooldown.",
+                "Устойчивые значения не выше этого порога возвращают одно физическое ядро после cooldown.",
+            ),
+        );
+        responsiveness_value_u16(
+            ui,
+            language.text(
+                "Adjustment stability samples",
+                "Стабильные измерения перед изменением",
+            ),
+            &mut self.config.responsiveness.adjustment_stability_samples,
+            1..=MAX_RESPONSIVENESS_STABILITY_SAMPLES,
+            controls_enabled,
+            language.text(
+                "Consecutive service evaluations required before changing memory width.",
+                "Число последовательных оценок службы перед изменением ширины memory-профиля.",
+            ),
+        );
+    }
+
+    fn responsiveness_memory_controls(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        let controls_enabled = self.config.responsiveness.enabled;
+        ui.heading(language.text(
+            "Memory-bound workload profile",
+            "Профиль нагрузок, ограниченных памятью",
+        ));
+        ui.checkbox(
+            &mut self.config.responsiveness.memory.use_smt,
+            language.text(
+                "Allow both SMT threads per physical core",
+                "Разрешить оба SMT-потока физического ядра",
+            ),
+        );
+        ui.label(language.text(
+            "Off is recommended for bandwidth-bound workloads on this Threadripper; the profile keeps one logical processor per physical core.",
+            "Для ограниченных памятью нагрузок на этом Threadripper рекомендуется выключить: профиль оставляет один логический процессор на физическое ядро.",
+        ));
+        responsiveness_value_u16(
+            ui,
+            language.text(
+                "Minimum memory-profile cores",
+                "Минимум ядер memory-профиля",
+            ),
+            &mut self.config.responsiveness.memory.minimum_physical_cores,
+            1..=MAX_CONFIGURED_PHYSICAL_CORES,
+            controls_enabled,
+            language.text(
+                "The adaptive width will never shrink below this value.",
+                "Адаптивная ширина никогда не уменьшится ниже этого значения.",
+            ),
+        );
+        responsiveness_value_u16(
+            ui,
+            language.text(
+                "Maximum memory-profile cores",
+                "Максимум ядер memory-профиля",
+            ),
+            &mut self.config.responsiveness.memory.maximum_physical_cores,
+            1..=MAX_CONFIGURED_PHYSICAL_CORES,
+            controls_enabled,
+            language.text(
+                "The adaptive width will never grow beyond this value.",
+                "Адаптивная ширина никогда не вырастет выше этого значения.",
+            ),
+        );
+        responsiveness_value_u64(
+            ui,
+            language.text(
+                "Memory resize cooldown (milliseconds)",
+                "Пауза изменения ширины memory-профиля (миллисекунды)",
+            ),
+            &mut self.config.responsiveness.memory.resize_cooldown_ms,
+            MIN_MEMORY_RESIZE_COOLDOWN_MS..=MAX_MEMORY_RESIZE_COOLDOWN_MS,
+            controls_enabled,
+            language.text(
+                "Prevents rapid concurrency oscillation and cache churn.",
+                "Предотвращает частые изменения параллелизма и вытеснение кеша.",
+            ),
+        );
+    }
+
+    fn responsiveness_live_status(&self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.heading(language.text("Live service plan", "Текущий план службы"));
+        match read_status(&self.paths.status)
+            .filter(|status| status.schema_version == STATUS_SCHEMA_VERSION)
+        {
+            Some(status) => {
+                let reserve = status.system_reserve;
+                ui.label(match language {
+                    Language::English => format!(
+                        "Physical cores: {}. Reserved: {} cores / {} CPU Sets across {} LLC domains.",
+                        reserve.physical_core_count,
+                        reserve.reserved_physical_cores.len(),
+                        reserve.reserved_cpu_set_ids.len(),
+                        reserve.covered_llc_domains.len(),
+                    ),
+                    Language::Russian => format!(
+                        "Физических ядер: {}. Резерв: {} ядер / {} CPU Sets в {} доменах LLC.",
+                        reserve.physical_core_count,
+                        reserve.reserved_physical_cores.len(),
+                        reserve.reserved_cpu_set_ids.len(),
+                        reserve.covered_llc_domains.len(),
+                    ),
+                });
+                if !reserve.reserved_physical_cores.is_empty() {
+                    ui.monospace(
+                        reserve
+                            .reserved_physical_cores
+                            .iter()
+                            .map(|core| format!("G{}:C{}", core.group, core.core_index))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                let latency = status.scheduler_latency;
+                ui.label(match language {
+                    Language::English => format!(
+                        "Scheduling latency guard: {}. Window: {} samples; p95 {} us, p99 {} us, maximum {} us.",
+                        if latency.enabled { "enabled" } else { "disabled" },
+                        latency.window_samples,
+                        latency.p95_lateness_us,
+                        latency.p99_lateness_us,
+                        latency.maximum_lateness_us,
+                    ),
+                    Language::Russian => format!(
+                        "Контроль задержки планирования: {}. Окно: {} измерений; p95 {} мкс, p99 {} мкс, максимум {} мкс.",
+                        if latency.enabled { "включён" } else { "выключен" },
+                        latency.window_samples,
+                        latency.p95_lateness_us,
+                        latency.p99_lateness_us,
+                        latency.maximum_lateness_us,
+                    ),
+                });
+                ui.label(match language {
+                    Language::English => format!(
+                        "Maximum LLC telemetry: DPC {}.{:02}%, interrupts {}.{:02}%.",
+                        status.maximum_dpc_time_bps / 100,
+                        status.maximum_dpc_time_bps % 100,
+                        status.maximum_interrupt_time_bps / 100,
+                        status.maximum_interrupt_time_bps % 100,
+                    ),
+                    Language::Russian => format!(
+                        "Максимум по LLC: DPC {}.{:02}%, прерывания {}.{:02}%.",
+                        status.maximum_dpc_time_bps / 100,
+                        status.maximum_dpc_time_bps % 100,
+                        status.maximum_interrupt_time_bps / 100,
+                        status.maximum_interrupt_time_bps % 100,
+                    ),
+                });
+                let pressure = match (language, status.responsiveness_pressure) {
+                    (Language::English, ResponsivenessPressure::Unknown) => "unknown",
+                    (Language::English, ResponsivenessPressure::Normal) => "normal",
+                    (Language::English, ResponsivenessPressure::Elevated) => "elevated",
+                    (Language::Russian, ResponsivenessPressure::Unknown) => "нет данных",
+                    (Language::Russian, ResponsivenessPressure::Normal) => "норма",
+                    (Language::Russian, ResponsivenessPressure::Elevated) => "повышено",
+                };
+                ui.label(match language {
+                    Language::English => format!(
+                        "Memory-profile width: {} physical cores; responsiveness pressure: {pressure}.",
+                        status.memory_profile_physical_cores,
+                    ),
+                    Language::Russian => format!(
+                        "Ширина memory-профиля: {} физических ядер; давление на отзывчивость: {pressure}.",
+                        status.memory_profile_physical_cores,
+                    ),
+                });
+                if let Some(adjustment) = &status.last_responsiveness_adjustment {
+                    ui.label(match language {
+                        Language::English => format!("Last adjustment: {adjustment}"),
+                        Language::Russian => format!("Последнее изменение: {adjustment}"),
+                    });
+                }
+            }
+            None => {
+                ui.label(language.text(
+                    "Live reserve information is unavailable until a schema-3 service is running.",
+                    "Информация о резерве появится после запуска службы со схемой статуса 3.",
+                ));
+            }
+        }
+    }
+
     fn rules_tab(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
         ui.horizontal(|ui| {
@@ -823,6 +1121,7 @@ impl SettingsApp {
                 self.config.rules.push(ProcessRule {
                     image: String::new(),
                     mode: RuleMode::Auto,
+                    profile: WorkloadProfile::Balanced,
                     group: None,
                     llc: None,
                 });
@@ -1108,6 +1407,7 @@ impl eframe::App for SettingsApp {
                     .show(ui, |ui| match self.tab {
                         SettingsTab::General => self.general_tab(ui),
                         SettingsTab::Adaptive => self.adaptive_tab(ui),
+                        SettingsTab::Responsiveness => self.responsiveness_tab(ui),
                         SettingsTab::Rules => self.rules_tab(ui),
                         SettingsTab::Logging => self.logging_tab(ui),
                     });
@@ -1183,6 +1483,16 @@ fn general_values(ui: &mut egui::Ui, config: &mut ControllerConfig, language: La
                 false,
             );
             ui.end_row();
+
+            ui.label(language.text("Default workload profile", "Профиль нагрузки по умолчанию"));
+            workload_profile_combo(
+                ui,
+                "default-workload-profile",
+                language.text("Default workload profile", "Профиль нагрузки по умолчанию"),
+                &mut config.default_workload_profile,
+                language,
+            );
+            ui.end_row();
         });
 }
 
@@ -1249,6 +1559,21 @@ fn process_rule_ui(
                         rule.llc = None;
                     }
                 }
+                ui.end_row();
+
+                ui.label(language.text("Workload profile", "Профиль нагрузки"));
+                workload_profile_combo(
+                    ui,
+                    ("process-workload-profile", index),
+                    &format!(
+                        "{} {} — {}",
+                        language.text("Rule", "Правило"),
+                        index + 1,
+                        language.text("workload profile", "профиль нагрузки")
+                    ),
+                    &mut rule.profile,
+                    language,
+                );
                 ui.end_row();
 
                 if rule.mode == RuleMode::Strict {
@@ -1327,6 +1652,112 @@ fn rule_mode_combo(
                 ui.selectable_value(mode, candidate, rule_mode_name(candidate, language));
             }
         });
+}
+
+fn workload_profile_name(profile: WorkloadProfile, language: Language) -> &'static str {
+    match profile {
+        WorkloadProfile::Interactive => language.text("Interactive", "Интерактивный"),
+        WorkloadProfile::Memory => language.text("Memory-bound", "Ограничен памятью"),
+        WorkloadProfile::Compute => language.text("Compute", "Вычислительный"),
+        WorkloadProfile::Background => language.text("Background", "Фоновый"),
+        WorkloadProfile::Balanced => language.text("Balanced", "Сбалансированный"),
+    }
+}
+
+fn workload_profile_combo(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    accessible_label: &str,
+    profile: &mut WorkloadProfile,
+    language: Language,
+) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(format!(
+            "{accessible_label}: {}",
+            workload_profile_name(*profile, language)
+        ))
+        .show_ui(ui, |ui| {
+            for candidate in [
+                WorkloadProfile::Interactive,
+                WorkloadProfile::Memory,
+                WorkloadProfile::Compute,
+                WorkloadProfile::Background,
+                WorkloadProfile::Balanced,
+            ] {
+                ui.selectable_value(
+                    profile,
+                    candidate,
+                    workload_profile_name(candidate, language),
+                );
+            }
+        });
+}
+
+fn responsiveness_value_u8(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u8,
+    range: std::ops::RangeInclusive<u8>,
+    enabled: bool,
+    explanation: &str,
+    suffix: &str,
+) {
+    let row_width = (ui.available_width() - 16.0).max(240.0);
+    ui.group(|ui| {
+        ui.set_width(row_width);
+        let response = ui.label(RichText::new(label).strong());
+        ui.label(explanation);
+        ui.add_space(4.0);
+        ui.add_enabled(
+            enabled,
+            egui::DragValue::new(value).range(range).suffix(suffix),
+        )
+        .labelled_by(response.id);
+    });
+    ui.add_space(6.0);
+}
+
+fn responsiveness_value_u16(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u16,
+    range: std::ops::RangeInclusive<u16>,
+    enabled: bool,
+    explanation: &str,
+) {
+    let row_width = (ui.available_width() - 16.0).max(240.0);
+    ui.group(|ui| {
+        ui.set_width(row_width);
+        let response = ui.label(RichText::new(label).strong());
+        ui.label(explanation);
+        ui.add_space(4.0);
+        ui.add_enabled(enabled, egui::DragValue::new(value).range(range))
+            .labelled_by(response.id);
+    });
+    ui.add_space(6.0);
+}
+
+fn responsiveness_value_u64(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u64,
+    range: std::ops::RangeInclusive<u64>,
+    enabled: bool,
+    explanation: &str,
+) {
+    let row_width = (ui.available_width() - 16.0).max(240.0);
+    ui.group(|ui| {
+        ui.set_width(row_width);
+        let response = ui.label(RichText::new(label).strong());
+        ui.label(explanation);
+        ui.add_space(4.0);
+        ui.add_enabled(
+            enabled,
+            egui::DragValue::new(value).range(range).speed(1_000),
+        )
+        .labelled_by(response.id);
+    });
+    ui.add_space(6.0);
 }
 
 fn policy_value_u16(

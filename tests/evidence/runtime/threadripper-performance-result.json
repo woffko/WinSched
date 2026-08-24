@@ -1,0 +1,111 @@
+{
+  "result": "PASS",
+  "target": {
+    "physical_cores": 32,
+    "logical_processors": 64,
+    "llc_domains": 8,
+    "reserved_physical_cores": 4,
+    "memory_profile_cpu_sets": 28
+  },
+  "workload": {
+    "workers": 48,
+    "working_set_mib": 1024,
+    "warmup_seconds": 5,
+    "measurement_seconds": 20,
+    "operation": "random private-buffer 64-bit read-modify-write",
+    "throughput_unit": "million operations per second"
+  },
+  "medians": {
+    "baseline_throughput_mops": 543.814493,
+    "managed_throughput_mops": 625.956536,
+    "throughput_delta_percent": 15.104791074407805,
+    "baseline_latency_p99_us": 5858.3,
+    "managed_latency_p99_us": 980.3,
+    "latency_improvement_percent": 83.266476622911085
+  },
+  "stability": {
+    "baseline_throughput_range_percent": 1.0977223073015763,
+    "managed_throughput_range_percent": 5.1525698902519279,
+    "maximum_allowed_range_percent": 10.0
+  },
+  "gates": {
+    "latency_improvement_at_least_20_percent": true,
+    "throughput_loss_at_most_5_percent": true,
+    "throughput_run_range_at_most_10_percent": true
+  },
+  "phases": [
+    {
+      "sequence": 1,
+      "mode": "baseline",
+      "throughput_mops": 539.857535,
+      "process_cpu_percent": 74.14316,
+      "latency_p50_us": 511.3,
+      "latency_p95_us": 2186.5,
+      "latency_p99_us": 6156.5,
+      "latency_max_us": 15450.6,
+      "latency_samples": 7425,
+      "high_resolution_timer": true
+    },
+    {
+      "sequence": 2,
+      "mode": "managed",
+      "throughput_mops": 601.549134,
+      "process_cpu_percent": 43.300913,
+      "latency_p50_us": 474.0,
+      "latency_p95_us": 754.8,
+      "latency_p99_us": 981.9,
+      "latency_max_us": 3144.8,
+      "latency_samples": 8362,
+      "high_resolution_timer": true
+    },
+    {
+      "sequence": 3,
+      "mode": "managed",
+      "throughput_mops": 625.956536,
+      "process_cpu_percent": 43.387882,
+      "latency_p50_us": 500.0,
+      "latency_p95_us": 767.0,
+      "latency_p99_us": 971.5,
+      "latency_max_us": 2382.7,
+      "latency_samples": 8293,
+      "high_resolution_timer": true
+    },
+    {
+      "sequence": 4,
+      "mode": "baseline",
+      "throughput_mops": 545.827108,
+      "process_cpu_percent": 74.144788,
+      "latency_p50_us": 519.2,
+      "latency_p95_us": 2090.9,
+      "latency_p99_us": 5858.3,
+      "latency_max_us": 15615.6,
+      "latency_samples": 7480,
+      "high_resolution_timer": true
+    },
+    {
+      "sequence": 5,
+      "mode": "baseline",
+      "throughput_mops": 543.814493,
+      "process_cpu_percent": 74.225709,
+      "latency_p50_us": 508.0,
+      "latency_p95_us": 1780.8,
+      "latency_p99_us": 5045.4,
+      "latency_max_us": 13527.3,
+      "latency_samples": 7638,
+      "high_resolution_timer": true
+    },
+    {
+      "sequence": 6,
+      "mode": "managed",
+      "throughput_mops": 633.801982,
+      "process_cpu_percent": 43.362295,
+      "latency_p50_us": 501.3,
+      "latency_p95_us": 753.0,
+      "latency_p99_us": 980.3,
+      "latency_max_us": 3707.0,
+      "latency_samples": 8276,
+      "high_resolution_timer": true
+    }
+  ],
+  "metric_scope": "synthetic random-memory operations; not measured DRAM bandwidth"
+}

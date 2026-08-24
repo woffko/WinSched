@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 winsched-config = { path = "../winsched-config" }
+winsched-core = { path = "../winsched-core" }
 
 [lints]
 workspace = true

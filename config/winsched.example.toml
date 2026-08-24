@@ -1,14 +1,31 @@
-schema_version = 2
+schema_version = 3
 controller_mode = "observe"
 sample_interval_ms = 1000
 minimum_process_utilization_bps = 500
 all_user_processes = false
 default_rule_mode = "auto"
+default_workload_profile = "balanced"
 
 [logging]
 enabled = true
 max_file_size_mib = 10
 retained_archives = 1
+
+[responsiveness]
+enabled = false
+system_reserve_percent = 10
+minimum_reserved_cores = 2
+maximum_reserved_cores = 8
+latency_guard_enabled = true
+latency_target_p99_us = 2000
+latency_recovery_p99_us = 1000
+adjustment_stability_samples = 5
+
+[responsiveness.memory]
+use_smt = false
+minimum_physical_cores = 8
+maximum_physical_cores = 28
+resize_cooldown_ms = 300000
 
 [policy]
 overload_threshold_bps = 8500
@@ -21,3 +38,4 @@ max_mutations_per_evaluation = 1
 [[rules]]
 image = "winsched.exe"
 mode = "auto"
+profile = "balanced"

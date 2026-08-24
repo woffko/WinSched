@@ -98,6 +98,8 @@ mod app {
         service: MenuItem,
         mode: MenuItem,
         managed: MenuItem,
+        reserve: MenuItem,
+        latency: MenuItem,
         activity: MenuItem,
         error: MenuItem,
         settings: MenuItem,
@@ -113,6 +115,8 @@ mod app {
             let service = MenuItem::with_id(MENU_SERVICE, "Service Unavailable", false, None);
             let mode = MenuItem::new("Mode: Unknown", false, None);
             let managed = MenuItem::new("Managed processes: 0", false, None);
+            let reserve = MenuItem::new("System reserve: unavailable", false, None);
+            let latency = MenuItem::new("Latency guard: unavailable", false, None);
             let activity = MenuItem::new("Last activity: none", false, None);
             let error = MenuItem::new("Last error: none", false, None);
             let settings = MenuItem::with_id(MENU_SETTINGS, "Settings...", true, None);
@@ -136,6 +140,8 @@ mod app {
                 &separator_1,
                 &mode,
                 &managed,
+                &reserve,
+                &latency,
                 &activity,
                 &error,
                 &separator_2,
@@ -164,6 +170,8 @@ mod app {
                 service,
                 mode,
                 managed,
+                reserve,
+                latency,
                 activity,
                 error,
                 settings,
@@ -180,6 +188,8 @@ mod app {
             self.service.set_enabled(model.service_action_enabled);
             self.mode.set_text(&model.mode);
             self.managed.set_text(&model.managed);
+            self.reserve.set_text(&model.reserve);
+            self.latency.set_text(&model.latency);
             self.activity.set_text(&model.activity);
             self.error.set_text(&model.error);
             self.settings.set_enabled(settings_present);

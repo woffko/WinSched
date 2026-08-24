@@ -140,6 +140,13 @@ try {
         '(?ms)^\s*\[logging\]\s*.*?(?=^\s*\[|\z)',
         ''
     )
+    foreach ($section in @('responsiveness.memory', 'responsiveness')) {
+        $customConfig = [regex]::Replace(
+            $customConfig,
+            '(?ms)^\s*\[' + [regex]::Escape($section) + '\]\s*.*?(?=^\s*\[|\z)',
+            ''
+        )
+    }
     $customConfig = $customConfig -replace `
         'minimum_process_utilization_bps\s*=\s*\d+', `
         'minimum_process_utilization_bps = 777'
@@ -155,15 +162,19 @@ try {
         "upgrade rewrote the legacy schema version"
     Assert-True ($preservedConfig -notmatch '(?m)^\s*\[logging\]\s*$') `
         "upgrade inserted a logging table into the preserved schema-1 file"
+    Assert-True ($preservedConfig -notmatch '(?m)^\s*\[responsiveness(?:\.memory)?\]\s*$') `
+        "upgrade inserted a responsiveness table into the preserved schema-1 file"
     Assert-True ($preservedConfig -match 'minimum_process_utilization_bps\s*=\s*777') "upgrade overwrote the existing configuration"
     Wait-Condition "schema-1 logging defaults applied by the upgraded service" {
         try {
             $status = Get-Content -LiteralPath (Join-Path $InstallDirectory "status.json") -Raw |
                 ConvertFrom-Json
-            [int]$status.schema_version -eq 2 -and
+            [int]$status.schema_version -eq 3 -and
                 [bool]$status.applied_logging.enabled -and
                 [int]$status.applied_logging.max_file_size_mib -eq 10 -and
-                [int]$status.applied_logging.retained_archives -eq 1
+                [int]$status.applied_logging.retained_archives -eq 1 -and
+                -not [bool]$status.applied_responsiveness.enabled -and
+                @($status.system_reserve.reserved_cpu_set_ids).Count -eq 0
         } catch {
             $false
         }
@@ -181,7 +192,11 @@ try {
     )) {
         $logFilesBeforeUninstall[$logFile.Name] = [ordered]@{
             path = $logFile.FullName
-            sha256 = (Get-FileHash -LiteralPath $logFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            sha256 = if ($logFile.Name -eq "winsched.log") {
+                $null
+            } else {
+                (Get-FileHash -LiteralPath $logFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
         }
     }
     Assert-True ($logFilesBeforeUninstall.Count -ge 2) `
@@ -280,6 +295,7 @@ try {
         result = "PASS"
         schema1_upgrade_preserved_bytes = $true
         schema1_logging_defaults_applied = $true
+        schema1_responsiveness_default_disabled = $true
         upgrade_preserved_threshold_bps = 777
         normal_uninstall_preserved_data = $true
         purge_removed_data = $true

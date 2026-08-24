@@ -120,6 +120,13 @@ impl Drop for OwnedPdhQuery {
 #[derive(Debug)]
 struct ProcessorCounter {
     domain: LlcDomainKey,
+    utility: PdhCounter,
+    dpc: Option<PdhCounter>,
+    interrupt: Option<PdhCounter>,
+}
+
+#[derive(Debug)]
+struct PdhCounter {
     path: String,
     handle: PDH_HCOUNTER,
 }
@@ -141,24 +148,27 @@ impl LoadSampler {
 
         let mut counters = Vec::with_capacity(topology.cpu_sets.len());
         for cpu in &topology.cpu_sets {
-            let path = format!(
+            let instance = format!("{},{}", cpu.group, cpu.logical_processor_index);
+            let utility_path = format!(
                 r"\Processor Information({},{})\% Processor Utility",
                 cpu.group, cpu.logical_processor_index
             );
-            let wide_path = wide_null(OsStr::new(&path));
-            let mut counter = PDH_HCOUNTER::default();
-            // SAFETY: The query is live and wide_path is a valid null-terminated UTF-16 string.
-            let status = unsafe {
-                PdhAddEnglishCounterW(query.0, PCWSTR(wide_path.as_ptr()), 0, &raw mut counter)
-            };
-            check_pdh("PdhAddEnglishCounterW", status)?;
             counters.push(ProcessorCounter {
                 domain: LlcDomainKey {
                     group: cpu.group,
                     last_level_cache_index: cpu.last_level_cache_index,
                 },
-                path,
-                handle: counter,
+                utility: add_pdh_counter(query.0, utility_path)?,
+                dpc: add_pdh_counter(
+                    query.0,
+                    format!(r"\Processor Information({instance})\% DPC Time"),
+                )
+                .ok(),
+                interrupt: add_pdh_counter(
+                    query.0,
+                    format!(r"\Processor Information({instance})\% Interrupt Time"),
+                )
+                .ok(),
             });
         }
 
@@ -176,40 +186,70 @@ impl LoadSampler {
         let status = unsafe { PdhCollectQueryData(self.query.0) };
         check_pdh("PdhCollectQueryData(sample)", status)?;
 
-        let mut domains = BTreeMap::<LlcDomainKey, (u64, u64)>::new();
+        let mut domains = BTreeMap::<LlcDomainKey, (u64, u64, u64, u64)>::new();
         for counter in &self.counters {
-            let mut value = PDH_FMT_COUNTERVALUE::default();
-            // SAFETY: The counter belongs to the live query and value is writable.
-            let status = unsafe {
-                PdhGetFormattedCounterValue(counter.handle, PDH_FMT_DOUBLE, None, &raw mut value)
-            };
-            check_pdh("PdhGetFormattedCounterValue", status)?;
-            if !matches!(value.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
-                return Err(PlatformError::PdhCounterStatus {
-                    path: counter.path.clone(),
-                    status: value.CStatus,
-                });
-            }
-            // SAFETY: PDH_FMT_DOUBLE makes doubleValue the active union member.
-            let utility = unsafe { value.Anonymous.doubleValue };
-            if !utility.is_finite() {
-                return Err(PlatformError::PdhNonFinite(counter.path.clone()));
-            }
-            let basis_points = utility_to_basis_points(utility);
+            let basis_points = read_pdh_counter(&counter.utility)?;
+            let dpc_time_bps = counter
+                .dpc
+                .as_ref()
+                .and_then(|counter| read_pdh_counter(counter).ok())
+                .unwrap_or(0);
+            let interrupt_time_bps = counter
+                .interrupt
+                .as_ref()
+                .and_then(|counter| read_pdh_counter(counter).ok())
+                .unwrap_or(0);
             let aggregate = domains.entry(counter.domain).or_default();
             aggregate.0 += u64::from(basis_points);
-            aggregate.1 += 1;
+            aggregate.1 += u64::from(dpc_time_bps);
+            aggregate.2 += u64::from(interrupt_time_bps);
+            aggregate.3 += 1;
         }
 
         Ok(domains
             .into_iter()
-            .map(|(domain, (sum, count))| DomainLoad {
+            .map(|(domain, (utility, dpc, interrupt, count))| DomainLoad {
                 domain,
-                utilization_bps: u16::try_from(sum / count)
+                utilization_bps: u16::try_from(utility / count)
+                    .expect("an average of clamped basis points fits u16"),
+                dpc_time_bps: u16::try_from(dpc / count)
+                    .expect("an average of clamped basis points fits u16"),
+                interrupt_time_bps: u16::try_from(interrupt / count)
                     .expect("an average of clamped basis points fits u16"),
             })
             .collect())
     }
+}
+
+fn add_pdh_counter(query: PDH_HQUERY, path: String) -> Result<PdhCounter, PlatformError> {
+    let wide_path = wide_null(OsStr::new(&path));
+    let mut handle = PDH_HCOUNTER::default();
+    // SAFETY: The query is live and wide_path is a valid null-terminated UTF-16 string.
+    let status =
+        unsafe { PdhAddEnglishCounterW(query, PCWSTR(wide_path.as_ptr()), 0, &raw mut handle) };
+    check_pdh("PdhAddEnglishCounterW", status)?;
+    Ok(PdhCounter { path, handle })
+}
+
+fn read_pdh_counter(counter: &PdhCounter) -> Result<u16, PlatformError> {
+    let mut value = PDH_FMT_COUNTERVALUE::default();
+    // SAFETY: The counter belongs to a live query and value is writable.
+    let status = unsafe {
+        PdhGetFormattedCounterValue(counter.handle, PDH_FMT_DOUBLE, None, &raw mut value)
+    };
+    check_pdh("PdhGetFormattedCounterValue", status)?;
+    if !matches!(value.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
+        return Err(PlatformError::PdhCounterStatus {
+            path: counter.path.clone(),
+            status: value.CStatus,
+        });
+    }
+    // SAFETY: PDH_FMT_DOUBLE makes doubleValue the active union member.
+    let measured = unsafe { value.Anonymous.doubleValue };
+    if !measured.is_finite() {
+        return Err(PlatformError::PdhNonFinite(counter.path.clone()));
+    }
+    Ok(utility_to_basis_points(measured))
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

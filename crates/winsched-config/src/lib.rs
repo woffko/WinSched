@@ -14,10 +14,19 @@ use winsched_core::{
 };
 
 pub const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const LOGGING_CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 pub const MIN_LOG_FILE_SIZE_MIB: u16 = 1;
 pub const MAX_LOG_FILE_SIZE_MIB: u16 = 100;
 pub const MAX_RETAINED_LOG_ARCHIVES: u8 = 10;
+pub const MIN_SYSTEM_RESERVE_PERCENT: u8 = 1;
+pub const MAX_SYSTEM_RESERVE_PERCENT: u8 = 25;
+pub const MAX_CONFIGURED_PHYSICAL_CORES: u16 = 256;
+pub const MIN_MEMORY_RESIZE_COOLDOWN_MS: u64 = 30_000;
+pub const MAX_MEMORY_RESIZE_COOLDOWN_MS: u64 = 3_600_000;
+pub const MIN_LATENCY_THRESHOLD_US: u64 = 100;
+pub const MAX_LATENCY_THRESHOLD_US: u64 = 100_000;
+pub const MAX_RESPONSIVENESS_STABILITY_SAMPLES: u16 = 60;
 
 /// Global mutation gate for the controller.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,6 +51,18 @@ pub enum RuleMode {
     Strict,
 }
 
+/// Locality and concurrency behavior for one managed workload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadProfile {
+    Interactive,
+    Memory,
+    Compute,
+    Background,
+    #[default]
+    Balanced,
+}
+
 /// One exact, case-insensitive executable-name rule.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,9 +71,63 @@ pub struct ProcessRule {
     #[serde(default)]
     pub mode: RuleMode,
     #[serde(default)]
+    pub profile: WorkloadProfile,
+    #[serde(default)]
     pub group: Option<u16>,
     #[serde(default)]
     pub llc: Option<u8>,
+}
+
+/// Concurrency controls used for explicitly memory-bound workloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryProfileConfig {
+    pub use_smt: bool,
+    pub minimum_physical_cores: u16,
+    pub maximum_physical_cores: u16,
+    pub resize_cooldown_ms: u64,
+}
+
+impl Default for MemoryProfileConfig {
+    fn default() -> Self {
+        Self {
+            use_smt: false,
+            minimum_physical_cores: 8,
+            maximum_physical_cores: 28,
+            resize_cooldown_ms: 300_000,
+        }
+    }
+}
+
+/// Topology-aware capacity held back from managed applications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResponsivenessConfig {
+    pub enabled: bool,
+    pub system_reserve_percent: u8,
+    pub minimum_reserved_cores: u16,
+    pub maximum_reserved_cores: u16,
+    pub latency_guard_enabled: bool,
+    pub latency_target_p99_us: u64,
+    pub latency_recovery_p99_us: u64,
+    pub adjustment_stability_samples: u16,
+    pub memory: MemoryProfileConfig,
+}
+
+impl Default for ResponsivenessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            system_reserve_percent: 10,
+            minimum_reserved_cores: 2,
+            maximum_reserved_cores: 8,
+            latency_guard_enabled: true,
+            latency_target_p99_us: 2_000,
+            latency_recovery_p99_us: 1_000,
+            adjustment_stability_samples: 5,
+            memory: MemoryProfileConfig::default(),
+        }
+    }
 }
 
 /// Bounded diagnostic event logging policy.
@@ -92,7 +167,9 @@ pub struct ControllerConfig {
     pub minimum_process_utilization_bps: u16,
     pub all_user_processes: bool,
     pub default_rule_mode: RuleMode,
+    pub default_workload_profile: WorkloadProfile,
     pub logging: LoggingConfig,
+    pub responsiveness: ResponsivenessConfig,
     pub policy: PolicyConfig,
     pub rules: Vec<ProcessRule>,
 }
@@ -106,7 +183,9 @@ impl Default for ControllerConfig {
             minimum_process_utilization_bps: 500,
             all_user_processes: false,
             default_rule_mode: RuleMode::Auto,
+            default_workload_profile: WorkloadProfile::Balanced,
             logging: LoggingConfig::default(),
+            responsiveness: ResponsivenessConfig::default(),
             policy: PolicyConfig::default(),
             rules: Vec::new(),
         }
@@ -118,6 +197,7 @@ impl Default for ControllerConfig {
 pub struct ResolvedRule {
     pub placement: PlacementMode,
     pub enforcement: EnforcementMode,
+    pub profile: WorkloadProfile,
 }
 
 #[derive(Debug, Error)]
@@ -136,6 +216,18 @@ pub enum ConfigError {
     LogFileSize,
     #[error("logging.retained_archives must be <= 10")]
     LogArchives,
+    #[error("responsiveness.system_reserve_percent must be between 1 and 25")]
+    SystemReservePercent,
+    #[error("responsiveness reserved core bounds must satisfy 1 <= minimum <= maximum <= 256")]
+    SystemReserveCoreBounds,
+    #[error("responsiveness.memory core bounds must satisfy 1 <= minimum <= maximum <= 256")]
+    MemoryCoreBounds,
+    #[error("responsiveness.memory.resize_cooldown_ms must be between 30000 and 3600000")]
+    MemoryResizeCooldown,
+    #[error("responsiveness latency thresholds must satisfy 100 <= recovery <= target <= 100000")]
+    ResponsivenessLatencyThresholds,
+    #[error("responsiveness.adjustment_stability_samples must be between 1 and 60")]
+    ResponsivenessStabilitySamples,
     #[error("invalid policy: {0}")]
     Policy(#[from] winsched_core::adaptive::AdaptiveError),
     #[error("rule image must be an executable name without path separators")]
@@ -165,7 +257,10 @@ impl ControllerConfig {
     /// schema versions, unsafe sampling intervals, or inconsistent rules.
     pub fn from_toml(value: &str) -> Result<Self, ConfigError> {
         let mut config = toml::from_str::<Self>(value)?;
-        if config.schema_version == LEGACY_CONFIG_SCHEMA_VERSION {
+        if matches!(
+            config.schema_version,
+            LEGACY_CONFIG_SCHEMA_VERSION | LOGGING_CONFIG_SCHEMA_VERSION
+        ) {
             config.schema_version = CONFIG_SCHEMA_VERSION;
         }
         config.validate()
@@ -196,6 +291,43 @@ impl ControllerConfig {
         }
         if self.logging.retained_archives > MAX_RETAINED_LOG_ARCHIVES {
             return Err(ConfigError::LogArchives);
+        }
+        if !(MIN_SYSTEM_RESERVE_PERCENT..=MAX_SYSTEM_RESERVE_PERCENT)
+            .contains(&self.responsiveness.system_reserve_percent)
+        {
+            return Err(ConfigError::SystemReservePercent);
+        }
+        if self.responsiveness.minimum_reserved_cores == 0
+            || self.responsiveness.minimum_reserved_cores
+                > self.responsiveness.maximum_reserved_cores
+            || self.responsiveness.maximum_reserved_cores > MAX_CONFIGURED_PHYSICAL_CORES
+        {
+            return Err(ConfigError::SystemReserveCoreBounds);
+        }
+        if self.responsiveness.memory.minimum_physical_cores == 0
+            || self.responsiveness.memory.minimum_physical_cores
+                > self.responsiveness.memory.maximum_physical_cores
+            || self.responsiveness.memory.maximum_physical_cores > MAX_CONFIGURED_PHYSICAL_CORES
+        {
+            return Err(ConfigError::MemoryCoreBounds);
+        }
+        if !(MIN_MEMORY_RESIZE_COOLDOWN_MS..=MAX_MEMORY_RESIZE_COOLDOWN_MS)
+            .contains(&self.responsiveness.memory.resize_cooldown_ms)
+        {
+            return Err(ConfigError::MemoryResizeCooldown);
+        }
+        if !(MIN_LATENCY_THRESHOLD_US..=MAX_LATENCY_THRESHOLD_US)
+            .contains(&self.responsiveness.latency_recovery_p99_us)
+            || self.responsiveness.latency_recovery_p99_us
+                > self.responsiveness.latency_target_p99_us
+            || self.responsiveness.latency_target_p99_us > MAX_LATENCY_THRESHOLD_US
+        {
+            return Err(ConfigError::ResponsivenessLatencyThresholds);
+        }
+        if !(1..=MAX_RESPONSIVENESS_STABILITY_SAMPLES)
+            .contains(&self.responsiveness.adjustment_stability_samples)
+        {
+            return Err(ConfigError::ResponsivenessStabilitySamples);
         }
         self.policy = self.policy.validate()?;
 
@@ -234,6 +366,7 @@ impl ControllerConfig {
             return None;
         }
         let mode = rule.map_or(self.default_rule_mode, |rule| rule.mode);
+        let profile = rule.map_or(self.default_workload_profile, |rule| rule.profile);
         let placement = match mode {
             RuleMode::Off => PlacementMode::Off,
             RuleMode::Sticky => PlacementMode::Sticky,
@@ -258,6 +391,7 @@ impl ControllerConfig {
                 ControllerMode::Auto => EnforcementMode::Apply,
                 ControllerMode::Off => unreachable!("off returned before rule resolution"),
             },
+            profile,
         })
     }
 }
@@ -291,6 +425,7 @@ mode = "performance"
             Some(ResolvedRule {
                 placement: PlacementMode::Performance,
                 enforcement: EnforcementMode::Observe,
+                profile: WorkloadProfile::Balanced,
             })
         );
     }
@@ -311,6 +446,7 @@ default_rule_mode = "sticky"
             Some(ResolvedRule {
                 placement: PlacementMode::Sticky,
                 enforcement: EnforcementMode::Apply,
+                profile: WorkloadProfile::Balanced,
             })
         );
     }
@@ -370,7 +506,9 @@ stability_samples = 5
     #[test]
     fn fingerprint_matches_normalized_legacy_config_and_changes_with_content() {
         let legacy = ControllerConfig::from_toml("schema_version = 1").unwrap();
-        let current = ControllerConfig::from_toml("schema_version = 2").unwrap();
+        let logging_schema = ControllerConfig::from_toml("schema_version = 2").unwrap();
+        let current = ControllerConfig::from_toml("schema_version = 3").unwrap();
+        assert_eq!(legacy.fingerprint(), logging_schema.fingerprint());
         assert_eq!(legacy.fingerprint(), current.fingerprint());
 
         let mut changed = current;
@@ -406,10 +544,56 @@ enabled = false
 
     #[test]
     fn unsupported_config_schema_is_rejected() {
-        for schema in [0, 3] {
+        for schema in [0, 4] {
             let error =
                 ControllerConfig::from_toml(&format!("schema_version = {schema}")).unwrap_err();
             assert!(matches!(error, ConfigError::SchemaVersion(value) if value == schema));
+        }
+    }
+
+    #[test]
+    fn legacy_schemas_keep_the_responsiveness_controller_disabled() {
+        for schema in [1, 2] {
+            let config =
+                ControllerConfig::from_toml(&format!("schema_version = {schema}")).unwrap();
+            assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+            assert_eq!(config.responsiveness, ResponsivenessConfig::default());
+            assert!(!config.responsiveness.enabled);
+        }
+    }
+
+    #[test]
+    fn exact_rule_selects_an_independent_workload_profile() {
+        let config = ControllerConfig::from_toml(
+            r#"
+schema_version = 3
+controller_mode = "auto"
+
+[[rules]]
+image = "renderer.exe"
+mode = "sticky"
+profile = "memory"
+"#,
+        )
+        .unwrap();
+        let resolved = config.resolve("RENDERER.EXE").unwrap();
+        assert_eq!(resolved.placement, PlacementMode::Sticky);
+        assert_eq!(resolved.enforcement, EnforcementMode::Apply);
+        assert_eq!(resolved.profile, WorkloadProfile::Memory);
+    }
+
+    #[test]
+    fn responsiveness_bounds_are_validated_even_when_disabled() {
+        for document in [
+            "schema_version = 3\n[responsiveness]\nsystem_reserve_percent = 0\n",
+            "schema_version = 3\n[responsiveness]\nsystem_reserve_percent = 26\n",
+            "schema_version = 3\n[responsiveness]\nminimum_reserved_cores = 9\nmaximum_reserved_cores = 8\n",
+            "schema_version = 3\n[responsiveness.memory]\nminimum_physical_cores = 29\nmaximum_physical_cores = 28\n",
+            "schema_version = 3\n[responsiveness.memory]\nresize_cooldown_ms = 29999\n",
+            "schema_version = 3\n[responsiveness]\nlatency_recovery_p99_us = 3000\nlatency_target_p99_us = 2000\n",
+            "schema_version = 3\n[responsiveness]\nadjustment_stability_samples = 0\n",
+        ] {
+            assert!(ControllerConfig::from_toml(document).is_err());
         }
     }
 

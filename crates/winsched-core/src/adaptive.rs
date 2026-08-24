@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{LlcDomain, LlcDomainKey, ProcessorClassPreference, Topology};
+use crate::{CpuPartition, LlcDomain, LlcDomainKey, ProcessorClassPreference, Topology};
 
 const FULL_UTILIZATION_BPS: u16 = 10_000;
 
@@ -117,6 +117,8 @@ pub struct ProcessObservation {
     pub enforcement: EnforcementMode,
     pub current_domain: Option<LlcDomainKey>,
     pub assignment_origin: AssignmentOrigin,
+    pub refresh_required: bool,
+    pub preferred_partition: Option<CpuPartition>,
     pub exclusion: Option<ExclusionReason>,
 }
 
@@ -125,6 +127,8 @@ pub struct ProcessObservation {
 pub struct DomainLoad {
     pub domain: LlcDomainKey,
     pub utilization_bps: u16,
+    pub dpc_time_bps: u16,
+    pub interrupt_time_bps: u16,
 }
 
 /// A mutation or no-op recommended by the policy engine.
@@ -175,6 +179,9 @@ pub enum DecisionReason {
     Excluded(ExclusionReason),
     ExternalAssignment,
     PendingMutation,
+    PartitionRefresh,
+    ProfilePartition,
+    ProfilePartitionStable,
     InitialPlacement,
     StickyPlacement,
     BelowOverloadThreshold,
@@ -542,20 +549,32 @@ fn evaluate_process(
     let enforce = process.enforcement == EnforcementMode::Apply;
     let class = class_preference(process.mode);
 
-    if let PlacementMode::Strict(target) = process.mode {
-        return strict_decision(topology, process, target, class);
+    if let Some(profile_decision) = preferred_partition_decision(process, enforce) {
+        return Ok(profile_decision);
     }
 
-    let Some(current) = process.current_domain else {
-        let (target, cpu_set_ids) = least_loaded_domain(topology, loads, None, class)?;
+    if process.refresh_required
+        && let Some(target) = process.current_domain
+    {
+        let cpu_set_ids = domain_cpu_set_ids(topology, target, class)?;
         return Ok(decision(
             process,
             PolicyAction::Assign {
                 target,
                 cpu_set_ids,
             },
-            DecisionReason::InitialPlacement,
+            DecisionReason::PartitionRefresh,
             enforce,
+        ));
+    }
+
+    if let PlacementMode::Strict(target) = process.mode {
+        return Ok(strict_decision(topology, process, target, class));
+    }
+
+    let Some(current) = process.current_domain else {
+        return Ok(initial_assignment_decision(
+            topology, loads, process, class, enforce,
         ));
     };
 
@@ -575,14 +594,79 @@ fn evaluate_process(
     ))
 }
 
+fn initial_assignment_decision(
+    topology: &Topology,
+    loads: &BTreeMap<LlcDomainKey, u16>,
+    process: &ProcessObservation,
+    class: ProcessorClassPreference,
+    enforce: bool,
+) -> PolicyDecision {
+    let Ok((target, cpu_set_ids)) = least_loaded_domain(topology, loads, None, class) else {
+        return decision(
+            process,
+            PolicyAction::Ignore,
+            DecisionReason::NoAlternativeDomain,
+            false,
+        );
+    };
+    decision(
+        process,
+        PolicyAction::Assign {
+            target,
+            cpu_set_ids,
+        },
+        DecisionReason::InitialPlacement,
+        enforce,
+    )
+}
+
+fn preferred_partition_decision(
+    process: &ProcessObservation,
+    enforce: bool,
+) -> Option<PolicyDecision> {
+    let partition = process.preferred_partition.as_ref()?;
+    if process.assignment_origin == AssignmentOrigin::Managed && !process.refresh_required {
+        return Some(decision(
+            process,
+            PolicyAction::Keep {
+                domain: Some(partition.anchor_domain),
+            },
+            DecisionReason::ProfilePartitionStable,
+            false,
+        ));
+    }
+    Some(decision(
+        process,
+        PolicyAction::Assign {
+            target: partition.anchor_domain,
+            cpu_set_ids: partition.cpu_set_ids.clone(),
+        },
+        if process.assignment_origin == AssignmentOrigin::Managed {
+            DecisionReason::PartitionRefresh
+        } else {
+            DecisionReason::ProfilePartition
+        },
+        enforce,
+    ))
+}
+
 fn strict_decision(
     topology: &Topology,
     process: &ProcessObservation,
     target: LlcDomainKey,
     class: ProcessorClassPreference,
-) -> Result<PolicyDecision, AdaptiveError> {
-    let cpu_set_ids = domain_cpu_set_ids(topology, target, class)?;
-    Ok(if process.current_domain == Some(target) {
+) -> PolicyDecision {
+    let Ok(cpu_set_ids) = domain_cpu_set_ids(topology, target, class) else {
+        return decision(
+            process,
+            PolicyAction::Keep {
+                domain: process.current_domain,
+            },
+            DecisionReason::NoAlternativeDomain,
+            false,
+        );
+    };
+    if process.current_domain == Some(target) {
         decision(
             process,
             PolicyAction::Keep {
@@ -608,7 +692,7 @@ fn strict_decision(
             DecisionReason::StrictPlacement,
             true,
         )
-    })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -824,10 +908,14 @@ mod tests {
             DomainLoad {
                 domain: D0,
                 utilization_bps: d0,
+                dpc_time_bps: 0,
+                interrupt_time_bps: 0,
             },
             DomainLoad {
                 domain: D1,
                 utilization_bps: d1,
+                dpc_time_bps: 0,
+                interrupt_time_bps: 0,
             },
         ]
     }
@@ -842,6 +930,8 @@ mod tests {
             enforcement: EnforcementMode::Apply,
             current_domain: current,
             assignment_origin: AssignmentOrigin::Managed,
+            refresh_required: false,
+            preferred_partition: None,
             exclusion: None,
         }
     }
@@ -863,6 +953,88 @@ mod tests {
             PolicyAction::Assign { target: D1, .. }
         ));
         assert!(decisions[0].enforce);
+    }
+
+    #[test]
+    fn reserve_change_refreshes_the_current_domain_without_waiting_for_overload() {
+        let mut engine = PolicyEngine::new(PolicyConfig::default()).unwrap();
+        let mut observed = process(PlacementMode::Sticky, Some(D0));
+        observed.refresh_required = true;
+
+        let decisions = engine
+            .evaluate(1_000, &topology(), &loads(1_000, 9_000), &[observed])
+            .unwrap();
+
+        assert_eq!(
+            decisions[0].action,
+            PolicyAction::Assign {
+                target: D0,
+                cpu_set_ids: vec![0, 1],
+            }
+        );
+        assert_eq!(decisions[0].reason, DecisionReason::PartitionRefresh);
+        assert!(decisions[0].enforce);
+    }
+
+    #[test]
+    fn workload_profile_can_apply_and_keep_a_multi_llc_partition() {
+        let mut engine = PolicyEngine::new(PolicyConfig::default()).unwrap();
+        let partition = CpuPartition {
+            anchor_domain: D0,
+            physical_cores: Vec::new(),
+            cpu_set_ids: vec![0, 2],
+            llc_domains: vec![D0, D1],
+            numa_nodes: vec![0],
+            uses_smt: false,
+        };
+        let mut observed = process(PlacementMode::Sticky, None);
+        observed.assignment_origin = AssignmentOrigin::None;
+        observed.preferred_partition = Some(partition.clone());
+
+        let decisions = engine
+            .evaluate(0, &topology(), &loads(1_000, 1_000), &[observed.clone()])
+            .unwrap();
+        assert_eq!(
+            decisions[0].action,
+            PolicyAction::Assign {
+                target: D0,
+                cpu_set_ids: vec![0, 2],
+            }
+        );
+        assert_eq!(decisions[0].reason, DecisionReason::ProfilePartition);
+
+        assert!(engine.acknowledge(observed.key, Some(D0), true, 0));
+        observed.current_domain = Some(D0);
+        observed.assignment_origin = AssignmentOrigin::Managed;
+        let decisions = engine
+            .evaluate(1_000, &topology(), &loads(9_000, 100), &[observed])
+            .unwrap();
+        assert_eq!(decisions[0].action, PolicyAction::Keep { domain: Some(D0) });
+        assert_eq!(decisions[0].reason, DecisionReason::ProfilePartitionStable);
+    }
+
+    #[test]
+    fn unavailable_domains_degrade_to_noop_without_stopping_the_controller() {
+        let mut unavailable = topology();
+        for cpu in &mut unavailable.cpu_sets {
+            cpu.flags.allocated = true;
+        }
+        unavailable = Topology::new(unavailable.cpu_sets).unwrap();
+        let mut engine = PolicyEngine::new(PolicyConfig::default()).unwrap();
+        let unassigned = process(PlacementMode::Auto, None);
+
+        let decisions = engine
+            .evaluate(0, &unavailable, &loads(1_000, 1_000), &[unassigned])
+            .unwrap();
+        assert_eq!(decisions[0].action, PolicyAction::Ignore);
+        assert_eq!(decisions[0].reason, DecisionReason::NoAlternativeDomain);
+
+        let strict = process(PlacementMode::Strict(D0), Some(D1));
+        let decisions = engine
+            .evaluate(1_000, &unavailable, &loads(1_000, 1_000), &[strict])
+            .unwrap();
+        assert_eq!(decisions[0].action, PolicyAction::Keep { domain: Some(D1) });
+        assert_eq!(decisions[0].reason, DecisionReason::NoAlternativeDomain);
     }
 
     #[test]
@@ -1178,6 +1350,8 @@ mod tests {
                 &[DomainLoad {
                     domain: D0,
                     utilization_bps: 0,
+                    dpc_time_bps: 0,
+                    interrupt_time_bps: 0,
                 }],
                 &[],
             )

@@ -29,7 +29,9 @@ mod app {
     use std::num::NonZeroU16;
     use std::path::{Path, PathBuf};
     use std::process::Command as ProcessCommand;
-    use std::sync::{OnceLock, mpsc};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use clap::{Parser, Subcommand};
@@ -48,7 +50,7 @@ mod app {
     use windows_service::service_dispatcher;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
     use winsched::platform::{self, MutationReport};
-    use winsched_config::{ControllerConfig, ControllerMode, LoggingConfig};
+    use winsched_config::{ControllerConfig, ControllerMode, LoggingConfig, WorkloadProfile};
     use winsched_control::{
         CONFIG_FILE_NAME, CONTROL_DISABLE, CONTROL_ENABLE, ConfigReloadResult, ControllerPhase,
         ControllerStatus, INSTALL_DIRECTORY_NAME, LOG_FILE_NAME, MANAGED_STATE_FILE_NAME,
@@ -56,12 +58,21 @@ mod app {
         STATUS_FILE_NAME,
     };
     use winsched_core::adaptive::{
-        AssignmentOrigin, DecisionReason, PolicyAction, PolicyDecision, PolicyEngine, ProcessKey,
+        AssignmentOrigin, DecisionReason, PlacementMode, PolicyAction, PolicyDecision,
+        PolicyEngine, ProcessKey,
     };
+    use winsched_core::latency::{SchedulerLatencyStatus, SchedulerLatencyWindow};
+    use winsched_core::responsiveness::{
+        AdaptiveWidthConfig, AdaptiveWidthController, WidthAdjustment,
+    };
+    use winsched_core::{ProcessorClassPreference, SystemReservePlan, Topology};
 
     const SERVICE_DISPLAY_NAME: &str = "WinSched LLC-aware placement controller";
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
-    const STATE_SCHEMA_VERSION: u32 = 1;
+    const LATENCY_PROBE_INTERVAL: Duration = Duration::from_millis(10);
+    const LATENCY_PROBE_WINDOW_SAMPLES: usize = 6_000;
+    const LEGACY_STATE_SCHEMA_VERSION: u32 = 1;
+    const STATE_SCHEMA_VERSION: u32 = 2;
     const INTERACTIVE_SERVICE_SDDL: &str = concat!(
         "D:",
         "(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)",
@@ -77,11 +88,40 @@ mod app {
         processes: Vec<ManagedProcess>,
     }
 
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ManagedProcess {
         key: ProcessKey,
+        placement: ManagedPlacement,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct ManagedPlacement {
+        anchor_domain: winsched_core::LlcDomainKey,
+        cpu_set_ids: Vec<u32>,
+    }
+
+    type ManagedAssignments = BTreeMap<ProcessKey, ManagedPlacement>;
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyManagedStateFile {
+        #[serde(rename = "schema_version")]
+        _schema_version: u32,
+        processes: Vec<LegacyManagedProcess>,
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyManagedProcess {
+        key: ProcessKey,
         domain: winsched_core::LlcDomainKey,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ManagedStateHeader {
+        schema_version: u32,
     }
 
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -97,6 +137,82 @@ mod app {
         Enable,
         Disable,
         Tick,
+    }
+
+    struct LatencyProbe {
+        enabled: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        samples: Arc<Mutex<SchedulerLatencyWindow>>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl LatencyProbe {
+        fn start(enabled: bool) -> Result<Self, std::io::Error> {
+            let enabled_flag = Arc::new(AtomicBool::new(enabled));
+            let stop = Arc::new(AtomicBool::new(false));
+            let samples = Arc::new(Mutex::new(SchedulerLatencyWindow::new(
+                LATENCY_PROBE_WINDOW_SAMPLES,
+            )));
+            let thread_enabled = Arc::clone(&enabled_flag);
+            let thread_stop = Arc::clone(&stop);
+            let thread_samples = Arc::clone(&samples);
+            let thread = std::thread::Builder::new()
+                .name("winsched-latency-probe".to_owned())
+                .spawn(move || {
+                    let mut deadline = Instant::now() + LATENCY_PROBE_INTERVAL;
+                    while !thread_stop.load(Ordering::Relaxed) {
+                        let now = Instant::now();
+                        if now < deadline {
+                            std::thread::sleep(deadline - now);
+                        }
+                        let woke = Instant::now();
+                        if thread_enabled.load(Ordering::Relaxed) {
+                            let lateness = woke.saturating_duration_since(deadline);
+                            let lateness_us =
+                                u64::try_from(lateness.as_micros()).unwrap_or(u64::MAX);
+                            if let Ok(mut window) = thread_samples.lock() {
+                                window.record(lateness_us);
+                            }
+                        }
+                        deadline += LATENCY_PROBE_INTERVAL;
+                        if woke > deadline + LATENCY_PROBE_INTERVAL {
+                            deadline = woke + LATENCY_PROBE_INTERVAL;
+                        }
+                    }
+                })?;
+            Ok(Self {
+                enabled: enabled_flag,
+                stop,
+                samples,
+                thread: Some(thread),
+            })
+        }
+
+        fn set_enabled(&self, enabled: bool) {
+            let previous = self.enabled.swap(enabled, Ordering::Relaxed);
+            if previous != enabled
+                && let Ok(mut window) = self.samples.lock()
+            {
+                window.clear();
+            }
+        }
+
+        fn status(&self) -> SchedulerLatencyStatus {
+            let enabled = self.enabled.load(Ordering::Relaxed);
+            self.samples.lock().map_or_else(
+                |_| SchedulerLatencyStatus::default(),
+                |window| window.status(enabled),
+            )
+        }
+    }
+
+    impl Drop for LatencyProbe {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -380,8 +496,15 @@ mod app {
         logger: &mut EventLogger,
     ) -> Result<(), ServiceError> {
         let topology = platform::system_topology()?;
+        let mut reserve_plan = system_reserve_plan(&topology, &config);
+        let mut placement_topology = topology.excluding_reserved_cpu_sets(&reserve_plan);
         let mut sampler = platform::LoadSampler::new(&topology)?;
         let mut engine = PolicyEngine::new(config.policy)?;
+        let latency_probe = LatencyProbe::start(
+            config.responsiveness.enabled && config.responsiveness.latency_guard_enabled,
+        )?;
+        let mut width_controller =
+            AdaptiveWidthController::new(adaptive_width_config(&config, &placement_topology));
         let mut managed = files
             .managed_state
             .map_or_else(|| Ok(BTreeMap::new()), load_managed_state)?;
@@ -398,18 +521,20 @@ mod app {
         let mut status = ControllerStatus::starting(
             std::process::id(),
             runtime.scheduling_enabled,
-            config.controller_mode,
-            config.fingerprint(),
-            config.logging,
+            &config,
+            reserve_plan.clone(),
             topology.llc_domains.len(),
             unix_time_ms(),
         );
-        status.phase = if runtime.scheduling_enabled {
+        status.phase = if controller_evaluation_active(&config, &runtime) {
             ControllerPhase::Running
         } else {
             ControllerPhase::Disabled
         };
-        if !runtime.scheduling_enabled {
+        status.scheduler_latency = latency_probe.status();
+        status.memory_profile_physical_cores = width_controller.current_physical_cores();
+        status.responsiveness_pressure = width_controller.pressure();
+        if !controller_mutations_active(&config, &runtime) {
             let cleanup = cleanup_managed(logger, &mut managed, files.managed_state)?;
             status.last_error = cleanup_error(cleanup);
         }
@@ -421,6 +546,9 @@ mod app {
             "controller_mode": config.controller_mode,
             "scheduling_enabled": runtime.scheduling_enabled,
             "llc_domains": topology.llc_domains.len(),
+            "physical_cores": reserve_plan.physical_core_count,
+            "reserved_physical_cores": reserve_plan.reserved_physical_cores,
+            "reserved_cpu_sets": reserve_plan.reserved_cpu_set_ids,
             "rules": config.rules.len(),
         }));
 
@@ -429,6 +557,7 @@ mod app {
             match wait_for_command(control, interval) {
                 ControllerCommand::Stop => {
                     status.phase = ControllerPhase::Stopping;
+                    status.scheduler_latency = latency_probe.status();
                     persist_controller_status(files.status, &mut status)?;
                     break Ok(());
                 }
@@ -446,6 +575,7 @@ mod app {
                     status.phase = ControllerPhase::Running;
                     status.last_activity = Some("Scheduling enabled from tray or CLI".to_owned());
                     status.last_error = None;
+                    status.scheduler_latency = latency_probe.status();
                     persist_controller_status(files.status, &mut status)?;
                     continue;
                 }
@@ -472,6 +602,7 @@ mod app {
                         )
                     });
                     status.last_error = cleanup_error(cleanup);
+                    status.scheduler_latency = latency_probe.status();
                     persist_controller_status(files.status, &mut status)?;
                     continue;
                 }
@@ -486,24 +617,108 @@ mod app {
                 files.managed_state,
                 logger,
             )?;
-            if let Some(event) = apply_reload_status(&mut status, &config, reload) {
+            if !matches!(&reload, ConfigReload::Unchanged) {
+                reserve_plan = system_reserve_plan(&topology, &config);
+                placement_topology = topology.excluding_reserved_cpu_sets(&reserve_plan);
+                latency_probe.set_enabled(
+                    config.responsiveness.enabled && config.responsiveness.latency_guard_enabled,
+                );
+                width_controller.reconfigure(adaptive_width_config(&config, &placement_topology));
+            }
+            status.scheduler_latency = latency_probe.status();
+            status.memory_profile_physical_cores = width_controller.current_physical_cores();
+            status.responsiveness_pressure = width_controller.pressure();
+            if let Some(event) = apply_reload_status(&mut status, &config, &reserve_plan, reload) {
                 // This status receipt is authoritative for Settings and must reach disk before
                 // any optional event-log write or rotation can fail.
                 persist_controller_status(files.status, &mut status)?;
                 logger.emit(event);
             }
-            if !runtime.scheduling_enabled {
+            if !controller_evaluation_active(&config, &runtime) {
                 let cleanup = cleanup_managed(logger, &mut managed, files.managed_state)?;
                 status.phase = ControllerPhase::Disabled;
                 status.managed_processes = managed.len();
                 status.last_error = cleanup_error(cleanup);
+                iteration = iteration.saturating_add(1);
+                status.iteration = iteration;
                 persist_controller_status(files.status, &mut status)?;
+                if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
+                    break Ok(());
+                }
                 continue;
             }
             let loads = match sampler.sample() {
                 Ok(loads) => loads,
-                Err(error) => break Err(error.into()),
+                Err(error) => {
+                    let detail = format!("Load telemetry sample skipped: {error}");
+                    status.last_activity = Some("Load telemetry sample skipped".to_owned());
+                    status.last_error = Some(detail.clone());
+                    status.scheduler_latency = latency_probe.status();
+                    logger.emit(json!({
+                        "event": "load_sample_skipped",
+                        "error": error.to_string(),
+                    }));
+                    if let Ok(mut replacement) = platform::LoadSampler::new(&topology)
+                        && replacement.prime().is_ok()
+                    {
+                        sampler = replacement;
+                    }
+                    iteration = iteration.saturating_add(1);
+                    status.iteration = iteration;
+                    persist_controller_status(files.status, &mut status)?;
+                    if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
+                        break Ok(());
+                    }
+                    continue;
+                }
             };
+            if status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("Load telemetry sample skipped:"))
+            {
+                status.last_error = None;
+            }
+            status.maximum_dpc_time_bps = loads
+                .iter()
+                .map(|load| load.dpc_time_bps)
+                .max()
+                .unwrap_or(0);
+            status.maximum_interrupt_time_bps = loads
+                .iter()
+                .map(|load| load.interrupt_time_bps)
+                .max()
+                .unwrap_or(0);
+            let evaluation_time_ms =
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if let Some(adjustment) = width_controller.evaluate(
+                evaluation_time_ms,
+                status.scheduler_latency,
+                status.maximum_dpc_time_bps,
+                status.maximum_interrupt_time_bps,
+            ) {
+                let detail = width_adjustment_summary(adjustment);
+                status.last_responsiveness_adjustment = Some(detail.clone());
+                logger.emit(json!({
+                    "event": "memory_profile_width_changed",
+                    "adjustment": detail,
+                    "pressure": width_controller.pressure(),
+                    "scheduler_latency": status.scheduler_latency,
+                    "maximum_dpc_time_bps": status.maximum_dpc_time_bps,
+                    "maximum_interrupt_time_bps": status.maximum_interrupt_time_bps,
+                }));
+            }
+            status.memory_profile_physical_cores = width_controller.current_physical_cores();
+            status.responsiveness_pressure = width_controller.pressure();
+            logger.emit(json!({
+                "event": "responsiveness_sample",
+                "scheduler_latency": status.scheduler_latency,
+                "maximum_dpc_time_bps": status.maximum_dpc_time_bps,
+                "maximum_interrupt_time_bps": status.maximum_interrupt_time_bps,
+                "memory_profile_physical_cores": status.memory_profile_physical_cores,
+                "pressure": status.responsiveness_pressure,
+                "domain_loads": loads,
+            }));
             let processes = match platform::observe_processes(&topology) {
                 Ok(processes) => processes,
                 Err(error) => break Err(error.into()),
@@ -519,17 +734,21 @@ mod app {
                 &config,
                 &managed,
                 &processes,
+                &placement_topology,
+                width_controller.current_physical_cores(),
                 &mut previous_cpu_times,
                 config.sample_interval_ms,
             );
 
-            let evaluation_time_ms =
-                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let decisions =
-                match engine.evaluate(evaluation_time_ms, &topology, &loads, &observations) {
-                    Ok(decisions) => decisions,
-                    Err(error) => break Err(error.into()),
-                };
+            let decisions = match engine.evaluate(
+                evaluation_time_ms,
+                &placement_topology,
+                &loads,
+                &observations,
+            ) {
+                Ok(decisions) => decisions,
+                Err(error) => break Err(error.into()),
+            };
             for decision in decisions {
                 log_decision(logger, &processes, &decision);
                 status.last_activity = Some(decision_summary(&processes, &decision));
@@ -553,6 +772,7 @@ mod app {
             status.iteration = iteration;
             status.managed_processes = managed.len();
             status.phase = ControllerPhase::Running;
+            status.scheduler_latency = latency_probe.status();
             persist_controller_status(files.status, &mut status)?;
             if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
                 break Ok(());
@@ -573,6 +793,9 @@ mod app {
             ControllerPhase::Error
         };
         status.managed_processes = managed.len();
+        status.scheduler_latency = latency_probe.status();
+        status.memory_profile_physical_cores = width_controller.current_physical_cores();
+        status.responsiveness_pressure = width_controller.pressure();
         if let Err(error) = &loop_result {
             status.last_error = Some(error.to_string());
         } else if let Err(error) = &cleanup_result {
@@ -591,10 +814,101 @@ mod app {
         }
     }
 
+    fn system_reserve_plan(topology: &Topology, config: &ControllerConfig) -> SystemReservePlan {
+        if !config.responsiveness.enabled {
+            return topology.plan_system_reserve(0, 0, 0);
+        }
+        topology.plan_system_reserve(
+            config.responsiveness.system_reserve_percent,
+            config.responsiveness.minimum_reserved_cores,
+            config.responsiveness.maximum_reserved_cores,
+        )
+    }
+
+    const fn controller_evaluation_active(
+        config: &ControllerConfig,
+        runtime: &RuntimeState,
+    ) -> bool {
+        match config.controller_mode {
+            ControllerMode::Off => false,
+            ControllerMode::Observe => true,
+            ControllerMode::Auto => runtime.scheduling_enabled,
+        }
+    }
+
+    const fn controller_mutations_active(
+        config: &ControllerConfig,
+        runtime: &RuntimeState,
+    ) -> bool {
+        matches!(config.controller_mode, ControllerMode::Auto) && runtime.scheduling_enabled
+    }
+
+    fn adaptive_width_config(
+        config: &ControllerConfig,
+        placement_topology: &Topology,
+    ) -> AdaptiveWidthConfig {
+        let available =
+            u16::try_from(placement_topology.assignable_physical_core_count()).unwrap_or(u16::MAX);
+        let maximum_physical_cores = config
+            .responsiveness
+            .memory
+            .maximum_physical_cores
+            .min(available);
+        let minimum_physical_cores = config
+            .responsiveness
+            .memory
+            .minimum_physical_cores
+            .min(maximum_physical_cores);
+        AdaptiveWidthConfig {
+            enabled: config.responsiveness.enabled && config.responsiveness.latency_guard_enabled,
+            minimum_physical_cores,
+            maximum_physical_cores,
+            latency_target_p99_us: config.responsiveness.latency_target_p99_us,
+            latency_recovery_p99_us: config.responsiveness.latency_recovery_p99_us,
+            stability_samples: config.responsiveness.adjustment_stability_samples,
+            resize_cooldown_ms: config.responsiveness.memory.resize_cooldown_ms,
+        }
+    }
+
+    fn width_adjustment_summary(adjustment: WidthAdjustment) -> String {
+        match adjustment {
+            WidthAdjustment::Shrunk { from, to } => {
+                format!("Memory profile reduced from {from} to {to} physical cores")
+            }
+            WidthAdjustment::Expanded { from, to } => {
+                format!("Memory profile expanded from {from} to {to} physical cores")
+            }
+        }
+    }
+
+    fn expected_domain_cpu_sets(
+        topology: &Topology,
+        domain: winsched_core::LlcDomainKey,
+        placement: PlacementMode,
+    ) -> Vec<u32> {
+        let preference = match placement {
+            PlacementMode::Performance => ProcessorClassPreference::Fastest,
+            PlacementMode::Efficiency => ProcessorClassPreference::MostEfficient,
+            PlacementMode::Off
+            | PlacementMode::Sticky
+            | PlacementMode::Auto
+            | PlacementMode::Strict(_) => ProcessorClassPreference::Any,
+        };
+        topology
+            .llc_domains
+            .iter()
+            .find(|candidate| candidate.key == domain)
+            .map_or_else(Vec::new, |candidate| {
+                candidate.cpu_set_ids_for_class(preference)
+            })
+    }
+
     fn build_ranked_observations(
         config: &ControllerConfig,
-        managed: &BTreeMap<ProcessKey, winsched_core::LlcDomainKey>,
+        managed: &ManagedAssignments,
         processes: &[platform::ObservedProcess],
+        placement_topology: &Topology,
+        memory_profile_physical_cores: u16,
         previous_cpu_times: &mut BTreeMap<ProcessKey, u64>,
         sample_interval_ms: u64,
     ) -> Vec<winsched_core::adaptive::ProcessObservation> {
@@ -605,24 +919,31 @@ mod app {
                 .map_or(0, |previous| {
                     process.cpu_time_100ns.saturating_sub(previous)
                 });
-            let recovered = managed.contains_key(&process.key);
+            let recovered_placement = managed.get(&process.key);
+            let recovered = recovered_placement.is_some();
             let explicit_rule = config
                 .rules
                 .iter()
                 .any(|rule| rule.image.eq_ignore_ascii_case(&process.image_name));
             let rule = config.resolve(&process.image_name);
-            let (placement, enforcement) = match (recovered, config.controller_mode, rule) {
-                (true, mode, _) if mode != ControllerMode::Auto => (
-                    winsched_core::adaptive::PlacementMode::Off,
-                    winsched_core::adaptive::EnforcementMode::Apply,
-                ),
-                (_, _, Some(rule)) => (rule.placement, rule.enforcement),
-                (true, _, None) => (
-                    winsched_core::adaptive::PlacementMode::Off,
-                    winsched_core::adaptive::EnforcementMode::Apply,
-                ),
-                (false, _, None) => continue,
-            };
+            let (mut placement, enforcement, profile) =
+                match (recovered, config.controller_mode, rule) {
+                    (true, mode, _) if mode != ControllerMode::Auto => (
+                        PlacementMode::Off,
+                        winsched_core::adaptive::EnforcementMode::Apply,
+                        WorkloadProfile::Balanced,
+                    ),
+                    (_, _, Some(rule)) => (rule.placement, rule.enforcement, rule.profile),
+                    (true, _, None) => (
+                        PlacementMode::Off,
+                        winsched_core::adaptive::EnforcementMode::Apply,
+                        WorkloadProfile::Balanced,
+                    ),
+                    (false, _, None) => continue,
+                };
+            if profile == WorkloadProfile::Interactive && placement == PlacementMode::Auto {
+                placement = PlacementMode::Sticky;
+            }
             if !recovered
                 && (!explicit_rule
                     && process_utilization_bps(cpu_delta, sample_interval_ms)
@@ -632,8 +953,45 @@ mod app {
                 continue;
             }
             let mut observation = process.policy_observation(placement, enforcement);
-            if recovered {
+            let preferred_partition = match profile {
+                WorkloadProfile::Memory
+                    if !matches!(placement, PlacementMode::Off | PlacementMode::Strict(_)) =>
+                {
+                    placement_topology.plan_spread_partition(
+                        usize::from(memory_profile_physical_cores),
+                        config.responsiveness.memory.use_smt,
+                    )
+                }
+                WorkloadProfile::Compute
+                    if !matches!(placement, PlacementMode::Off | PlacementMode::Strict(_)) =>
+                {
+                    placement_topology.plan_spread_partition(usize::MAX, true)
+                }
+                WorkloadProfile::Interactive
+                | WorkloadProfile::Memory
+                | WorkloadProfile::Compute
+                | WorkloadProfile::Background
+                | WorkloadProfile::Balanced => None,
+            };
+            observation.preferred_partition = preferred_partition;
+            if let Some(recovered_placement) = recovered_placement {
                 observation.assignment_origin = AssignmentOrigin::Managed;
+                observation.current_domain = Some(recovered_placement.anchor_domain);
+                if let Some(partition) = &observation.preferred_partition {
+                    observation.refresh_required =
+                        partition.cpu_set_ids != process.default_cpu_set_ids;
+                } else {
+                    let expected = expected_domain_cpu_sets(
+                        placement_topology,
+                        recovered_placement.anchor_domain,
+                        placement,
+                    );
+                    if expected.is_empty() {
+                        observation.current_domain = None;
+                    } else {
+                        observation.refresh_required = expected != process.default_cpu_set_ids;
+                    }
+                }
             }
             ranked.push((observation, cpu_delta));
         }
@@ -655,22 +1013,35 @@ mod app {
 
     fn reconcile_managed(
         logger: &mut EventLogger,
-        managed: &mut BTreeMap<ProcessKey, winsched_core::LlcDomainKey>,
+        managed: &mut ManagedAssignments,
         state_path: Option<&Path>,
         processes: &[platform::ObservedProcess],
     ) -> Result<(), ServiceError> {
         let entries = managed
             .iter()
-            .map(|(key, domain)| (*key, *domain))
+            .map(|(key, placement)| (*key, placement.clone()))
             .collect::<Vec<_>>();
         let mut changed = false;
-        for (key, domain) in entries {
+        for (key, placement) in entries {
             let Some(process) = processes.iter().find(|process| process.key == key) else {
                 managed.remove(&key);
                 changed = true;
                 continue;
             };
-            if process.current_domain != Some(domain) {
+            if placement.cpu_set_ids.is_empty() {
+                if process.current_domain == Some(placement.anchor_domain)
+                    && !process.default_cpu_set_ids.is_empty()
+                {
+                    if let Some(current) = managed.get_mut(&key) {
+                        current.cpu_set_ids.clone_from(&process.default_cpu_set_ids);
+                        changed = true;
+                    }
+                } else {
+                    managed.remove(&key);
+                    changed = true;
+                    continue;
+                }
+            } else if process.default_cpu_set_ids != placement.cpu_set_ids {
                 managed.remove(&key);
                 changed = true;
                 continue;
@@ -707,11 +1078,14 @@ mod app {
     fn apply_reload_status(
         status: &mut ControllerStatus,
         config: &ControllerConfig,
+        reserve_plan: &SystemReservePlan,
         reload: ConfigReload,
     ) -> Option<Value> {
         status.configured_mode = config.controller_mode;
         status.applied_config_fingerprint = config.fingerprint();
         status.applied_logging = config.logging;
+        status.applied_responsiveness = config.responsiveness;
+        status.system_reserve.clone_from(reserve_plan);
         match reload {
             ConfigReload::Unchanged => None,
             ConfigReload::Reloaded => {
@@ -724,6 +1098,9 @@ mod app {
                     "event": "config_reloaded",
                     "controller_mode": config.controller_mode,
                     "logging": config.logging,
+                    "responsiveness": config.responsiveness,
+                    "reserved_physical_cores": reserve_plan.reserved_physical_cores.len(),
+                    "reserved_cpu_sets": reserve_plan.reserved_cpu_set_ids.len(),
                     "rules": config.rules.len(),
                 }))
             }
@@ -755,7 +1132,7 @@ mod app {
         previous_modified: &mut Option<SystemTime>,
         config: &mut ControllerConfig,
         engine: &mut PolicyEngine,
-        managed: &mut BTreeMap<ProcessKey, winsched_core::LlcDomainKey>,
+        managed: &mut ManagedAssignments,
         state_path: Option<&Path>,
         logger: &mut EventLogger,
     ) -> Result<ConfigReload, ServiceError> {
@@ -899,16 +1276,26 @@ mod app {
                     )
                 },
             ),
-            PolicyAction::Assign { target, .. } => format!(
-                "assigned to LLC {}:{}",
-                target.group, target.last_level_cache_index
+            PolicyAction::Assign {
+                target,
+                cpu_set_ids,
+            } => format!(
+                "assigned partition anchored at LLC {}:{} ({} CPU Sets)",
+                target.group,
+                target.last_level_cache_index,
+                cpu_set_ids.len(),
             ),
-            PolicyAction::Move { source, target, .. } => format!(
-                "moved LLC {}:{} -> {}:{}",
+            PolicyAction::Move {
+                source,
+                target,
+                cpu_set_ids,
+            } => format!(
+                "moved LLC {}:{} -> partition anchored at {}:{} ({} CPU Sets)",
                 source.group,
                 source.last_level_cache_index,
                 target.group,
-                target.last_level_cache_index
+                target.last_level_cache_index,
+                cpu_set_ids.len(),
             ),
             PolicyAction::Clear { source } => format!(
                 "cleared LLC {}:{} assignment",
@@ -928,6 +1315,9 @@ mod app {
             DecisionReason::Excluded(_) => "fixed safety exclusion",
             DecisionReason::ExternalAssignment => "external assignment preserved",
             DecisionReason::PendingMutation => "mutation awaiting acknowledgement",
+            DecisionReason::PartitionRefresh => "refreshing reserved CPU partition",
+            DecisionReason::ProfilePartition => "workload profile partition",
+            DecisionReason::ProfilePartitionStable => "workload profile partition stable",
             DecisionReason::InitialPlacement => "initial placement",
             DecisionReason::StickyPlacement => "sticky placement",
             DecisionReason::BelowOverloadThreshold => "load below overload threshold",
@@ -946,7 +1336,7 @@ mod app {
     fn enforce_decision(
         logger: &mut EventLogger,
         engine: &mut PolicyEngine,
-        managed: &mut BTreeMap<ProcessKey, winsched_core::LlcDomainKey>,
+        managed: &mut ManagedAssignments,
         state_path: Option<&Path>,
         decision: &PolicyDecision,
         evaluation_time_ms: u64,
@@ -995,7 +1385,7 @@ mod app {
     fn finish_enforcement(
         logger: &mut EventLogger,
         engine: &mut PolicyEngine,
-        managed: &mut BTreeMap<ProcessKey, winsched_core::LlcDomainKey>,
+        managed: &mut ManagedAssignments,
         state_path: Option<&Path>,
         decision: &PolicyDecision,
         target: Option<winsched_core::LlcDomainKey>,
@@ -1007,7 +1397,16 @@ mod app {
             engine.acknowledge(decision.process, target, succeeded, evaluation_time_ms);
         if succeeded {
             if let Some(target) = target {
-                managed.insert(decision.process, target);
+                let cpu_set_ids = result
+                    .as_ref()
+                    .map_or_else(|_| Vec::new(), |report| report.observed_cpu_set_ids.clone());
+                managed.insert(
+                    decision.process,
+                    ManagedPlacement {
+                        anchor_domain: target,
+                        cpu_set_ids,
+                    },
+                );
             } else {
                 managed.remove(&decision.process);
             }
@@ -1033,7 +1432,7 @@ mod app {
 
     fn cleanup_managed(
         logger: &mut EventLogger,
-        managed: &mut BTreeMap<ProcessKey, winsched_core::LlcDomainKey>,
+        managed: &mut ManagedAssignments,
         state_path: Option<&Path>,
     ) -> Result<CleanupReport, ServiceError> {
         cleanup_managed_with(logger, managed, state_path, |process| {
@@ -1045,7 +1444,7 @@ mod app {
 
     fn cleanup_managed_with<F>(
         logger: &mut EventLogger,
-        managed: &mut BTreeMap<ProcessKey, winsched_core::LlcDomainKey>,
+        managed: &mut ManagedAssignments,
         state_path: Option<&Path>,
         mut clear: F,
     ) -> Result<CleanupReport, ServiceError>
@@ -1092,26 +1491,44 @@ mod app {
         })
     }
 
-    fn load_managed_state(
-        path: &Path,
-    ) -> Result<BTreeMap<ProcessKey, winsched_core::LlcDomainKey>, ServiceError> {
+    fn load_managed_state(path: &Path) -> Result<ManagedAssignments, ServiceError> {
         if !path.exists() {
             return Ok(BTreeMap::new());
         }
-        let state = serde_json::from_slice::<ManagedStateFile>(&fs::read(path)?)?;
-        if state.schema_version != STATE_SCHEMA_VERSION {
-            return Err(ServiceError::StateSchema(state.schema_version));
+        let bytes = fs::read(path)?;
+        let header = serde_json::from_slice::<ManagedStateHeader>(&bytes)?;
+        match header.schema_version {
+            LEGACY_STATE_SCHEMA_VERSION => {
+                let state = serde_json::from_slice::<LegacyManagedStateFile>(&bytes)?;
+                Ok(state
+                    .processes
+                    .into_iter()
+                    .map(|process| {
+                        (
+                            process.key,
+                            ManagedPlacement {
+                                anchor_domain: process.domain,
+                                cpu_set_ids: Vec::new(),
+                            },
+                        )
+                    })
+                    .collect())
+            }
+            STATE_SCHEMA_VERSION => {
+                let state = serde_json::from_slice::<ManagedStateFile>(&bytes)?;
+                Ok(state
+                    .processes
+                    .into_iter()
+                    .map(|process| (process.key, process.placement))
+                    .collect())
+            }
+            schema => Err(ServiceError::StateSchema(schema)),
         }
-        Ok(state
-            .processes
-            .into_iter()
-            .map(|process| (process.key, process.domain))
-            .collect())
     }
 
     fn persist_managed_state(
         path: Option<&Path>,
-        managed: &BTreeMap<ProcessKey, winsched_core::LlcDomainKey>,
+        managed: &ManagedAssignments,
     ) -> Result<(), ServiceError> {
         let Some(path) = path else {
             return Ok(());
@@ -1120,9 +1537,9 @@ mod app {
             schema_version: STATE_SCHEMA_VERSION,
             processes: managed
                 .iter()
-                .map(|(key, domain)| ManagedProcess {
+                .map(|(key, placement)| ManagedProcess {
                     key: *key,
-                    domain: *domain,
+                    placement: placement.clone(),
                 })
                 .collect(),
         };
@@ -1177,13 +1594,22 @@ mod app {
         if current_exe != installed_exe {
             fs::copy(&current_exe, &installed_exe)?;
         }
-        atomic_write(
-            &installed_config,
-            toml::to_string_pretty(&config)?.as_bytes(),
-        )?;
+        if !paths_refer_to_same_file(config_path, &installed_config)? {
+            atomic_write(
+                &installed_config,
+                toml::to_string_pretty(&config)?.as_bytes(),
+            )?;
+        }
         configure_service(&installed_exe, &installed_config, start_now, false)?;
         println!("installed {SERVICE_NAME}");
         Ok(())
+    }
+
+    fn paths_refer_to_same_file(left: &Path, right: &Path) -> Result<bool, std::io::Error> {
+        if !left.exists() || !right.exists() {
+            return Ok(false);
+        }
+        Ok(fs::canonicalize(left)? == fs::canonicalize(right)?)
     }
 
     fn register_in_place(
@@ -2128,14 +2554,16 @@ mod app {
             let mut status = ControllerStatus::starting(
                 42,
                 true,
-                ControllerMode::Observe,
-                ControllerConfig::default().fingerprint(),
-                LoggingConfig::default(),
+                &ControllerConfig::default(),
+                SystemReservePlan::default(),
                 2,
                 unix_time_ms(),
             );
+            let reserve_plan = SystemReservePlan::default();
 
-            let event = apply_reload_status(&mut status, &config, ConfigReload::Reloaded).unwrap();
+            let event =
+                apply_reload_status(&mut status, &config, &reserve_plan, ConfigReload::Reloaded)
+                    .unwrap();
             persist_controller_status(Some(&path), &mut status).unwrap();
             let persisted =
                 serde_json::from_slice::<ControllerStatus>(&fs::read(&path).unwrap()).unwrap();
@@ -2149,6 +2577,7 @@ mod app {
             let event = apply_reload_status(
                 &mut status,
                 &config,
+                &reserve_plan,
                 ConfigReload::Rejected {
                     error: "injected invalid configuration".to_owned(),
                     fail_closed: true,
@@ -2286,13 +2715,14 @@ mod app {
             let mut status = ControllerStatus::starting(
                 42,
                 true,
-                config.controller_mode,
-                config.fingerprint(),
-                config.logging,
+                &config,
+                SystemReservePlan::default(),
                 2,
                 unix_time_ms(),
             );
-            let event = apply_reload_status(&mut status, &config, reload).unwrap();
+            let event =
+                apply_reload_status(&mut status, &config, &SystemReservePlan::default(), reload)
+                    .unwrap();
             persist_controller_status(Some(&status_path), &mut status).unwrap();
             let persisted =
                 serde_json::from_slice::<ControllerStatus>(&fs::read(&status_path).unwrap())
@@ -2324,6 +2754,71 @@ mod app {
             }
         }
 
+        fn observation_topology() -> Topology {
+            Topology::new(vec![
+                winsched_core::CpuSet {
+                    id: 256,
+                    group: 0,
+                    logical_processor_index: 0,
+                    core_index: 0,
+                    last_level_cache_index: 1,
+                    numa_node_index: 0,
+                    efficiency_class: 0,
+                    scheduling_class: 1,
+                    flags: winsched_core::CpuSetFlags::default(),
+                    allocation_tag: 0,
+                },
+                winsched_core::CpuSet {
+                    id: 257,
+                    group: 0,
+                    logical_processor_index: 1,
+                    core_index: 0,
+                    last_level_cache_index: 1,
+                    numa_node_index: 0,
+                    efficiency_class: 0,
+                    scheduling_class: 1,
+                    flags: winsched_core::CpuSetFlags::default(),
+                    allocation_tag: 0,
+                },
+            ])
+            .unwrap()
+        }
+
+        fn profile_topology() -> Topology {
+            let mut cpu_sets = Vec::new();
+            for llc in 0u8..4 {
+                for core_in_llc in 0u8..2 {
+                    let core_index = llc * 4 + core_in_llc * 2;
+                    for sibling in 0u8..2 {
+                        let logical = core_index + sibling;
+                        cpu_sets.push(winsched_core::CpuSet {
+                            id: 400 + u32::from(logical),
+                            group: 0,
+                            logical_processor_index: logical,
+                            core_index,
+                            last_level_cache_index: llc * 4,
+                            numa_node_index: 0,
+                            efficiency_class: 0,
+                            scheduling_class: llc * 2 + core_in_llc,
+                            flags: winsched_core::CpuSetFlags::default(),
+                            allocation_tag: 0,
+                        });
+                    }
+                }
+            }
+            Topology::new(cpu_sets).unwrap()
+        }
+
+        fn managed_placement(
+            anchor_domain: winsched_core::LlcDomainKey,
+            cpu_set_ids: &[u32],
+        ) -> ManagedPlacement {
+            ManagedPlacement {
+                anchor_domain,
+                cpu_set_ids: cpu_set_ids.to_vec(),
+            }
+        }
+
         #[test]
         fn process_ranking_prefers_largest_cpu_delta() {
             let config = ControllerConfig::from_toml(
@@ -2344,6 +2839,8 @@ image = "b.exe"
                 &config,
                 &BTreeMap::new(),
                 &processes,
+                &observation_topology(),
+                28,
                 &mut previous,
                 1_000,
             );
@@ -2391,6 +2888,8 @@ minimum_process_utilization_bps = 500
                 &implicit,
                 &BTreeMap::new(),
                 &processes,
+                &observation_topology(),
+                28,
                 &mut previous,
                 1_000,
             );
@@ -2412,6 +2911,8 @@ image = "idle.exe"
                 &explicit,
                 &BTreeMap::new(),
                 &processes[..1],
+                &observation_topology(),
+                28,
                 &mut previous,
                 1_000,
             );
@@ -2437,14 +2938,24 @@ all_user_processes = false
             observed.default_cpu_set_ids = vec![256];
             let managed = BTreeMap::from([(
                 observed.key,
-                winsched_core::LlcDomainKey {
-                    group: 0,
-                    last_level_cache_index: 1,
-                },
+                managed_placement(
+                    winsched_core::LlcDomainKey {
+                        group: 0,
+                        last_level_cache_index: 1,
+                    },
+                    &[256],
+                ),
             )]);
             let mut previous = BTreeMap::new();
-            let ranked =
-                build_ranked_observations(&config, &managed, &[observed], &mut previous, 1_000);
+            let ranked = build_ranked_observations(
+                &config,
+                &managed,
+                &[observed],
+                &observation_topology(),
+                28,
+                &mut previous,
+                1_000,
+            );
             assert_eq!(ranked.len(), 1);
             assert_eq!(ranked[0].mode, winsched_core::adaptive::PlacementMode::Off);
             assert_eq!(
@@ -2452,6 +2963,182 @@ all_user_processes = false
                 winsched_core::adaptive::EnforcementMode::Apply
             );
             assert_eq!(ranked[0].assignment_origin, AssignmentOrigin::Managed);
+        }
+
+        #[test]
+        fn managed_process_is_refreshed_when_a_cpu_set_becomes_reserved() {
+            let config = ControllerConfig::from_toml(
+                r#"
+schema_version = 3
+controller_mode = "auto"
+[[rules]]
+image = "interactive.exe"
+mode = "sticky"
+profile = "interactive"
+"#,
+            )
+            .unwrap();
+            let mut observed = process(10, "interactive.exe", 100);
+            observed.current_domain = Some(winsched_core::LlcDomainKey {
+                group: 0,
+                last_level_cache_index: 1,
+            });
+            observed.default_cpu_set_ids = vec![256, 257];
+            let managed = BTreeMap::from([(
+                observed.key,
+                managed_placement(
+                    winsched_core::LlcDomainKey {
+                        group: 0,
+                        last_level_cache_index: 1,
+                    },
+                    &[256, 257],
+                ),
+            )]);
+            let placement =
+                observation_topology().excluding_reserved_cpu_sets(&SystemReservePlan {
+                    reserved_cpu_set_ids: vec![256],
+                    ..SystemReservePlan::default()
+                });
+            let mut previous = BTreeMap::new();
+
+            let ranked = build_ranked_observations(
+                &config,
+                &managed,
+                &[observed],
+                &placement,
+                28,
+                &mut previous,
+                1_000,
+            );
+
+            assert_eq!(ranked.len(), 1);
+            assert!(ranked[0].refresh_required);
+            assert_eq!(ranked[0].assignment_origin, AssignmentOrigin::Managed);
+        }
+
+        #[test]
+        fn managed_process_leaves_a_domain_that_becomes_fully_reserved() {
+            let config = ControllerConfig::from_toml(
+                r#"
+schema_version = 3
+controller_mode = "auto"
+[[rules]]
+image = "interactive.exe"
+mode = "sticky"
+profile = "interactive"
+"#,
+            )
+            .unwrap();
+            let mut observed = process(10, "interactive.exe", 100);
+            let anchor = winsched_core::LlcDomainKey {
+                group: 0,
+                last_level_cache_index: 1,
+            };
+            observed.current_domain = Some(anchor);
+            observed.default_cpu_set_ids = vec![256, 257];
+            let managed = BTreeMap::from([(observed.key, managed_placement(anchor, &[256, 257]))]);
+            let placement =
+                observation_topology().excluding_reserved_cpu_sets(&SystemReservePlan {
+                    reserved_cpu_set_ids: vec![256, 257],
+                    ..SystemReservePlan::default()
+                });
+            let mut previous = BTreeMap::new();
+
+            let ranked = build_ranked_observations(
+                &config,
+                &managed,
+                &[observed],
+                &placement,
+                28,
+                &mut previous,
+                1_000,
+            );
+
+            assert_eq!(ranked.len(), 1);
+            assert_eq!(ranked[0].current_domain, None);
+            assert!(!ranked[0].refresh_required);
+        }
+
+        #[test]
+        fn memory_profile_uses_one_smt_thread_across_the_requested_core_width() {
+            let config = ControllerConfig::from_toml(
+                r#"
+schema_version = 3
+controller_mode = "auto"
+[[rules]]
+image = "memory.exe"
+mode = "sticky"
+profile = "memory"
+"#,
+            )
+            .unwrap();
+            let observed = process(10, "memory.exe", 100);
+            let mut previous = BTreeMap::new();
+
+            let ranked = build_ranked_observations(
+                &config,
+                &BTreeMap::new(),
+                &[observed],
+                &profile_topology(),
+                4,
+                &mut previous,
+                1_000,
+            );
+
+            let partition = ranked[0].preferred_partition.as_ref().unwrap();
+            assert_eq!(partition.physical_cores.len(), 4);
+            assert_eq!(partition.cpu_set_ids.len(), 4);
+            assert_eq!(partition.llc_domains.len(), 4);
+            assert!(!partition.uses_smt);
+        }
+
+        #[test]
+        fn compute_profile_uses_both_smt_threads_on_every_available_core() {
+            let config = ControllerConfig::from_toml(
+                r#"
+schema_version = 3
+controller_mode = "auto"
+[[rules]]
+image = "compute.exe"
+mode = "sticky"
+profile = "compute"
+"#,
+            )
+            .unwrap();
+            let observed = process(10, "compute.exe", 100);
+            let mut previous = BTreeMap::new();
+
+            let ranked = build_ranked_observations(
+                &config,
+                &BTreeMap::new(),
+                &[observed],
+                &profile_topology(),
+                4,
+                &mut previous,
+                1_000,
+            );
+
+            let partition = ranked[0].preferred_partition.as_ref().unwrap();
+            assert_eq!(partition.physical_cores.len(), 8);
+            assert_eq!(partition.cpu_set_ids.len(), 16);
+            assert!(partition.uses_smt);
+        }
+
+        #[test]
+        fn adaptive_memory_width_is_clamped_to_the_available_placement_topology() {
+            let mut config = ControllerConfig::default();
+            config.responsiveness.enabled = true;
+            config.responsiveness.memory.minimum_physical_cores = 8;
+            config.responsiveness.memory.maximum_physical_cores = 28;
+            let topology = observation_topology();
+            let placement = topology.excluding_reserved_cpu_sets(&SystemReservePlan {
+                reserved_cpu_set_ids: vec![256, 257],
+                ..SystemReservePlan::default()
+            });
+
+            let width = adaptive_width_config(&config, &placement);
+            assert_eq!(width.minimum_physical_cores, 0);
+            assert_eq!(width.maximum_physical_cores, 0);
         }
 
         #[test]
@@ -2469,7 +3156,8 @@ all_user_processes = false
                 group: 0,
                 last_level_cache_index: 2,
             };
-            let managed = BTreeMap::from([(key, domain)]);
+            let placement = managed_placement(domain, &[300, 301]);
+            let managed = BTreeMap::from([(key, placement)]);
 
             persist_managed_state(Some(&path), &managed).unwrap();
             assert_eq!(load_managed_state(&path).unwrap(), managed);
@@ -2477,6 +3165,64 @@ all_user_processes = false
             assert!(load_managed_state(&path).unwrap().is_empty());
 
             fs::remove_file(&path).unwrap();
+        }
+
+        #[test]
+        fn installer_detects_when_the_source_is_the_installed_config() {
+            let directory = std::env::temp_dir().join(format!(
+                "winsched-install-config-identity-{}-{}",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let installed = directory.join("winsched.toml");
+            let external = directory.join("external.toml");
+            fs::write(&installed, "schema_version = 1\n").unwrap();
+            fs::write(&external, "schema_version = 3\n").unwrap();
+
+            assert!(paths_refer_to_same_file(&installed, &installed).unwrap());
+            assert!(!paths_refer_to_same_file(&external, &installed).unwrap());
+            assert!(
+                !paths_refer_to_same_file(&directory.join("missing.toml"), &installed).unwrap()
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn schema_one_managed_state_migrates_to_exact_partition_records() {
+            let path = std::env::temp_dir().join(format!(
+                "winsched-managed-state-migration-{}-{}.json",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            let key = ProcessKey {
+                pid: 78,
+                creation_time_100ns: 124,
+            };
+            let domain = winsched_core::LlcDomainKey {
+                group: 0,
+                last_level_cache_index: 2,
+            };
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&json!({
+                    "schema_version": 1,
+                    "processes": [{
+                        "key": key,
+                        "domain": domain,
+                    }],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let managed = load_managed_state(&path).unwrap();
+            assert_eq!(managed.get(&key), Some(&managed_placement(domain, &[])));
+            persist_managed_state(Some(&path), &managed).unwrap();
+            let persisted = fs::read_to_string(&path).unwrap();
+            assert!(persisted.contains("\"schema_version\": 2"));
+            assert!(persisted.contains("\"cpu_set_ids\""));
+            fs::remove_file(path).unwrap();
         }
 
         #[test]
@@ -2498,7 +3244,9 @@ all_user_processes = false
                 group: 0,
                 last_level_cache_index: 1,
             };
-            let mut managed = BTreeMap::from([(first, domain), (second, domain)]);
+            let placement = managed_placement(domain, &[300, 301]);
+            let mut managed =
+                BTreeMap::from([(first, placement.clone()), (second, placement.clone())]);
             let mut logger = EventLogger::console();
 
             let report = cleanup_managed_with(&mut logger, &mut managed, Some(&path), |process| {
@@ -2518,7 +3266,7 @@ all_user_processes = false
                     failed: 1,
                 }
             );
-            assert_eq!(managed, BTreeMap::from([(second, domain)]));
+            assert_eq!(managed, BTreeMap::from([(second, placement)]));
             assert_eq!(load_managed_state(&path).unwrap(), managed);
             fs::remove_file(path).unwrap();
         }
@@ -2539,14 +3287,15 @@ all_user_processes = false
                 group: 0,
                 last_level_cache_index: 1,
             };
-            let mut managed = BTreeMap::from([(key, domain)]);
+            let placement = managed_placement(domain, &[300, 301]);
+            let mut managed = BTreeMap::from([(key, placement.clone())]);
             let mut logger = EventLogger::console();
 
             let result = cleanup_managed_with(&mut logger, &mut managed, Some(&path), |_| {
                 Err("injected clear failure".to_owned())
             });
             assert!(matches!(result, Err(ServiceError::Io(_))));
-            assert_eq!(managed, BTreeMap::from([(key, domain)]));
+            assert_eq!(managed, BTreeMap::from([(key, placement)]));
         }
 
         #[test]
@@ -2577,6 +3326,32 @@ all_user_processes = false
                 disabled
             );
             fs::remove_file(path).unwrap();
+        }
+
+        #[test]
+        fn observe_evaluates_without_enabling_mutations() {
+            let observe = ControllerConfig {
+                controller_mode: ControllerMode::Observe,
+                ..ControllerConfig::default()
+            };
+            let disabled = RuntimeState {
+                schema_version: RUNTIME_SCHEMA_VERSION,
+                scheduling_enabled: false,
+            };
+            assert!(controller_evaluation_active(&observe, &disabled));
+            assert!(!controller_mutations_active(&observe, &disabled));
+
+            let auto = ControllerConfig {
+                controller_mode: ControllerMode::Auto,
+                ..ControllerConfig::default()
+            };
+            assert!(!controller_evaluation_active(&auto, &disabled));
+            let enabled = RuntimeState {
+                scheduling_enabled: true,
+                ..disabled
+            };
+            assert!(controller_evaluation_active(&auto, &enabled));
+            assert!(controller_mutations_active(&auto, &enabled));
         }
 
         #[test]

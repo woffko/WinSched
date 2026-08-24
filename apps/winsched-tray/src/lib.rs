@@ -25,6 +25,8 @@ pub struct MenuModel {
     pub service_action_enabled: bool,
     pub mode: String,
     pub managed: String,
+    pub reserve: String,
+    pub latency: String,
     pub activity: String,
     pub error: String,
     pub tooltip: String,
@@ -52,6 +54,8 @@ pub fn build_menu_model(
     let effective_label = status.map_or("Status unavailable".to_owned(), effective_label);
     let configured_mode = status.map_or("Unknown", |status| mode_label(status.configured_mode));
     let managed = status.map_or(0, |status| status.managed_processes);
+    let reserve = status.map_or_else(|| "System reserve: unavailable".to_owned(), reserve_label);
+    let latency = status.map_or_else(|| "Latency guard: unavailable".to_owned(), latency_label);
     let activity = status
         .and_then(|status| status.last_activity.as_deref())
         .map_or_else(
@@ -86,6 +90,8 @@ pub fn build_menu_model(
         service_action_enabled,
         mode: format!("Mode: {configured_mode}"),
         managed: format!("Managed processes: {managed}"),
+        reserve,
+        latency,
         activity,
         error: format!(
             "Last error: {}",
@@ -94,10 +100,44 @@ pub fn build_menu_model(
                 .map_or("none".to_owned(), |value| menu_text(value, 96))
         ),
         tooltip: menu_text(
-            &format!("WinSched: {service_label}; {effective_label}; managed {managed}"),
+            &format!(
+                "WinSched: {service_label}; {effective_label}; managed {managed}; reserve {} cores",
+                status.map_or(0, |status| status
+                    .system_reserve
+                    .reserved_physical_cores
+                    .len())
+            ),
             120,
         ),
     }
+}
+
+fn reserve_label(status: &ControllerStatus) -> String {
+    if !status.applied_responsiveness.enabled {
+        return "System reserve: disabled".to_owned();
+    }
+    let cores = status.system_reserve.reserved_physical_cores.len();
+    let threads = status.system_reserve.reserved_cpu_set_ids.len();
+    format!(
+        "System reserve: {cores} {} / {threads} {}",
+        if cores == 1 { "core" } else { "cores" },
+        if threads == 1 { "thread" } else { "threads" },
+    )
+}
+
+fn latency_label(status: &ControllerStatus) -> String {
+    if !status.scheduler_latency.enabled {
+        return "Latency guard: disabled".to_owned();
+    }
+    let memory_cores = status.memory_profile_physical_cores;
+    format!(
+        "Latency: p99 {} us / DPC {}.{:02}% / memory {memory_cores} {} ({})",
+        status.scheduler_latency.p99_lateness_us,
+        status.maximum_dpc_time_bps / 100,
+        status.maximum_dpc_time_bps % 100,
+        if memory_cores == 1 { "core" } else { "cores" },
+        pressure_label(status.responsiveness_pressure),
+    )
 }
 
 fn service_label(service: &ServiceViewState) -> String {
@@ -113,13 +153,25 @@ fn service_label(service: &ServiceViewState) -> String {
 }
 
 fn effective_label(status: &ControllerStatus) -> String {
-    if !status.scheduling_enabled || status.phase == ControllerPhase::Disabled {
-        return "Scheduling disabled".to_owned();
-    }
     match status.configured_mode {
         ControllerMode::Off => "Configured off".to_owned(),
         ControllerMode::Observe => "Observe only".to_owned(),
+        ControllerMode::Auto
+            if !status.scheduling_enabled || status.phase == ControllerPhase::Disabled =>
+        {
+            "Scheduling disabled".to_owned()
+        }
         ControllerMode::Auto => "Scheduling enabled".to_owned(),
+    }
+}
+
+const fn pressure_label(
+    pressure: winsched_core::responsiveness::ResponsivenessPressure,
+) -> &'static str {
+    match pressure {
+        winsched_core::responsiveness::ResponsivenessPressure::Unknown => "unknown",
+        winsched_core::responsiveness::ResponsivenessPressure::Normal => "normal",
+        winsched_core::responsiveness::ResponsivenessPressure::Elevated => "elevated",
     }
 }
 
@@ -145,8 +197,10 @@ fn menu_text(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winsched_config::{ControllerConfig, LoggingConfig};
+    use winsched_config::{ControllerConfig, LoggingConfig, ResponsivenessConfig};
     use winsched_control::{ConfigReloadResult, ControllerStatus, STATUS_SCHEMA_VERSION};
+    use winsched_core::responsiveness::ResponsivenessPressure;
+    use winsched_core::{PhysicalCoreKey, SystemReservePlan, latency::SchedulerLatencyStatus};
 
     fn status(enabled: bool, mode: ControllerMode) -> ControllerStatus {
         ControllerStatus {
@@ -164,6 +218,14 @@ mod tests {
             config_reload_error: None,
             applied_config_fingerprint: ControllerConfig::default().fingerprint(),
             applied_logging: LoggingConfig::default(),
+            applied_responsiveness: ResponsivenessConfig::default(),
+            system_reserve: SystemReservePlan::default(),
+            scheduler_latency: SchedulerLatencyStatus::default(),
+            maximum_dpc_time_bps: 0,
+            maximum_interrupt_time_bps: 0,
+            memory_profile_physical_cores: 28,
+            responsiveness_pressure: ResponsivenessPressure::Unknown,
+            last_responsiveness_adjustment: None,
             iteration: 7,
             managed_processes: 3,
             llc_domains: 2,
@@ -175,13 +237,27 @@ mod tests {
 
     #[test]
     fn running_auto_service_exposes_disable_and_stop_actions() {
-        let status = status(true, ControllerMode::Auto);
+        let mut status = status(true, ControllerMode::Auto);
+        status.applied_responsiveness.enabled = true;
+        status.system_reserve.reserved_physical_cores = vec![PhysicalCoreKey {
+            group: 0,
+            core_index: 6,
+        }];
+        status.system_reserve.reserved_cpu_set_ids = vec![262, 263];
+        status.scheduler_latency.enabled = true;
+        status.scheduler_latency.p99_lateness_us = 750;
+        status.maximum_dpc_time_bps = 125;
         let model = build_menu_model(&ServiceViewState::Running, Some(&status), None);
         assert_eq!(model.scheduling_action, "Disable Scheduling");
         assert!(model.scheduling_action_enabled);
         assert_eq!(model.service_action, "Stop Service");
         assert!(model.header.contains("Scheduling enabled"));
         assert_eq!(model.managed, "Managed processes: 3");
+        assert_eq!(model.reserve, "System reserve: 1 core / 2 threads");
+        assert_eq!(
+            model.latency,
+            "Latency: p99 750 us / DPC 1.25% / memory 28 cores (unknown)"
+        );
     }
 
     #[test]
