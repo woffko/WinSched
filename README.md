@@ -31,7 +31,15 @@ The tray menu contains:
 - managed-process count
 - last controller activity and error
 - `Settings...`, `Open Configuration (Advanced)`, `Open Logs`, `Refresh Status`,
-  and `Exit Tray`
+  `About WinSched...`, `GitHub Repository`, and `Exit Tray`
+
+The About dialog shows the installed version, project description, MIT license,
+and GitHub URL. `GitHub Repository` opens
+<https://github.com/woffko/WinSched> in the default browser.
+
+Important Settings labels and controls provide contextual hover help in both
+English and Russian, including units and the consequences of policy,
+responsiveness, workload-profile, strict-placement, and logging choices.
 
 Interactive users receive only the service rights required to query, start,
 stop, and send the two WinSched control codes. Administrators retain full
@@ -246,6 +254,26 @@ The script verifies every frozen payload hash before compiling and writes
 `WinSched-<version>-Setup-x64.exe` plus a portable `.sha256` file under
 `dist\gui-installer`. The final Setup must be accepted on a local Windows 11 x64
 machine; a WSL cross-build alone is not release evidence.
+
+## Testing and evidence
+
+WinSched uses separate source, Windows VM, and physical Threadripper gates.
+The current 0.3.1 summary is:
+
+| Gate | Result |
+|---|---:|
+| Rust workspace tests | 86 PASS |
+| Native and Windows-target Clippy | PASS |
+| RustSec audit | PASS, 383 dependencies |
+| Windows PowerShell parser | PASS, 22 scripts |
+| Setup upgrade and byte-identical config preservation | PASS |
+| About version/GitHub and Settings tooltip UI Automation | PASS |
+| Threadripper topology/apply/rollback | PASS |
+| Threadripper p99 / throughput gate | 83.27% lower p99; 15.10% higher throughput |
+
+See [Testing and release validation](docs/testing.md) for the complete matrix,
+environment boundaries, exact results, commands, and example JSON output. The
+version-specific acceptance records are under `tests/evidence/`.
 
 The generated tray source and all Windows icon sizes are reproducible with:
 

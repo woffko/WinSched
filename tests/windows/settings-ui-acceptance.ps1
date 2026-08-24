@@ -12,6 +12,7 @@ Set-StrictMode -Version Latest
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
 
 function Expand-UnicodeEscapes([string]$Value) {
     return [System.Text.RegularExpressions.Regex]::Unescape($Value)
@@ -478,6 +479,26 @@ function Test-AccessibleName($Root, [string[]]$Names) {
     return $null -ne (Find-AccessibleElement $Root $Names $false)
 }
 
+function Assert-HoverTooltip(
+    $Window,
+    [string[]]$TargetNames,
+    [string]$ExpectedText
+) {
+    $target = Wait-AccessibleElement $Window $TargetNames $false
+    $rect = $target.Current.BoundingRectangle
+    Assert-True ($rect.Width -gt 0 -and $rect.Height -gt 0) `
+        "Tooltip target '$($TargetNames -join "' or '")' has invalid bounds"
+    [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(
+        [int][Math]::Round($rect.X + $rect.Width / 2),
+        [int][Math]::Round($rect.Y + $rect.Height / 2)
+    )
+    Wait-Condition "tooltip '$ExpectedText'" {
+        Test-AccessibleName `
+            ([System.Windows.Automation.AutomationElement]::RootElement) `
+            @($ExpectedText)
+    } 8
+}
+
 function Capture-Window($Window, [string]$Path) {
     try {
         $Window.SetFocus()
@@ -815,6 +836,14 @@ max_mutations_per_evaluation = 1
     [void](Wait-AccessibleElement $primaryWindow @("General") $true)
     Invoke-NamedAccessibleElement $primaryWindow @("General")
     [void](Wait-AccessibleElement $primaryWindow @("Controller behavior") $false)
+    Assert-HoverTooltip `
+        $primaryWindow `
+        @("Sample interval (milliseconds)") `
+        "How often the service samples process and CPU activity. Lower values react faster but add more telemetry work."
+    Assert-HoverTooltip `
+        $primaryWindow `
+        @("Default workload profile") `
+        "Interactive stays on one LLC, Memory spreads one thread per physical core by default, Compute uses both SMT siblings, and Background/Balanced retain LLC-aware adaptive behavior."
     [void](Wait-AccessibleElement $primaryWindow @(
         "Start the WinSched tray automatically when a user signs in"
     ) $true)
@@ -836,6 +865,10 @@ max_mutations_per_evaluation = 1
         $true
     Assert-True ((Get-ToggleState $responsivenessToggle) -eq "On") `
         "Working configuration did not enable the system reserve"
+    Assert-HoverTooltip `
+        $primaryWindow `
+        @("Enable topology-aware system reserve") `
+        "Excludes complete physical-core CPU Sets from managed application plans while leaving Windows and protected system processes unrestricted."
     Assert-NumericControl $primaryWindow @("System reserve percent") $true 10
     Assert-NumericControl $primaryWindow @("Minimum reserved cores") $true 2
     Assert-NumericControl $primaryWindow @("Maximum reserved cores") $true 8
@@ -876,6 +909,10 @@ max_mutations_per_evaluation = 1
         $true
     Assert-True ((Get-ToggleState $loggingToggle) -eq "Off") `
         "Working configuration did not load logging as disabled"
+    Assert-HoverTooltip `
+        $primaryWindow `
+        @("Enable detailed service logging") `
+        "Writes detailed service events as JSONL. Disable it to stop routine disk writes; existing logs remain until removed manually or by uninstall purge."
     Assert-NumericControl `
         $primaryWindow `
         @("Maximum active log size (MiB)") `
@@ -1114,6 +1151,8 @@ max_mutations_per_evaluation = 1
         responsiveness_en_ru_ui = $true
         logging_enabled_disabled_persistence = $true
         logging_defaults_applied = $true
+        tooltip_pages_verified = @("General", "Responsiveness", "Logging")
+        tooltips_verified = 4
         service_reload_observed = $true
         original_config_sha256 = $originalHash
         screenshots = @($screenshots)

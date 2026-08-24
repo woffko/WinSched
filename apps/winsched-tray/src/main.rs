@@ -27,7 +27,7 @@ mod app {
     use std::process::Command;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::menu::{AboutMetadataBuilder, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
     use windows_service::Error as WindowsServiceError;
     use windows_service::service::{ServiceAccess, ServiceState, UserEventCode};
@@ -41,7 +41,7 @@ mod app {
         INSTALL_DIRECTORY_NAME, LOG_FILE_NAME, SERVICE_NAME, STATUS_FILE_NAME,
         STATUS_SCHEMA_VERSION,
     };
-    use winsched_tray::{MenuModel, ServiceViewState, build_menu_model};
+    use winsched_tray::{GITHUB_URL, MenuModel, ServiceViewState, about_details, build_menu_model};
 
     const MENU_SCHEDULING: &str = "scheduling";
     const MENU_SERVICE: &str = "service";
@@ -49,6 +49,7 @@ mod app {
     const MENU_OPEN_CONFIG: &str = "open-config";
     const MENU_OPEN_LOGS: &str = "open-logs";
     const MENU_REFRESH: &str = "refresh";
+    const MENU_GITHUB: &str = "github";
     const MENU_EXIT: &str = "exit";
     const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
     const STATUS_STALE_AFTER_MS: u64 = 75_000;
@@ -128,10 +129,22 @@ mod app {
             );
             let open_logs = MenuItem::with_id(MENU_OPEN_LOGS, "Open Logs", true, None);
             let refresh = MenuItem::with_id(MENU_REFRESH, "Refresh Status", true, None);
+            let details = about_details(env!("CARGO_PKG_VERSION"));
+            let metadata = AboutMetadataBuilder::new()
+                .name(Some(details.name))
+                .version(Some(details.version))
+                .comments(Some(details.comments))
+                .license(Some(details.license))
+                .website(Some(details.website))
+                .website_label(Some(details.website_label))
+                .build();
+            let about = PredefinedMenuItem::about(Some("About WinSched..."), Some(metadata));
+            let github = MenuItem::with_id(MENU_GITHUB, "GitHub Repository", true, None);
             let exit = MenuItem::with_id(MENU_EXIT, "Exit Tray", true, None);
             let separator_1 = PredefinedMenuItem::separator();
             let separator_2 = PredefinedMenuItem::separator();
             let separator_3 = PredefinedMenuItem::separator();
+            let separator_4 = PredefinedMenuItem::separator();
 
             menu.append_items(&[
                 &header,
@@ -150,6 +163,9 @@ mod app {
                 &open_logs,
                 &refresh,
                 &separator_3,
+                &about,
+                &github,
+                &separator_4,
                 &exit,
             ])?;
 
@@ -264,6 +280,8 @@ mod app {
                 open_file_or_directory(&self.paths.log, &self.paths.install_dir, "notepad.exe")
             } else if event.id == MENU_REFRESH {
                 Ok(())
+            } else if event.id == MENU_GITHUB {
+                open_url(GITHUB_URL)
             } else if event.id == MENU_EXIT {
                 event_loop.exit();
                 return;
@@ -487,6 +505,14 @@ mod app {
             .arg(argument)
             .spawn()
             .map_err(|error| format!("Cannot open {}: {error}", argument.display()))?;
+        Ok(())
+    }
+
+    fn open_url(url: &str) -> Result<(), String> {
+        Command::new("explorer.exe")
+            .arg(url)
+            .spawn()
+            .map_err(|error| format!("Cannot open {url}: {error}"))?;
         Ok(())
     }
 

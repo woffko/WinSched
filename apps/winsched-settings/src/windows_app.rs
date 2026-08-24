@@ -604,7 +604,12 @@ impl SettingsApp {
         ));
         ui.add_space(6.0);
         ui.group(|ui| {
-            ui.label(RichText::new(language.text("Controller mode", "Режим контроллера")).strong());
+            let controller_help = language.text(
+                "Off stops evaluation, Observe reports decisions without changing CPU Sets, and Auto applies validated placement decisions.",
+                "«Выключен» останавливает оценку, «Наблюдение» показывает решения без изменения CPU Sets, а Auto применяет проверенные решения размещения.",
+            );
+            ui.label(RichText::new(language.text("Controller mode", "Режим контроллера")).strong())
+                .on_hover_text(controller_help);
             ui.radio_value(
                 &mut self.config.controller_mode,
                 ControllerMode::Off,
@@ -612,7 +617,8 @@ impl SettingsApp {
                     "Off — do not observe or change process placement",
                     "Выключен — не наблюдать и не изменять размещение процессов",
                 ),
-            );
+            )
+            .on_hover_text(controller_help);
             ui.radio_value(
                 &mut self.config.controller_mode,
                 ControllerMode::Observe,
@@ -620,7 +626,8 @@ impl SettingsApp {
                     "Observe — calculate and report decisions without applying them",
                     "Наблюдение — рассчитывать и показывать решения без их применения",
                 ),
-            );
+            )
+            .on_hover_text(controller_help);
             ui.radio_value(
                 &mut self.config.controller_mode,
                 ControllerMode::Auto,
@@ -628,34 +635,47 @@ impl SettingsApp {
                     "Auto — apply validated CPU placement decisions",
                     "Авто — применять проверенные решения по размещению на CPU",
                 ),
-            );
+            )
+            .on_hover_text(controller_help);
         });
         ui.add_space(10.0);
         general_values(ui, &mut self.config, language);
         ui.add_space(8.0);
+        let all_processes_help = language.text(
+            "When enabled, eligible interactive user processes may be managed even without an explicit rule. Safety exclusions and the utilization threshold still apply.",
+            "Если включено, подходящие интерактивные процессы пользователя могут управляться без явного правила. Защитные исключения и порог загрузки продолжают действовать.",
+        );
         ui.checkbox(
             &mut self.config.all_user_processes,
             language.text(
                 "Manage all eligible user processes, not only explicitly listed rules",
                 "Управлять всеми подходящими пользовательскими процессами, а не только указанными в правилах",
             ),
-        );
+        )
+        .on_hover_text(all_processes_help);
         ui.label(language.text(
             "When disabled, a process must have an exact executable-name rule before WinSched considers it.",
             "Если флажок снят, WinSched рассматривает процесс только при наличии правила с точным именем исполняемого файла.",
-        ));
+        ))
+        .on_hover_text(all_processes_help);
         ui.add_space(10.0);
+        let autostart_help = language.text(
+            "Controls the machine-wide Startup shortcut. It starts the non-elevated tray after interactive sign-in; the service starts independently with Windows.",
+            "Управляет общесистемным ярлыком автозагрузки. Он запускает трей без повышения прав после интерактивного входа; служба запускается с Windows независимо.",
+        );
         ui.checkbox(
             &mut self.tray_autostart,
             language.text(
                 "Start the WinSched tray automatically when a user signs in",
                 "Автоматически запускать WinSched в области уведомлений при входе пользователя",
             ),
-        );
+        )
+        .on_hover_text(autostart_help);
         ui.label(language.text(
             "This manages the machine-wide WinSched Tray shortcut in the Windows Startup folder.",
             "Этот параметр управляет общесистемным ярлыком WinSched Tray в папке автозагрузки Windows.",
-        ));
+        ))
+        .on_hover_text(autostart_help);
     }
 
     fn adaptive_tab(&mut self, ui: &mut egui::Ui) {
@@ -752,17 +772,23 @@ impl SettingsApp {
             "Настройте объём истории диагностики службы, сохраняемой на этом компьютере.",
         ));
         ui.add_space(8.0);
+        let logging_help = language.text(
+            "Writes detailed service events as JSONL. Disable it to stop routine disk writes; existing logs remain until removed manually or by uninstall purge.",
+            "Записывает подробные события службы в JSONL. Выключите, чтобы прекратить обычные записи на диск; существующие журналы сохраняются до ручного удаления или полной очистки при удалении программы.",
+        );
         ui.checkbox(
             &mut self.config.logging.enabled,
             language.text(
                 "Enable detailed service logging",
                 "Включить подробный журнал службы",
             ),
-        );
+        )
+        .on_hover_text(logging_help);
         ui.label(language.text(
             "Diagnostic events are written as JSON lines to:",
             "Диагностические события записываются строками JSON в:",
-        ));
+        ))
+        .on_hover_text(logging_help);
         ui.monospace(self.paths.log.display().to_string());
         ui.add_space(8.0);
 
@@ -843,17 +869,20 @@ impl SettingsApp {
 
     fn responsiveness_reserve_controls(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
+        let reserve_help = reserve_help(language);
         ui.checkbox(
             &mut self.config.responsiveness.enabled,
             language.text(
                 "Enable topology-aware system reserve",
                 "Включить топологический системный резерв",
             ),
-        );
+        )
+        .on_hover_text(reserve_help);
         ui.label(language.text(
             "Protected system processes remain unrestricted and are never pinned to the reserve. The reserve is spread over LLC domains and always includes complete SMT sibling pairs.",
             "Защищённые системные процессы остаются без ограничений и не закрепляются за резервом. Резерв распределяется по LLC и всегда включает полные пары SMT-потоков.",
-        ));
+        ))
+        .on_hover_text(reserve_help);
         ui.add_space(8.0);
         let controls_enabled = self.config.responsiveness.enabled;
 
@@ -891,15 +920,11 @@ impl SettingsApp {
                 "Верхняя граница, не позволяющая проценту занять слишком большую часть CPU.",
             ),
         );
-        ui.add_enabled(
+        latency_guard_toggle(
+            ui,
+            &mut self.config.responsiveness.latency_guard_enabled,
             controls_enabled,
-            egui::Checkbox::new(
-                &mut self.config.responsiveness.latency_guard_enabled,
-                language.text(
-                    "Enable scheduling latency guard",
-                    "Включить контроль задержки планирования",
-                ),
-            ),
+            language,
         );
         responsiveness_value_u64(
             ui,
@@ -952,17 +977,26 @@ impl SettingsApp {
             "Memory-bound workload profile",
             "Профиль нагрузок, ограниченных памятью",
         ));
-        ui.checkbox(
-            &mut self.config.responsiveness.memory.use_smt,
-            language.text(
-                "Allow both SMT threads per physical core",
-                "Разрешить оба SMT-потока физического ядра",
-            ),
+        let smt_help = language.text(
+            "Off keeps one logical processor per physical core, which is recommended for bandwidth-bound workloads. On permits both SMT siblings and can help compute-heavy mixed workloads.",
+            "В выключенном состоянии остаётся один логический процессор на физическое ядро, что рекомендуется для нагрузок, ограниченных памятью. Включение разрешает оба SMT-потока и может помочь смешанным вычислительным нагрузкам.",
         );
+        ui.add_enabled(
+            controls_enabled,
+            egui::Checkbox::new(
+                &mut self.config.responsiveness.memory.use_smt,
+                language.text(
+                    "Allow both SMT threads per physical core",
+                    "Разрешить оба SMT-потока физического ядра",
+                ),
+            ),
+        )
+        .on_hover_text(smt_help);
         ui.label(language.text(
             "Off is recommended for bandwidth-bound workloads on this Threadripper; the profile keeps one logical processor per physical core.",
             "Для ограниченных памятью нагрузок на этом Threadripper рекомендуется выключить: профиль оставляет один логический процессор на физическое ядро.",
-        ));
+        ))
+        .on_hover_text(smt_help);
         responsiveness_value_u16(
             ui,
             language.text(
@@ -1416,61 +1450,96 @@ impl eframe::App for SettingsApp {
     }
 }
 
+fn latency_guard_toggle(
+    ui: &mut egui::Ui,
+    enabled: &mut bool,
+    controls_enabled: bool,
+    language: Language,
+) {
+    let help = language.text(
+        "Measures normal-priority scheduler wake lateness. Sustained p99, DPC, or interrupt pressure can reduce Memory-profile concurrency within the configured bounds.",
+        "Измеряет задержку пробуждения планировщика с обычным приоритетом. Устойчивое давление p99, DPC или прерываний может уменьшить параллелизм Memory-профиля в заданных границах.",
+    );
+    ui.add_enabled(
+        controls_enabled,
+        egui::Checkbox::new(
+            enabled,
+            language.text(
+                "Enable scheduling latency guard",
+                "Включить контроль задержки планирования",
+            ),
+        ),
+    )
+    .on_hover_text(help);
+}
+
+const fn reserve_help(language: Language) -> &'static str {
+    language.text(
+        "Excludes complete physical-core CPU Sets from managed application plans while leaving Windows and protected system processes unrestricted.",
+        "Исключает CPU Sets целых физических ядер из планов управляемых приложений, не ограничивая Windows и защищённые системные процессы.",
+    )
+}
+
 fn general_values(ui: &mut egui::Ui, config: &mut ControllerConfig, language: Language) {
     egui::Grid::new("general-values")
         .num_columns(2)
         .spacing([18.0, 10.0])
         .show(ui, |ui| {
+            let schema_help = match language {
+                Language::English => format!(
+                    "The service currently supports schema version {CONFIG_SCHEMA_VERSION}. This field is read-only."
+                ),
+                Language::Russian => format!(
+                    "Служба сейчас поддерживает схему версии {CONFIG_SCHEMA_VERSION}. Это поле доступно только для чтения."
+                ),
+            };
             let schema_label = ui
-                .label(language.text("Configuration schema version", "Версия схемы конфигурации"));
+                .label(language.text("Configuration schema version", "Версия схемы конфигурации"))
+                .on_hover_text(&schema_help);
             ui.add_enabled(false, egui::DragValue::new(&mut config.schema_version))
                 .labelled_by(schema_label.id)
-                .on_hover_text(match language {
-                    Language::English => format!(
-                        "The service currently supports schema version {CONFIG_SCHEMA_VERSION}."
-                    ),
-                    Language::Russian => {
-                        format!("Служба сейчас поддерживает схему версии {CONFIG_SCHEMA_VERSION}.")
-                    }
-                });
+                .on_hover_text(&schema_help);
             ui.end_row();
 
+            let sample_help = language.text(
+                "How often the service samples process and CPU activity. Lower values react faster but add more telemetry work.",
+                "Как часто служба измеряет активность процессов и CPU. Меньшие значения ускоряют реакцию, но увеличивают объём телеметрии.",
+            );
             let sample_label = ui.label(language.text(
                 "Sample interval (milliseconds)",
                 "Интервал опроса (миллисекунды)",
-            ));
+            )).on_hover_text(sample_help);
             ui.add(
                 egui::DragValue::new(&mut config.sample_interval_ms)
                     .range(1_000..=60_000)
                     .speed(100),
             )
             .labelled_by(sample_label.id)
-            .on_hover_text(language.text(
-                "How often the service samples process and CPU activity.",
-                "Как часто служба измеряет активность процессов и CPU.",
-            ));
+            .on_hover_text(sample_help);
             ui.end_row();
 
+            let utilization_help = language.text(
+                "Minimum CPU activity required before an implicitly scoped process is managed. 100 basis points equal 1% of one logical CPU.",
+                "Минимальная активность CPU для управления неявно выбранным процессом. 100 базисных пунктов равны 1% одного логического CPU.",
+            );
             let utilization_label = ui.label(language.text(
                 "Minimum process utilization (basis points)",
                 "Минимальная загрузка процесса (базисные пункты)",
-            ));
+            )).on_hover_text(utilization_help);
             ui.add(
                 egui::DragValue::new(&mut config.minimum_process_utilization_bps)
                     .range(0..=10_000)
                     .speed(25),
             )
             .labelled_by(utilization_label.id)
-            .on_hover_text(language.text(
-                "100 basis points equal 1% CPU utilization.",
-                "100 базисных пунктов равны 1% загрузки CPU.",
-            ));
+            .on_hover_text(utilization_help);
             ui.end_row();
 
             ui.label(language.text(
                 "Default process rule mode",
                 "Режим правила процессов по умолчанию",
-            ));
+            ))
+            .on_hover_text(rule_mode_help(language));
             rule_mode_combo(
                 ui,
                 "default-rule-mode",
@@ -1484,7 +1553,8 @@ fn general_values(ui: &mut egui::Ui, config: &mut ControllerConfig, language: La
             );
             ui.end_row();
 
-            ui.label(language.text("Default workload profile", "Профиль нагрузки по умолчанию"));
+            ui.label(language.text("Default workload profile", "Профиль нагрузки по умолчанию"))
+                .on_hover_text(workload_profile_help(language));
             workload_profile_combo(
                 ui,
                 "default-workload-profile",
@@ -1521,75 +1591,7 @@ fn process_rule_ui(
                 ))
                 .clicked();
         });
-        egui::Grid::new(("process-rule", index))
-            .num_columns(2)
-            .spacing([14.0, 8.0])
-            .show(ui, |ui| {
-                let image_label =
-                    ui.label(language.text("Executable image name", "Имя исполняемого файла"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut rule.image)
-                        .hint_text("example.exe")
-                        .desired_width(260.0),
-                )
-                .labelled_by(image_label.id);
-                ui.end_row();
-
-                ui.label(language.text("Placement mode", "Режим размещения"));
-                let previous = rule.mode;
-                rule_mode_combo(
-                    ui,
-                    ("process-rule-mode", index),
-                    &format!(
-                        "{} {} — {}",
-                        language.text("Rule", "Правило"),
-                        index + 1,
-                        language.text("placement mode", "режим размещения")
-                    ),
-                    &mut rule.mode,
-                    language,
-                    true,
-                );
-                if rule.mode != previous {
-                    if rule.mode == RuleMode::Strict {
-                        rule.group.get_or_insert(0);
-                        rule.llc.get_or_insert(0);
-                    } else {
-                        rule.group = None;
-                        rule.llc = None;
-                    }
-                }
-                ui.end_row();
-
-                ui.label(language.text("Workload profile", "Профиль нагрузки"));
-                workload_profile_combo(
-                    ui,
-                    ("process-workload-profile", index),
-                    &format!(
-                        "{} {} — {}",
-                        language.text("Rule", "Правило"),
-                        index + 1,
-                        language.text("workload profile", "профиль нагрузки")
-                    ),
-                    &mut rule.profile,
-                    language,
-                );
-                ui.end_row();
-
-                if rule.mode == RuleMode::Strict {
-                    let group_label =
-                        ui.label(language.text("Processor group", "Группа процессоров"));
-                    ui.add(egui::DragValue::new(rule.group.get_or_insert(0)))
-                        .labelled_by(group_label.id);
-                    ui.end_row();
-                    let llc_label = ui.label(
-                        language.text("Last-level cache index", "Индекс кеша последнего уровня"),
-                    );
-                    ui.add(egui::DragValue::new(rule.llc.get_or_insert(0)))
-                        .labelled_by(llc_label.id);
-                    ui.end_row();
-                }
-            });
+        process_rule_grid(ui, index, rule, language);
         if rule.mode == RuleMode::Strict {
             ui.label(language.text(
                 "Strict pins the process to the specified processor group and cache domain.",
@@ -1598,6 +1600,111 @@ fn process_rule_ui(
         }
     });
     remove
+}
+
+fn process_rule_grid(ui: &mut egui::Ui, index: usize, rule: &mut ProcessRule, language: Language) {
+    egui::Grid::new(("process-rule", index))
+        .num_columns(2)
+        .spacing([14.0, 8.0])
+        .show(ui, |ui| {
+            process_image_row(ui, rule, language);
+            process_mode_row(ui, index, rule, language);
+            process_profile_row(ui, index, rule, language);
+            if rule.mode == RuleMode::Strict {
+                strict_domain_rows(ui, rule, language);
+            }
+        });
+}
+
+fn process_image_row(ui: &mut egui::Ui, rule: &mut ProcessRule, language: Language) {
+    let help = language.text(
+        "Enter only the executable file name, for example game.exe. Matching is exact and case-insensitive; paths and wildcards are rejected.",
+        "Укажите только имя исполняемого файла, например game.exe. Сопоставление точное и без учёта регистра; пути и маски не допускаются.",
+    );
+    let label = ui
+        .label(language.text("Executable image name", "Имя исполняемого файла"))
+        .on_hover_text(help);
+    ui.add(
+        egui::TextEdit::singleline(&mut rule.image)
+            .hint_text("example.exe")
+            .desired_width(260.0),
+    )
+    .labelled_by(label.id)
+    .on_hover_text(help);
+    ui.end_row();
+}
+
+fn process_mode_row(ui: &mut egui::Ui, index: usize, rule: &mut ProcessRule, language: Language) {
+    ui.label(language.text("Placement mode", "Режим размещения"))
+        .on_hover_text(rule_mode_help(language));
+    let previous = rule.mode;
+    rule_mode_combo(
+        ui,
+        ("process-rule-mode", index),
+        &format!(
+            "{} {} — {}",
+            language.text("Rule", "Правило"),
+            index + 1,
+            language.text("placement mode", "режим размещения")
+        ),
+        &mut rule.mode,
+        language,
+        true,
+    );
+    if rule.mode != previous {
+        if rule.mode == RuleMode::Strict {
+            rule.group.get_or_insert(0);
+            rule.llc.get_or_insert(0);
+        } else {
+            rule.group = None;
+            rule.llc = None;
+        }
+    }
+    ui.end_row();
+}
+
+fn process_profile_row(
+    ui: &mut egui::Ui,
+    index: usize,
+    rule: &mut ProcessRule,
+    language: Language,
+) {
+    ui.label(language.text("Workload profile", "Профиль нагрузки"))
+        .on_hover_text(workload_profile_help(language));
+    workload_profile_combo(
+        ui,
+        ("process-workload-profile", index),
+        &format!(
+            "{} {} — {}",
+            language.text("Rule", "Правило"),
+            index + 1,
+            language.text("workload profile", "профиль нагрузки")
+        ),
+        &mut rule.profile,
+        language,
+    );
+    ui.end_row();
+}
+
+fn strict_domain_rows(ui: &mut egui::Ui, rule: &mut ProcessRule, language: Language) {
+    let help = language.text(
+        "Strict mode uses this Windows processor group and LLC index exactly. Use winsched topology to discover valid values.",
+        "Строгий режим точно использует эту группу процессоров Windows и индекс LLC. Допустимые значения можно узнать командой winsched topology.",
+    );
+    let group_label = ui
+        .label(language.text("Processor group", "Группа процессоров"))
+        .on_hover_text(help);
+    ui.add(egui::DragValue::new(rule.group.get_or_insert(0)))
+        .labelled_by(group_label.id)
+        .on_hover_text(help);
+    ui.end_row();
+    let llc_label = ui
+        .label(language.text("Last-level cache index", "Индекс кеша последнего уровня"))
+        .on_hover_text(help);
+    ui.add(egui::DragValue::new(rule.llc.get_or_insert(0)))
+        .labelled_by(llc_label.id)
+        .on_hover_text(help);
+    ui.end_row();
 }
 
 fn read_status(path: &Path) -> Option<ControllerStatus> {
@@ -1651,7 +1758,16 @@ fn rule_mode_combo(
                 }
                 ui.selectable_value(mode, candidate, rule_mode_name(candidate, language));
             }
-        });
+        })
+        .response
+        .on_hover_text(rule_mode_help(language));
+}
+
+const fn rule_mode_help(language: Language) -> &'static str {
+    language.text(
+        "Controls placement behavior: Off excludes the process, Sticky keeps its first assignment, Auto may move it after policy safeguards, Performance/Efficiency filter CPU classes, and Strict targets one LLC domain.",
+        "Определяет размещение: «Выключен» исключает процесс, Sticky сохраняет первое назначение, Auto может перемещать после проверок политики, Performance/Efficiency фильтруют классы CPU, а Strict выбирает один домен LLC.",
+    )
 }
 
 fn workload_profile_name(profile: WorkloadProfile, language: Language) -> &'static str {
@@ -1690,7 +1806,16 @@ fn workload_profile_combo(
                     workload_profile_name(candidate, language),
                 );
             }
-        });
+        })
+        .response
+        .on_hover_text(workload_profile_help(language));
+}
+
+const fn workload_profile_help(language: Language) -> &'static str {
+    language.text(
+        "Interactive stays on one LLC, Memory spreads one thread per physical core by default, Compute uses both SMT siblings, and Background/Balanced retain LLC-aware adaptive behavior.",
+        "Interactive остаётся в одном LLC, Memory по умолчанию распределяет по одному потоку на физическое ядро, Compute использует оба SMT-потока, а Background/Balanced сохраняют адаптивное LLC-размещение.",
+    )
 }
 
 fn responsiveness_value_u8(
@@ -1705,14 +1830,17 @@ fn responsiveness_value_u8(
     let row_width = (ui.available_width() - 16.0).max(240.0);
     ui.group(|ui| {
         ui.set_width(row_width);
-        let response = ui.label(RichText::new(label).strong());
-        ui.label(explanation);
+        let response = ui
+            .label(RichText::new(label).strong())
+            .on_hover_text(explanation);
+        ui.label(explanation).on_hover_text(explanation);
         ui.add_space(4.0);
         ui.add_enabled(
             enabled,
             egui::DragValue::new(value).range(range).suffix(suffix),
         )
-        .labelled_by(response.id);
+        .labelled_by(response.id)
+        .on_hover_text(explanation);
     });
     ui.add_space(6.0);
 }
@@ -1728,11 +1856,14 @@ fn responsiveness_value_u16(
     let row_width = (ui.available_width() - 16.0).max(240.0);
     ui.group(|ui| {
         ui.set_width(row_width);
-        let response = ui.label(RichText::new(label).strong());
-        ui.label(explanation);
+        let response = ui
+            .label(RichText::new(label).strong())
+            .on_hover_text(explanation);
+        ui.label(explanation).on_hover_text(explanation);
         ui.add_space(4.0);
         ui.add_enabled(enabled, egui::DragValue::new(value).range(range))
-            .labelled_by(response.id);
+            .labelled_by(response.id)
+            .on_hover_text(explanation);
     });
     ui.add_space(6.0);
 }
@@ -1748,14 +1879,17 @@ fn responsiveness_value_u64(
     let row_width = (ui.available_width() - 16.0).max(240.0);
     ui.group(|ui| {
         ui.set_width(row_width);
-        let response = ui.label(RichText::new(label).strong());
-        ui.label(explanation);
+        let response = ui
+            .label(RichText::new(label).strong())
+            .on_hover_text(explanation);
+        ui.label(explanation).on_hover_text(explanation);
         ui.add_space(4.0);
         ui.add_enabled(
             enabled,
             egui::DragValue::new(value).range(range).speed(1_000),
         )
-        .labelled_by(response.id);
+        .labelled_by(response.id)
+        .on_hover_text(explanation);
     });
     ui.add_space(6.0);
 }
@@ -1770,11 +1904,14 @@ fn policy_value_u16(
     let row_width = (ui.available_width() - 16.0).max(240.0);
     ui.group(|ui| {
         ui.set_width(row_width);
-        let response = ui.label(RichText::new(label).strong());
-        ui.label(explanation);
+        let response = ui
+            .label(RichText::new(label).strong())
+            .on_hover_text(explanation);
+        ui.label(explanation).on_hover_text(explanation);
         ui.add_space(4.0);
         ui.add_sized([180.0, 24.0], egui::DragValue::new(value).range(range))
-            .labelled_by(response.id);
+            .labelled_by(response.id)
+            .on_hover_text(explanation);
     });
     ui.add_space(6.0);
 }
@@ -1783,11 +1920,14 @@ fn policy_value_u64(ui: &mut egui::Ui, label: &str, value: &mut u64, explanation
     let row_width = (ui.available_width() - 16.0).max(240.0);
     ui.group(|ui| {
         ui.set_width(row_width);
-        let response = ui.label(RichText::new(label).strong());
-        ui.label(explanation);
+        let response = ui
+            .label(RichText::new(label).strong())
+            .on_hover_text(explanation);
+        ui.label(explanation).on_hover_text(explanation);
         ui.add_space(4.0);
         ui.add_sized([180.0, 24.0], egui::DragValue::new(value).speed(100))
-            .labelled_by(response.id);
+            .labelled_by(response.id)
+            .on_hover_text(explanation);
     });
     ui.add_space(6.0);
 }
@@ -1803,8 +1943,10 @@ fn logging_value_u16(
     let row_width = (ui.available_width() - 16.0).max(240.0);
     ui.group(|ui| {
         ui.set_width(row_width);
-        let response = ui.label(RichText::new(label).strong());
-        ui.label(explanation);
+        let response = ui
+            .label(RichText::new(label).strong())
+            .on_hover_text(explanation);
+        ui.label(explanation).on_hover_text(explanation);
         ui.add_space(4.0);
         ui.add_enabled(
             enabled,
@@ -1812,7 +1954,8 @@ fn logging_value_u16(
                 .range(MIN_LOG_FILE_SIZE_MIB..=MAX_LOG_FILE_SIZE_MIB)
                 .suffix(suffix),
         )
-        .labelled_by(response.id);
+        .labelled_by(response.id)
+        .on_hover_text(explanation);
     });
     ui.add_space(6.0);
 }
@@ -1827,14 +1970,17 @@ fn logging_value_u8(
     let row_width = (ui.available_width() - 16.0).max(240.0);
     ui.group(|ui| {
         ui.set_width(row_width);
-        let response = ui.label(RichText::new(label).strong());
-        ui.label(explanation);
+        let response = ui
+            .label(RichText::new(label).strong())
+            .on_hover_text(explanation);
+        ui.label(explanation).on_hover_text(explanation);
         ui.add_space(4.0);
         ui.add_enabled(
             enabled,
             egui::DragValue::new(value).range(0..=MAX_RETAINED_LOG_ARCHIVES),
         )
-        .labelled_by(response.id);
+        .labelled_by(response.id)
+        .on_hover_text(explanation);
     });
     ui.add_space(6.0);
 }

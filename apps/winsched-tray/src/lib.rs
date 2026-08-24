@@ -5,6 +5,30 @@
 use winsched_config::ControllerMode;
 use winsched_control::{ControllerPhase, ControllerStatus};
 
+pub const GITHUB_URL: &str = "https://github.com/woffko/WinSched";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AboutDetails {
+    pub name: String,
+    pub version: String,
+    pub comments: String,
+    pub license: String,
+    pub website: String,
+    pub website_label: String,
+}
+
+#[must_use]
+pub fn about_details(version: &str) -> AboutDetails {
+    AboutDetails {
+        name: "WinSched".to_owned(),
+        version: version.to_owned(),
+        comments: "Topology-aware Windows 11 CPU placement controller.".to_owned(),
+        license: "MIT".to_owned(),
+        website: GITHUB_URL.to_owned(),
+        website_label: "GitHub Repository".to_owned(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceViewState {
     Missing,
@@ -233,6 +257,16 @@ mod tests {
             last_error: None,
             updated_at_unix_ms: 100,
         }
+    }
+
+    #[test]
+    fn about_details_expose_version_and_repository() {
+        let details = about_details("0.3.1");
+        assert_eq!(details.name, "WinSched");
+        assert_eq!(details.version, "0.3.1");
+        assert_eq!(details.license, "MIT");
+        assert_eq!(details.website, GITHUB_URL);
+        assert_eq!(details.website_label, "GitHub Repository");
     }
 
     #[test]
