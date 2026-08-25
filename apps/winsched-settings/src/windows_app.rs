@@ -3,9 +3,16 @@ use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Color32, RichText};
+use winsched::diagnostics::{
+    self, DiagnosticFindingCode, DiagnosticOptions, DiagnosticReport, DiagnosticSeverity,
+};
 use winsched_config::{
     CONFIG_SCHEMA_VERSION, ControllerConfig, ControllerMode, LoggingConfig,
     MAX_CONFIGURED_PHYSICAL_CORES, MAX_LATENCY_THRESHOLD_US, MAX_LOG_FILE_SIZE_MIB,
@@ -143,6 +150,7 @@ enum SettingsTab {
     Responsiveness,
     Rules,
     Logging,
+    Diagnostics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +172,13 @@ enum Confirmation {
     RestoreDefaults,
     CancelChanges,
     Close,
+}
+
+struct PendingDiagnostic {
+    receiver: mpsc::Receiver<Result<DiagnosticReport, String>>,
+    cancellation: Arc<AtomicBool>,
+    started: Instant,
+    cancelling: bool,
 }
 
 struct Banner {
@@ -239,6 +254,9 @@ struct SettingsApp {
     allow_close: bool,
     pending_reload: Option<PendingReload>,
     service_reload_state: ServiceReloadState,
+    pending_diagnostic: Option<PendingDiagnostic>,
+    diagnostic_report: Option<DiagnosticReport>,
+    diagnostic_error: Option<String>,
     language: Language,
 }
 
@@ -265,6 +283,9 @@ impl SettingsApp {
             allow_close: false,
             pending_reload: None,
             service_reload_state: ServiceReloadState::InSync,
+            pending_diagnostic: None,
+            diagnostic_report: None,
+            diagnostic_error: None,
             language,
         }
     }
@@ -510,6 +531,116 @@ impl SettingsApp {
         }
     }
 
+    fn start_diagnostic(&mut self) {
+        if self.pending_diagnostic.is_some() {
+            return;
+        }
+        let language = self.language;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let thread_cancellation = Arc::clone(&cancellation);
+        let (sender, receiver) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("winsched-settings-diagnostic".to_owned())
+            .spawn(move || {
+                let result = diagnostics::run_cancellable(
+                    DiagnosticOptions::default(),
+                    &thread_cancellation,
+                )
+                .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            }) {
+            Ok(_) => {
+                self.diagnostic_error = None;
+                self.pending_diagnostic = Some(PendingDiagnostic {
+                    receiver,
+                    cancellation,
+                    started: Instant::now(),
+                    cancelling: false,
+                });
+                self.set_banner(
+                    BannerKind::Information,
+                    language.text(
+                        "Passive responsiveness diagnostic started.",
+                        "Пассивная диагностика отзывчивости запущена.",
+                    ),
+                );
+            }
+            Err(error) => {
+                self.diagnostic_error = Some(error.to_string());
+                self.set_banner(
+                    BannerKind::Error,
+                    format!(
+                        "{}: {error}",
+                        language.text(
+                            "Could not start diagnostic worker",
+                            "Не удалось запустить поток диагностики"
+                        )
+                    ),
+                );
+            }
+        }
+    }
+
+    fn cancel_diagnostic(&mut self) {
+        if let Some(pending) = self.pending_diagnostic.as_mut() {
+            pending.cancelling = true;
+            pending.cancellation.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn poll_diagnostic(&mut self, context: &egui::Context) {
+        let Some(pending) = self.pending_diagnostic.as_ref() else {
+            return;
+        };
+        match pending.receiver.try_recv() {
+            Ok(Ok(report)) => {
+                self.pending_diagnostic = None;
+                self.diagnostic_report = Some(report);
+                self.diagnostic_error = None;
+                self.set_banner(
+                    BannerKind::Success,
+                    self.language.text(
+                        "Passive diagnostic completed.",
+                        "Пассивная диагностика завершена.",
+                    ),
+                );
+            }
+            Ok(Err(error)) => {
+                let cancelled = error == "diagnostic cancelled";
+                self.pending_diagnostic = None;
+                if cancelled {
+                    self.set_banner(
+                        BannerKind::Information,
+                        self.language
+                            .text("Diagnostic cancelled.", "Диагностика отменена."),
+                    );
+                } else {
+                    self.diagnostic_error = Some(error.clone());
+                    self.set_banner(
+                        BannerKind::Error,
+                        format!(
+                            "{}: {error}",
+                            self.language
+                                .text("Diagnostic failed", "Ошибка диагностики")
+                        ),
+                    );
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                context.request_repaint_after(Duration::from_millis(100));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending_diagnostic = None;
+                let error = self.language.text(
+                    "Diagnostic worker exited without a result.",
+                    "Поток диагностики завершился без результата.",
+                );
+                self.diagnostic_error = Some(error.to_owned());
+                self.set_banner(BannerKind::Error, error);
+            }
+        }
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
         ui.horizontal_wrapped(|ui| {
@@ -536,7 +667,7 @@ impl SettingsApp {
             });
         });
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(
                 &mut self.tab,
                 SettingsTab::General,
@@ -561,6 +692,11 @@ impl SettingsApp {
                 &mut self.tab,
                 SettingsTab::Logging,
                 language.text("Logging", "Журнал"),
+            );
+            ui.selectable_value(
+                &mut self.tab,
+                SettingsTab::Diagnostics,
+                language.text("Diagnostics", "Диагностика"),
             );
         });
         ui.separator();
@@ -847,6 +983,142 @@ impl SettingsApp {
             "Critical startup failures may still be written to the separate winsched-emergency.log file.",
             "Критические ошибки запуска могут по-прежнему записываться в отдельный файл winsched-emergency.log.",
         ));
+    }
+
+    fn diagnostics_tab(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.heading(language.text("Passive diagnostics", "Пассивная диагностика"));
+        ui.label(language.text(
+            "Measures scheduler, CPU, memory, taskbar, Explorer, WSL, and VMware signals for 10 seconds. It never clicks, moves the pointer, changes focus, edits .wslconfig, or changes CPU Sets.",
+            "В течение 10 секунд измеряет планировщик, CPU, память, панель задач, Explorer, WSL и VMware. Диагностика не нажимает кнопки, не двигает указатель, не меняет фокус, не редактирует .wslconfig и не изменяет CPU Sets.",
+        ));
+        ui.add_space(8.0);
+
+        if let Some(pending) = &self.pending_diagnostic {
+            let elapsed = pending.started.elapsed().as_secs_f32();
+            ui.label(if pending.cancelling {
+                language.text("Cancelling...", "Отмена...").to_owned()
+            } else {
+                match language {
+                    Language::English => format!("Collecting passive samples... {elapsed:.1} s"),
+                    Language::Russian => format!("Сбор пассивных измерений... {elapsed:.1} с"),
+                }
+            });
+            if ui
+                .add_enabled(
+                    !pending.cancelling,
+                    egui::Button::new(language.text("Cancel", "Отменить")),
+                )
+                .on_hover_text(language.text(
+                    "Stops after the current bounded sample.",
+                    "Останавливает диагностику после текущего ограниченного измерения.",
+                ))
+                .clicked()
+            {
+                self.cancel_diagnostic();
+            }
+        } else if ui
+            .button(language.text(
+                "Run passive 10-second diagnostic",
+                "Запустить пассивную диагностику на 10 секунд",
+            ))
+            .on_hover_text(language.text(
+                "Runs in a background worker so the Settings window remains responsive.",
+                "Выполняется в фоновом потоке, поэтому окно настроек остаётся отзывчивым.",
+            ))
+            .clicked()
+        {
+            self.start_diagnostic();
+        }
+
+        if let Some(error) = &self.diagnostic_error {
+            ui.colored_label(Color32::from_rgb(210, 70, 70), error);
+        }
+        let Some(report) = self.diagnostic_report.clone() else {
+            return;
+        };
+        ui.add_space(12.0);
+        diagnostic_metrics(ui, &report, language);
+        ui.add_space(10.0);
+        ui.heading(language.text("Findings", "Выводы"));
+        for finding in &report.findings {
+            let (summary, recommendation) = diagnostic_finding_text(finding.code, language);
+            let color = match finding.severity {
+                DiagnosticSeverity::Information => Color32::from_rgb(90, 150, 210),
+                DiagnosticSeverity::Warning => Color32::from_rgb(220, 160, 55),
+                DiagnosticSeverity::Critical => Color32::from_rgb(220, 70, 70),
+            };
+            ui.group(|ui| {
+                ui.colored_label(color, format!("{:?}", finding.code));
+                ui.label(summary);
+                ui.label(recommendation);
+            });
+        }
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            let json = serde_json::to_string_pretty(&report).unwrap_or_default();
+            if ui
+                .button(language.text("Copy JSON", "Копировать JSON"))
+                .on_hover_text(language.text(
+                    "Copies the privacy-safe report without window titles or user paths.",
+                    "Копирует безопасный отчёт без заголовков окон и пользовательских путей.",
+                ))
+                .clicked()
+            {
+                ui.ctx().copy_text(json.clone());
+            }
+            if ui
+                .button(language.text("Save JSON to Downloads", "Сохранить JSON в Загрузки"))
+                .on_hover_text(language.text(
+                    "Writes one report only after this explicit action.",
+                    "Записывает один отчёт только после этого явного действия.",
+                ))
+                .clicked()
+            {
+                self.save_diagnostic_report(&json, report.captured_at_unix_ms);
+            }
+        });
+    }
+
+    fn save_diagnostic_report(&mut self, json: &str, captured_at_unix_ms: u64) {
+        let language = self.language;
+        let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) else {
+            self.set_banner(
+                BannerKind::Error,
+                language.text(
+                    "Cannot find the user profile for report output.",
+                    "Не удалось определить профиль пользователя для сохранения отчёта.",
+                ),
+            );
+            return;
+        };
+        let downloads = profile.join("Downloads");
+        let directory = if downloads.is_dir() {
+            downloads
+        } else {
+            profile
+        };
+        let path = directory.join(format!("WinSched-diagnostic-{captured_at_unix_ms}.json"));
+        match fs::write(&path, format!("{json}\n")) {
+            Ok(()) => self.set_banner(
+                BannerKind::Success,
+                format!(
+                    "{} {}",
+                    language.text("Diagnostic report saved to", "Отчёт диагностики сохранён в"),
+                    path.display()
+                ),
+            ),
+            Err(error) => self.set_banner(
+                BannerKind::Error,
+                format!(
+                    "{}: {error}",
+                    language.text(
+                        "Could not save diagnostic report",
+                        "Не удалось сохранить отчёт диагностики"
+                    )
+                ),
+            ),
+        }
     }
 
     fn responsiveness_tab(&mut self, ui: &mut egui::Ui) {
@@ -1425,6 +1697,7 @@ impl eframe::App for SettingsApp {
             self.confirmation = Confirmation::Close;
         }
         self.poll_reload(context);
+        self.poll_diagnostic(context);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1444,6 +1717,7 @@ impl eframe::App for SettingsApp {
                         SettingsTab::Responsiveness => self.responsiveness_tab(ui),
                         SettingsTab::Rules => self.rules_tab(ui),
                         SettingsTab::Logging => self.logging_tab(ui),
+                        SettingsTab::Diagnostics => self.diagnostics_tab(ui),
                     });
             });
         });
@@ -1710,6 +1984,207 @@ fn strict_domain_rows(ui: &mut egui::Ui, rule: &mut ProcessRule, language: Langu
 fn read_status(path: &Path) -> Option<ControllerStatus> {
     let contents = fs::read(path).ok()?;
     serde_json::from_slice(&contents).ok()
+}
+
+fn diagnostic_metrics(ui: &mut egui::Ui, report: &DiagnosticReport, language: Language) {
+    ui.heading(language.text("Measurements", "Измерения"));
+    let system = report.system;
+    let shell = report.shell;
+    let taskbar = shell.taskbar;
+    egui::Grid::new("diagnostic-measurements")
+        .num_columns(2)
+        .spacing([18.0, 8.0])
+        .show(ui, |ui| {
+            ui.label(language.text("Average CPU utilization", "Средняя загрузка CPU"));
+            ui.label(format!(
+                "{}.{:02}%",
+                system.average_cpu_utilization_bps / 100,
+                system.average_cpu_utilization_bps % 100
+            ));
+            ui.end_row();
+            ui.label(language.text("Maximum processor queue", "Максимальная очередь CPU"));
+            ui.label(system.maximum_processor_queue_length.to_string());
+            ui.end_row();
+            ui.label(language.text("Scheduler wake p99", "Пробуждение планировщика p99"));
+            ui.label(format!("{} us", system.scheduler_latency.p99_lateness_us));
+            ui.end_row();
+            ui.label(language.text("Maximum DPC / interrupt", "Максимум DPC / прерываний"));
+            ui.label(format!(
+                "{}.{:02}% / {}.{:02}%",
+                system.maximum_dpc_time_bps / 100,
+                system.maximum_dpc_time_bps % 100,
+                system.maximum_interrupt_time_bps / 100,
+                system.maximum_interrupt_time_bps % 100
+            ));
+            ui.end_row();
+            ui.label(language.text("Minimum available memory", "Минимум доступной памяти"));
+            ui.label(format!(
+                "{} GiB / {} GiB",
+                format_gib(system.minimum_available_memory_bytes),
+                format_gib(system.total_physical_memory_bytes)
+            ));
+            ui.end_row();
+            ui.label(language.text("Taskbar response p50 / p95", "Ответ taskbar p50 / p95"));
+            ui.label(format!(
+                "{} / {} us; {} timeouts",
+                taskbar.p50_response_us, taskbar.p95_response_us, taskbar.timeout_samples
+            ));
+            ui.end_row();
+            ui.label(language.text("Explorer processes / windows", "Процессы / окна Explorer"));
+            ui.label(format!(
+                "{} / {} ({} threads)",
+                shell.explorer_processes, shell.explorer_windows, shell.explorer_threads
+            ));
+            ui.end_row();
+            ui.label(language.text("Separate Explorer processes", "Отдельные процессы Explorer"));
+            ui.label(match shell.launch_folders_in_separate_process {
+                Some(true) => language.text("enabled", "включены"),
+                Some(false) => language.text("disabled", "выключены"),
+                None => language.text("unknown", "неизвестно"),
+            });
+            ui.end_row();
+            ui.label(language.text("WSL / VMware VM processes", "Процессы WSL / VMware VM"));
+            ui.label(format!(
+                "{} / {}",
+                report.virtualization.wsl_processes, report.virtualization.vmware_vm_processes
+            ));
+            ui.end_row();
+            ui.label(language.text(".wslconfig", ".wslconfig"));
+            ui.label(if report.virtualization.wsl_config.present {
+                language.text("present (read-only analysis)", "найден (только чтение)")
+            } else {
+                language.text(
+                    "not present; WSL defaults apply",
+                    "не найден; действуют настройки WSL по умолчанию",
+                )
+            });
+            ui.end_row();
+            let advice = report.virtualization.wsl_advice;
+            if advice.resource_pressure_observed {
+                ui.label(language.text("WSL advisory", "Рекомендация WSL"));
+                let memory = advice
+                    .recommended_memory_bytes
+                    .map(format_gib)
+                    .map_or_else(|| "-".to_owned(), |value| format!("{value} GiB"));
+                let processors = advice
+                    .recommended_processors
+                    .map_or_else(|| "-".to_owned(), |value| value.to_string());
+                ui.label(match language {
+                    Language::English => format!(
+                        "Review only; memory {memory}, processors {processors}. No automatic changes."
+                    ),
+                    Language::Russian => format!(
+                        "Только для проверки: память {memory}, процессоры {processors}. Автоматических изменений нет."
+                    ),
+                });
+                ui.end_row();
+            }
+        });
+}
+
+fn format_gib(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let whole = bytes / GIB;
+    let tenth = bytes % GIB * 10 / GIB;
+    format!("{whole}.{tenth}")
+}
+
+const fn diagnostic_finding_text(
+    code: DiagnosticFindingCode,
+    language: Language,
+) -> (&'static str, &'static str) {
+    match code {
+        DiagnosticFindingCode::Healthy => (
+            language.text(
+                "No supported responsiveness pressure signal was detected.",
+                "Поддерживаемые признаки давления на отзывчивость не обнаружены.",
+            ),
+            language.text(
+                "Repeat the diagnostic while the symptom is occurring if delays persist.",
+                "Если задержки сохраняются, повторите диагностику непосредственно во время проблемы.",
+            ),
+        ),
+        DiagnosticFindingCode::CpuSaturation => (
+            language.text(
+                "CPU capacity or runnable-queue pressure is elevated.",
+                "Повышена загрузка CPU или очередь готовых потоков.",
+            ),
+            language.text(
+                "Reduce or contain compute-heavy workloads before changing shell placement.",
+                "Сначала ограничьте вычислительные нагрузки, не меняя размещение оболочки.",
+            ),
+        ),
+        DiagnosticFindingCode::SchedulerLatency => (
+            language.text(
+                "Normal-priority scheduler wake latency is elevated.",
+                "Повышена задержка пробуждения потоков обычного приоритета.",
+            ),
+            language.text(
+                "Inspect sustained CPU, virtualization, DPC, and interrupt pressure.",
+                "Проверьте устойчивую нагрузку CPU, виртуализацию, DPC и прерывания.",
+            ),
+        ),
+        DiagnosticFindingCode::DpcOrInterruptPressure => (
+            language.text(
+                "DPC or interrupt processing is elevated.",
+                "Повышена нагрузка DPC или аппаратных прерываний.",
+            ),
+            language.text(
+                "Investigate drivers and devices before applying CPU Set changes.",
+                "Проверьте драйверы и устройства до изменения CPU Sets.",
+            ),
+        ),
+        DiagnosticFindingCode::MemoryPressure => (
+            language.text(
+                "Available physical memory is low.",
+                "Доступной физической памяти осталось мало.",
+            ),
+            language.text(
+                "Reduce memory pressure and inspect hard-fault activity.",
+                "Уменьшите давление на память и проверьте hard faults.",
+            ),
+        ),
+        DiagnosticFindingCode::ShellLatencyWithSpareCpu => (
+            language.text(
+                "The taskbar is slow while CPU capacity remains available.",
+                "Панель задач отвечает медленно при наличии свободного CPU.",
+            ),
+            language.text(
+                "Inspect Explorer integrations and GUI clients; more reserved cores are unlikely to help.",
+                "Проверьте интеграции Explorer и GUI-клиенты; дополнительный резерв ядер вряд ли поможет.",
+            ),
+        ),
+        DiagnosticFindingCode::ExplorerFanout => (
+            language.text(
+                "Many Explorer processes or folder windows are active.",
+                "Активно много процессов Explorer или окон папок.",
+            ),
+            language.text(
+                "Treat this only as context; test fewer windows or shell extensions without changing SeparateProcess automatically.",
+                "Считайте это только контекстом: проверьте меньше окон или расширений, не меняя SeparateProcess автоматически.",
+            ),
+        ),
+        DiagnosticFindingCode::WslResourcePressure => (
+            language.text(
+                "WSL is active while the host is under measurable resource pressure.",
+                "WSL активен при измеримом давлении ресурсов на хосте.",
+            ),
+            language.text(
+                "Review .wslconfig limits; never apply process CPU Sets to vmmemWSL.",
+                "Проверьте ограничения .wslconfig; никогда не применяйте CPU Sets процесса к vmmemWSL.",
+            ),
+        ),
+        DiagnosticFindingCode::ServiceStatusUnavailable => (
+            language.text(
+                "WinSched service status is unavailable.",
+                "Статус службы WinSched недоступен.",
+            ),
+            language.text(
+                "Start or update the service to include live policy context.",
+                "Запустите или обновите службу для получения данных действующей политики.",
+            ),
+        ),
+    }
 }
 
 fn confirmation_frame(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) {

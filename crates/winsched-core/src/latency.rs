@@ -1,6 +1,12 @@
 //! Bounded scheduler wake-latency telemetry.
 
 use std::collections::VecDeque;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +29,91 @@ pub struct SchedulerLatencyWindow {
     capacity: usize,
     total_samples: u64,
     samples: VecDeque<u64>,
+}
+
+/// Background normal-priority wake-latency probe shared by the service and diagnostics.
+pub struct SchedulerLatencyProbe {
+    enabled: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    samples: Arc<Mutex<SchedulerLatencyWindow>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SchedulerLatencyProbe {
+    /// Starts one bounded sampler thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system error when the sampler thread cannot be created.
+    pub fn start(
+        enabled: bool,
+        interval: Duration,
+        window_samples: usize,
+    ) -> Result<Self, std::io::Error> {
+        let interval = interval.max(Duration::from_millis(1));
+        let enabled_flag = Arc::new(AtomicBool::new(enabled));
+        let stop = Arc::new(AtomicBool::new(false));
+        let samples = Arc::new(Mutex::new(SchedulerLatencyWindow::new(window_samples)));
+        let thread_enabled = Arc::clone(&enabled_flag);
+        let thread_stop = Arc::clone(&stop);
+        let thread_samples = Arc::clone(&samples);
+        let thread = std::thread::Builder::new()
+            .name("winsched-latency-probe".to_owned())
+            .spawn(move || {
+                let mut deadline = Instant::now() + interval;
+                while !thread_stop.load(Ordering::Relaxed) {
+                    let now = Instant::now();
+                    if now < deadline {
+                        std::thread::sleep(deadline - now);
+                    }
+                    let woke = Instant::now();
+                    if thread_enabled.load(Ordering::Relaxed) {
+                        let lateness = woke.saturating_duration_since(deadline);
+                        let lateness_us = u64::try_from(lateness.as_micros()).unwrap_or(u64::MAX);
+                        if let Ok(mut window) = thread_samples.lock() {
+                            window.record(lateness_us);
+                        }
+                    }
+                    deadline += interval;
+                    if woke > deadline + interval {
+                        deadline = woke + interval;
+                    }
+                }
+            })?;
+        Ok(Self {
+            enabled: enabled_flag,
+            stop,
+            samples,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        let previous = self.enabled.swap(enabled, Ordering::Relaxed);
+        if previous != enabled
+            && let Ok(mut window) = self.samples.lock()
+        {
+            window.clear();
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> SchedulerLatencyStatus {
+        let enabled = self.enabled.load(Ordering::Relaxed);
+        self.samples.lock().map_or_else(
+            |_| SchedulerLatencyStatus::default(),
+            |window| window.status(enabled),
+        )
+    }
+}
+
+impl Drop for SchedulerLatencyProbe {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl SchedulerLatencyWindow {

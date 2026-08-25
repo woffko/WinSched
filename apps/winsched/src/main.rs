@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use thiserror::Error;
+use winsched::diagnostics::{self, DiagnosticOptions};
 use winsched::platform;
 use winsched_core::{
     AssignmentPlan, DomainSelector, LlcDomainKey, Topology,
@@ -27,6 +28,24 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run a bounded, passive responsiveness diagnostic in the current user session.
+    Diagnose {
+        /// Total collection duration in seconds.
+        #[arg(long, default_value = "10")]
+        duration_seconds: NonZeroU16,
+        /// Milliseconds between passive samples.
+        #[arg(long, default_value = "250")]
+        interval_ms: NonZeroU64,
+        /// Maximum time for one side-effect-free taskbar `WM_NULL` response.
+        #[arg(long, default_value = "50")]
+        taskbar_timeout_ms: NonZeroU64,
+        /// Emit stable, privacy-safe JSON.
+        #[arg(long)]
+        json: bool,
+        /// Also save the JSON report to this exact path.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Print the Windows CPU Set and LLC topology.
     Topology {
         /// Emit machine-readable JSON.
@@ -150,6 +169,8 @@ enum Command {
 #[derive(Debug, Error)]
 enum AppError {
     #[error(transparent)]
+    Diagnostic(#[from] diagnostics::DiagnosticError),
+    #[error(transparent)]
     Platform(#[from] platform::PlatformError),
     #[error(transparent)]
     Policy(#[from] winsched_core::PolicyError),
@@ -177,8 +198,22 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
+        Command::Diagnose {
+            duration_seconds,
+            interval_ms,
+            taskbar_timeout_ms,
+            json,
+            output,
+        } => run_diagnose(
+            duration_seconds,
+            interval_ms,
+            taskbar_timeout_ms,
+            json,
+            output.as_ref(),
+        )?,
         Command::Topology { json } => print_topology(&platform::system_topology()?, json)?,
         Command::Observe {
             samples,
@@ -274,6 +309,54 @@ fn run(cli: Cli) -> Result<(), AppError> {
                 print_plan(&plan);
             }
         }
+    }
+    Ok(())
+}
+
+fn run_diagnose(
+    duration_seconds: NonZeroU16,
+    interval_ms: NonZeroU64,
+    taskbar_timeout_ms: NonZeroU64,
+    json: bool,
+    output: Option<&PathBuf>,
+) -> Result<(), AppError> {
+    let report = diagnostics::run(DiagnosticOptions {
+        duration: Duration::from_secs(u64::from(duration_seconds.get())),
+        interval: Duration::from_millis(interval_ms.get()),
+        taskbar_timeout: Duration::from_millis(taskbar_timeout_ms.get()),
+    })?;
+    let serialized = serde_json::to_string_pretty(&report)?;
+    if let Some(path) = output {
+        fs::write(path, format!("{serialized}\n"))?;
+    }
+    if json {
+        println!("{serialized}");
+        return Ok(());
+    }
+    println!(
+        "WinSched diagnostic: {} samples in {} ms",
+        report.sample_count, report.duration_ms
+    );
+    println!(
+        "CPU average {:.2}%, queue max {}, scheduler p99 {} us",
+        f64::from(report.system.average_cpu_utilization_bps) / 100.0,
+        report.system.maximum_processor_queue_length,
+        report.system.scheduler_latency.p99_lateness_us,
+    );
+    println!(
+        "Taskbar p95 {} us, timeouts {}/{}; Explorer processes {}, windows {}",
+        report.shell.taskbar.p95_response_us,
+        report.shell.taskbar.timeout_samples,
+        report.shell.taskbar.samples,
+        report.shell.explorer_processes,
+        report.shell.explorer_windows,
+    );
+    for finding in report.findings {
+        println!("- {:?}: {}", finding.code, finding.summary);
+        println!("  {}", finding.recommendation);
+    }
+    if let Some(path) = output {
+        println!("JSON report saved to {}", path.display());
     }
     Ok(())
 }
@@ -604,6 +687,34 @@ mod tests {
         assert!(matches!(
             parse_selector("llc0"),
             Err(AppError::InvalidSelector(_))
+        ));
+    }
+
+    #[test]
+    fn parses_bounded_passive_diagnostic_options() {
+        let cli = Cli::try_parse_from([
+            "winsched",
+            "diagnose",
+            "--duration-seconds",
+            "3",
+            "--interval-ms",
+            "250",
+            "--taskbar-timeout-ms",
+            "50",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Diagnose {
+                duration_seconds,
+                interval_ms,
+                taskbar_timeout_ms,
+                json: true,
+                output: None,
+            } if duration_seconds.get() == 3
+                && interval_ms.get() == 250
+                && taskbar_timeout_ms.get() == 50
         ));
     }
 }

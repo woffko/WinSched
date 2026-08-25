@@ -34,7 +34,8 @@ function Get-PayloadHashes([string]$Directory) {
         "winsched.exe",
         "winsched-service.exe",
         "winsched-tray.exe",
-        "winsched-settings.exe"
+        "winsched-settings.exe",
+        "README.md"
     )) {
         $path = Join-Path $Directory $name
         Assert-True (Test-Path -LiteralPath $path -PathType Leaf) "payload binary is missing: $name"

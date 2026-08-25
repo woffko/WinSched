@@ -20,8 +20,9 @@ User-Mode Scheduling is not used because it is not supported on Windows 11.
   last error.
 - `winsched-settings.exe` is the administrative graphical settings editor. It
   validates every field before atomically replacing the configuration and then
-  reports whether the running service accepted the reload.
-- `winsched.exe` is the inspection and manual-control CLI.
+  reports whether the running service accepted the reload. Its Diagnostics page
+  runs a bounded passive responsiveness probe in a background worker.
+- `winsched.exe` is the inspection, passive-diagnostics, and manual-control CLI.
 
 The tray menu contains:
 
@@ -39,7 +40,8 @@ and GitHub URL. `GitHub Repository` opens
 
 Important Settings labels and controls provide contextual hover help in both
 English and Russian, including units and the consequences of policy,
-responsiveness, workload-profile, strict-placement, and logging choices.
+responsiveness, workload-profile, strict-placement, logging, and diagnostic
+choices.
 
 Interactive users receive only the service rights required to query, start,
 stop, and send the two WinSched control codes. Administrators retain full
@@ -72,7 +74,10 @@ sample interval. Fixed safety exclusions also protect system, protected,
 real-time, parked, and foreign-allocated resources, plus Windows shell and
 service-host executables such as Explorer, Runtime Broker, and svchost. Exact
 process rules bypass only the activity threshold, never the fixed safety
-exclusions. The extracted ZIP remains available for advanced or scripted
+exclusions. New CPU Set assignments are also denied at the Windows mutation
+boundary for shell/system targets and the WSL VM hosts `vmmem`, `vmmemWSL`,
+`wslhost.exe`, and `wslservice.exe`; clearing an existing assignment remains
+allowed. The extracted ZIP remains available for advanced or scripted
 deployment. Run `Install WinSched.cmd` from that directory. To install a custom
 configuration with the ZIP package, run the elevated PowerShell installer:
 
@@ -107,7 +112,8 @@ data is stored under `C:\ProgramData\WinSched`:
 - `winsched.log` and optional `winsched.log.1` ... `.10` archives — bounded
   circular JSONL controller logs
 - `winsched-emergency.log` — independent critical startup and logging failures
-- `status.json` — atomic tray heartbeat/status snapshot
+- `status.json` — atomic tray heartbeat/status snapshot, published immediately
+  for control/reload/error transitions and otherwise at a 10-second heartbeat
 - `runtime-state.json` — persisted tray enable/disable choice
 - `managed-state.json` — PID-and-creation-time ownership journal
 
@@ -131,7 +137,10 @@ limit. Critical startup or logging failures can still be recorded separately
 in `winsched-emergency.log`. Existing schema-1 configurations remain accepted
 and immediately use the default logging policy (`true`, 10 MiB, one archive)
 in memory. Their first save through Settings writes the current schema without
-losing existing values.
+losing existing values. Steady `responsiveness_sample` telemetry is coalesced
+to one periodic summary per 60 seconds. Initial state, stable pressure
+transitions, memory-profile width changes, errors, and controller decisions
+remain immediate.
 
 The `[responsiveness]` section reserves whole physical cores for Windows by
 removing their CPU Sets only from WinSched-managed application assignments.
@@ -174,12 +183,50 @@ See `config/winsched.example.toml` for a narrow observe-only example and
 
 Open `Settings...` from the tray or `WinSched Settings` from the Start Menu to
 edit General, Adaptive policy, Responsiveness, Process rules, and Logging
-pages. The editor
+pages, or run the read-only Diagnostics page. The editor
 supports English and Russian, validates all policy/rule/logging invariants,
 uses a two-step confirmation before restoring defaults, and never writes a
 partially updated TOML file. UAC is required because the configuration controls
 a LocalSystem service. `Open Configuration (Advanced)` remains available for
 inspection and manual expert editing.
+
+## Passive diagnostics
+
+`winsched diagnose` measures the current user session without generating input,
+changing focus, editing configuration, restarting WSL, or changing CPU Sets.
+It samples CPU/LLC utility, processor queue length, DPC/interrupt pressure,
+pages input, available memory, normal-priority wake latency, Explorer process
+and window counts, active WSL/VMware processes, and the running WinSched status.
+The taskbar probe sends only bounded `WM_NULL` messages to `Shell_TrayWnd` from
+the interactive caller, with `SMTO_ABORTIFHUNG` and a 50 ms timeout. It never
+runs from the LocalSystem service in Session 0.
+
+Stable finding codes distinguish CPU saturation, scheduler latency,
+DPC/interrupt pressure, memory pressure, Explorer fan-out, and taskbar latency
+while CPU capacity remains available. The latter explicitly explains that more
+reserved cores are unlikely to fix a shell-path stall. Explorer fan-out is
+reported only as context; WinSched never changes the Windows
+`SeparateProcess` setting.
+
+The JSON schema excludes window titles, user names, executable paths, and raw
+`.wslconfig` contents. Only recognized WSL resource values are reported. WSL
+advice appears only when WSL is active together with measured host CPU or memory
+pressure. It is a read-only suggestion: WinSched never edits `.wslconfig`,
+runs `wsl --shutdown`, or assigns CPU Sets to `vmmemWSL`. Microsoft documents
+the global WSL 2 settings and restart semantics at
+<https://learn.microsoft.com/windows/wsl/wsl-config>.
+
+Examples:
+
+```text
+winsched diagnose
+winsched diagnose --duration-seconds 10 --json
+winsched diagnose --json --output C:\Temp\winsched-diagnostic.json
+```
+
+The Settings Diagnostics page runs the same engine on a background thread,
+supports cancellation, displays localized findings, copies JSON, and writes a
+report to Downloads only after an explicit button press.
 
 ## CLI
 
@@ -187,6 +234,7 @@ Useful read-only commands:
 
 ```text
 winsched topology
+winsched diagnose --json
 winsched responsiveness-plan C:\Path\To\winsched.toml
 winsched observe --samples 5
 winsched processes
@@ -258,16 +306,18 @@ machine; a WSL cross-build alone is not release evidence.
 ## Testing and evidence
 
 WinSched uses separate source, Windows VM, and physical Threadripper gates.
-The current 0.3.1 summary is:
+The current 0.4.0 summary is:
 
 | Gate | Result |
 |---|---:|
-| Rust workspace tests | 86 PASS |
+| Rust workspace tests | 100 PASS |
 | Native and Windows-target Clippy | PASS |
 | RustSec audit | PASS, 383 dependencies |
-| Windows PowerShell parser | PASS, 22 scripts |
-| Setup upgrade and byte-identical config preservation | PASS |
-| About version/GitHub and Settings tooltip UI Automation | PASS |
+| Passive CLI and Diagnostics UI | PASS on physical host and Windows VM |
+| Status/log cadence | PASS, 10-second heartbeat and 60-second summary |
+| Byte-identical reload receipt | PASS, 128 ms on Windows VM |
+| Existing Settings regression | PASS |
+| Setup 0.3.1 to 0.4.0 and GUI wizard | PASS |
 | Threadripper topology/apply/rollback | PASS |
 | Threadripper p99 / throughput gate | 83.27% lower p99; 15.10% higher throughput |
 

@@ -296,6 +296,7 @@ try {
             service = (Get-FileHash "C:\Program Files\WinSched\winsched-service.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
             tray = (Get-FileHash "C:\Program Files\WinSched\winsched-tray.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
             settings = (Get-FileHash $settingsPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            readme = (Get-FileHash "C:\Program Files\WinSched\README.md" -Algorithm SHA256).Hash.ToLowerInvariant()
         }
         screenshots = @(
             "installer-welcome.png",

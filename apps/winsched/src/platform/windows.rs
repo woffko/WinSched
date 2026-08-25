@@ -18,9 +18,10 @@ use windows::Win32::System::Performance::{
 };
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::SystemInformation::{
-    CpuSetInformation, GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
-    SYSTEM_CPU_SET_INFORMATION_ALLOCATED, SYSTEM_CPU_SET_INFORMATION_ALLOCATED_TO_TARGET_PROCESS,
-    SYSTEM_CPU_SET_INFORMATION_PARKED, SYSTEM_CPU_SET_INFORMATION_REALTIME,
+    CpuSetInformation, GetSystemCpuSetInformation, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+    SYSTEM_CPU_SET_INFORMATION, SYSTEM_CPU_SET_INFORMATION_ALLOCATED,
+    SYSTEM_CPU_SET_INFORMATION_ALLOCATED_TO_TARGET_PROCESS, SYSTEM_CPU_SET_INFORMATION_PARKED,
+    SYSTEM_CPU_SET_INFORMATION_REALTIME,
 };
 use windows::Win32::System::Threading::{
     CREATE_SUSPENDED, CreateProcessW, GetPriorityClass, GetProcessDefaultCpuSets,
@@ -36,7 +37,9 @@ use winsched_core::{
     adaptive::{DomainLoad, ExclusionReason, ProcessKey},
 };
 
-use super::{LaunchReport, MutationReport, ObservedProcess, ProcessSnapshot};
+use super::{
+    LaunchReport, MutationReport, ObservedProcess, ProcessSnapshot, SystemPressureSample, safety,
+};
 
 const RESUME_THREAD_FAILED: u32 = u32::MAX;
 
@@ -72,6 +75,10 @@ pub enum PlatformError {
         expected: u64,
         observed: u64,
     },
+    #[error("CPU Set assignment is denied for protected target PID {pid} ({image})")]
+    ProtectedMutationTarget { pid: u32, image: String },
+    #[error("CPU Set assignment is denied because PID {0} could not be identified")]
+    UnidentifiedMutationTarget(u32),
     #[error("{operation} failed with PDH status 0x{status:08X}")]
     PdhStatus {
         operation: &'static str,
@@ -136,6 +143,56 @@ struct PdhCounter {
 pub struct LoadSampler {
     query: OwnedPdhQuery,
     counters: Vec<ProcessorCounter>,
+}
+
+#[derive(Debug)]
+pub struct SystemPressureSampler {
+    query: OwnedPdhQuery,
+    processor_queue: PdhCounter,
+    pages_input: PdhCounter,
+}
+
+impl SystemPressureSampler {
+    pub fn new() -> Result<Self, PlatformError> {
+        let mut query = PDH_HQUERY::default();
+        // SAFETY: The output pointer is valid and the null source selects live data.
+        let status = unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &raw mut query) };
+        check_pdh("PdhOpenQueryW(system pressure)", status)?;
+        let query = OwnedPdhQuery(query);
+        let processor_queue =
+            add_pdh_counter(query.0, r"\System\Processor Queue Length".to_owned())?;
+        let pages_input = add_pdh_counter(query.0, r"\Memory\Pages Input/sec".to_owned())?;
+        Ok(Self {
+            query,
+            processor_queue,
+            pages_input,
+        })
+    }
+
+    pub fn prime(&mut self) -> Result<(), PlatformError> {
+        // SAFETY: The query is valid for the lifetime of self.
+        let status = unsafe { PdhCollectQueryData(self.query.0) };
+        check_pdh("PdhCollectQueryData(system pressure initial)", status)
+    }
+
+    pub fn sample(&mut self) -> Result<SystemPressureSample, PlatformError> {
+        // SAFETY: The query is valid for the lifetime of self.
+        let status = unsafe { PdhCollectQueryData(self.query.0) };
+        check_pdh("PdhCollectQueryData(system pressure sample)", status)?;
+        let mut memory = MEMORYSTATUSEX {
+            dwLength: u32::try_from(size_of::<MEMORYSTATUSEX>())
+                .expect("MEMORYSTATUSEX size fits u32"),
+            ..Default::default()
+        };
+        // SAFETY: memory has the documented length and is a valid writable output structure.
+        unsafe { GlobalMemoryStatusEx(&raw mut memory)? };
+        Ok(SystemPressureSample {
+            processor_queue_length: rounded_u32(read_pdh_double(&self.processor_queue)?),
+            pages_input_per_second: rounded_u64(read_pdh_double(&self.pages_input)?),
+            total_physical_memory_bytes: memory.ullTotalPhys,
+            available_physical_memory_bytes: memory.ullAvailPhys,
+        })
+    }
 }
 
 impl LoadSampler {
@@ -232,6 +289,10 @@ fn add_pdh_counter(query: PDH_HQUERY, path: String) -> Result<PdhCounter, Platfo
 }
 
 fn read_pdh_counter(counter: &PdhCounter) -> Result<u16, PlatformError> {
+    Ok(utility_to_basis_points(read_pdh_double(counter)?))
+}
+
+fn read_pdh_double(counter: &PdhCounter) -> Result<f64, PlatformError> {
     let mut value = PDH_FMT_COUNTERVALUE::default();
     // SAFETY: The counter belongs to a live query and value is writable.
     let status = unsafe {
@@ -249,7 +310,21 @@ fn read_pdh_counter(counter: &PdhCounter) -> Result<u16, PlatformError> {
     if !measured.is_finite() {
         return Err(PlatformError::PdhNonFinite(counter.path.clone()));
     }
-    Ok(utility_to_basis_points(measured))
+    Ok(measured)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn rounded_u32(value: f64) -> u32 {
+    value.clamp(0.0, f64::from(u32::MAX)).round() as u32
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn rounded_u64(value: f64) -> u64 {
+    value.clamp(0.0, u64::MAX as f64).round() as u64
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -314,7 +389,7 @@ fn observe_process_entry(topology: &Topology, entry: &PROCESSENTRY32W) -> Observ
     let pid = entry.th32ProcessID;
     let image_name = fixed_wide_string(&entry.szExeFile);
     let session_id = process_session_id(pid);
-    let initial_exclusion = if is_system_process(pid, &image_name) {
+    let initial_exclusion = if safety::is_fixed_system_process(pid, &image_name) {
         Some(ExclusionReason::SystemProcess)
     } else if session_id == Some(0) {
         Some(ExclusionReason::SessionZero)
@@ -476,40 +551,6 @@ fn fixed_wide_string(value: &[u16]) -> String {
     OsString::from_wide(&value[..length])
         .to_string_lossy()
         .into_owned()
-}
-
-fn is_system_process(pid: u32, image_name: &str) -> bool {
-    const SYSTEM_IMAGES: &[&str] = &[
-        "audiodg.exe",
-        "conhost.exe",
-        "csrss.exe",
-        "ctfmon.exe",
-        "dwm.exe",
-        "explorer.exe",
-        "fontdrvhost.exe",
-        "idle",
-        "lsass.exe",
-        "registry",
-        "runtimebroker.exe",
-        "searchhost.exe",
-        "services.exe",
-        "shellexperiencehost.exe",
-        "sihost.exe",
-        "smss.exe",
-        "startmenuexperiencehost.exe",
-        "svchost.exe",
-        "system",
-        "taskhostw.exe",
-        "textinputhost.exe",
-        "wininit.exe",
-        "winlogon.exe",
-        "winsched-service.exe",
-        "winsched-tray.exe",
-    ];
-    pid <= 4
-        || SYSTEM_IMAGES
-            .iter()
-            .any(|system| image_name.eq_ignore_ascii_case(system))
 }
 
 pub fn apply_process(pid: u32, cpu_set_ids: &[u32]) -> Result<MutationReport, PlatformError> {
@@ -752,6 +793,9 @@ fn replace_default_cpu_sets(
     process: HANDLE,
     requested: &[u32],
 ) -> Result<MutationReport, PlatformError> {
+    if !requested.is_empty() {
+        ensure_assignment_target_is_safe(pid, process)?;
+    }
     let previous = get_process_default_cpu_sets(process)?;
     let requested = sorted(requested);
     set_process_default_cpu_sets(process, &requested)?;
@@ -782,6 +826,21 @@ fn replace_default_cpu_sets(
         requested_cpu_set_ids: requested,
         observed_cpu_set_ids: observed,
     })
+}
+
+fn ensure_assignment_target_is_safe(pid: u32, process: HANDLE) -> Result<(), PlatformError> {
+    let image = process_image_path(process)
+        .and_then(|path| {
+            Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .ok_or(PlatformError::UnidentifiedMutationTarget(pid))?;
+    if safety::is_fixed_system_process(pid, &image) {
+        Err(PlatformError::ProtectedMutationTarget { pid, image })
+    } else {
+        Ok(())
+    }
 }
 
 fn set_process_default_cpu_sets(process: HANDLE, cpu_set_ids: &[u32]) -> Result<(), PlatformError> {
@@ -867,20 +926,5 @@ mod tests {
             quote_windows_argument(OsStr::new(r"C:\path with space\")),
             r#""C:\path with space\\""#
         );
-    }
-
-    #[test]
-    fn fixed_exclusions_cover_windows_shell_and_service_hosts() {
-        for image in [
-            "svchost.exe",
-            "Explorer.EXE",
-            "RuntimeBroker.exe",
-            "SearchHost.exe",
-            "StartMenuExperienceHost.exe",
-            "winsched-tray.exe",
-        ] {
-            assert!(is_system_process(1_000, image), "{image} must be excluded");
-        }
-        assert!(!is_system_process(1_000, "game.exe"));
     }
 }

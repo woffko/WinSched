@@ -13,6 +13,8 @@ use winsched_core::{
     },
 };
 
+#[cfg(any(windows, test))]
+mod safety;
 #[cfg(windows)]
 mod windows;
 
@@ -115,6 +117,58 @@ impl ObservedProcess {
 pub struct LoadSampler {
     #[cfg(windows)]
     inner: windows::LoadSampler,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct SystemPressureSample {
+    pub processor_queue_length: u32,
+    pub pages_input_per_second: u64,
+    pub total_physical_memory_bytes: u64,
+    pub available_physical_memory_bytes: u64,
+}
+
+pub struct SystemPressureSampler {
+    #[cfg(windows)]
+    inner: windows::SystemPressureSampler,
+}
+
+impl SystemPressureSampler {
+    pub fn new() -> Result<Self, PlatformError> {
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                inner: windows::SystemPressureSampler::new()?,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+    }
+
+    #[cfg_attr(not(windows), allow(clippy::unused_self))]
+    pub fn prime(&mut self) -> Result<(), PlatformError> {
+        #[cfg(windows)]
+        {
+            self.inner.prime().map_err(Into::into)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+    }
+
+    #[cfg_attr(not(windows), allow(clippy::unused_self))]
+    pub fn sample(&mut self) -> Result<SystemPressureSample, PlatformError> {
+        #[cfg(windows)]
+        {
+            self.inner.sample().map_err(Into::into)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(PlatformError::UnsupportedPlatform)
+        }
+    }
 }
 
 impl LoadSampler {

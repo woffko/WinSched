@@ -7,7 +7,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$InteractiveUser,
     [string]$InstallDirectory = "$env:ProgramData\WinSched",
-    [string]$DataDirectory = $InstallDirectory
+    [string]$DataDirectory = $InstallDirectory,
+    [string]$ExpectedVersion = "0.3.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,7 +25,8 @@ $arguments = @(
     "-File", "`"$AcceptanceScript`"",
     "-InstallDirectory", "`"$InstallDirectory`"",
     "-DataDirectory", "`"$DataDirectory`"",
-    "-OutputDirectory", "`"$OutputDirectory`""
+    "-OutputDirectory", "`"$OutputDirectory`"",
+    "-ExpectedVersion", "`"$ExpectedVersion`""
 ) -join " "
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
 $principal = New-ScheduledTaskPrincipal `

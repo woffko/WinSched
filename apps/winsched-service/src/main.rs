@@ -1,5 +1,9 @@
 #[cfg(any(windows, test))]
 mod event_logger;
+#[cfg(any(windows, test))]
+mod responsiveness_log;
+#[cfg(any(windows, test))]
+mod status_publisher;
 
 #[cfg(not(windows))]
 fn main() {
@@ -21,6 +25,8 @@ fn main() -> std::process::ExitCode {
 #[cfg(windows)]
 mod app {
     use crate::event_logger::EventSink;
+    use crate::responsiveness_log::{ResponsivenessLogGate, ResponsivenessSignature};
+    use crate::status_publisher::StatusPublishGate;
     use std::cmp::Reverse;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::{OsStr, OsString};
@@ -29,9 +35,7 @@ mod app {
     use std::num::NonZeroU16;
     use std::path::{Path, PathBuf};
     use std::process::Command as ProcessCommand;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock, mpsc};
-    use std::thread::JoinHandle;
+    use std::sync::{OnceLock, mpsc};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use clap::{Parser, Subcommand};
@@ -61,7 +65,7 @@ mod app {
         AssignmentOrigin, DecisionReason, PlacementMode, PolicyAction, PolicyDecision,
         PolicyEngine, ProcessKey,
     };
-    use winsched_core::latency::{SchedulerLatencyStatus, SchedulerLatencyWindow};
+    use winsched_core::latency::SchedulerLatencyProbe;
     use winsched_core::responsiveness::{
         AdaptiveWidthConfig, AdaptiveWidthController, WidthAdjustment,
     };
@@ -137,82 +141,6 @@ mod app {
         Enable,
         Disable,
         Tick,
-    }
-
-    struct LatencyProbe {
-        enabled: Arc<AtomicBool>,
-        stop: Arc<AtomicBool>,
-        samples: Arc<Mutex<SchedulerLatencyWindow>>,
-        thread: Option<JoinHandle<()>>,
-    }
-
-    impl LatencyProbe {
-        fn start(enabled: bool) -> Result<Self, std::io::Error> {
-            let enabled_flag = Arc::new(AtomicBool::new(enabled));
-            let stop = Arc::new(AtomicBool::new(false));
-            let samples = Arc::new(Mutex::new(SchedulerLatencyWindow::new(
-                LATENCY_PROBE_WINDOW_SAMPLES,
-            )));
-            let thread_enabled = Arc::clone(&enabled_flag);
-            let thread_stop = Arc::clone(&stop);
-            let thread_samples = Arc::clone(&samples);
-            let thread = std::thread::Builder::new()
-                .name("winsched-latency-probe".to_owned())
-                .spawn(move || {
-                    let mut deadline = Instant::now() + LATENCY_PROBE_INTERVAL;
-                    while !thread_stop.load(Ordering::Relaxed) {
-                        let now = Instant::now();
-                        if now < deadline {
-                            std::thread::sleep(deadline - now);
-                        }
-                        let woke = Instant::now();
-                        if thread_enabled.load(Ordering::Relaxed) {
-                            let lateness = woke.saturating_duration_since(deadline);
-                            let lateness_us =
-                                u64::try_from(lateness.as_micros()).unwrap_or(u64::MAX);
-                            if let Ok(mut window) = thread_samples.lock() {
-                                window.record(lateness_us);
-                            }
-                        }
-                        deadline += LATENCY_PROBE_INTERVAL;
-                        if woke > deadline + LATENCY_PROBE_INTERVAL {
-                            deadline = woke + LATENCY_PROBE_INTERVAL;
-                        }
-                    }
-                })?;
-            Ok(Self {
-                enabled: enabled_flag,
-                stop,
-                samples,
-                thread: Some(thread),
-            })
-        }
-
-        fn set_enabled(&self, enabled: bool) {
-            let previous = self.enabled.swap(enabled, Ordering::Relaxed);
-            if previous != enabled
-                && let Ok(mut window) = self.samples.lock()
-            {
-                window.clear();
-            }
-        }
-
-        fn status(&self) -> SchedulerLatencyStatus {
-            let enabled = self.enabled.load(Ordering::Relaxed);
-            self.samples.lock().map_or_else(
-                |_| SchedulerLatencyStatus::default(),
-                |window| window.status(enabled),
-            )
-        }
-    }
-
-    impl Drop for LatencyProbe {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
-        }
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -500,8 +428,10 @@ mod app {
         let mut placement_topology = topology.excluding_reserved_cpu_sets(&reserve_plan);
         let mut sampler = platform::LoadSampler::new(&topology)?;
         let mut engine = PolicyEngine::new(config.policy)?;
-        let latency_probe = LatencyProbe::start(
+        let latency_probe = SchedulerLatencyProbe::start(
             config.responsiveness.enabled && config.responsiveness.latency_guard_enabled,
+            LATENCY_PROBE_INTERVAL,
+            LATENCY_PROBE_WINDOW_SAMPLES,
         )?;
         let mut width_controller =
             AdaptiveWidthController::new(adaptive_width_config(&config, &placement_topology));
@@ -515,6 +445,8 @@ mod app {
         let mut previous_cpu_times = BTreeMap::<ProcessKey, u64>::new();
         let started = Instant::now();
         let mut iteration = 0u64;
+        let mut status_publish_gate = StatusPublishGate::default();
+        let mut responsiveness_log_gate = ResponsivenessLogGate::default();
         // Re-read once on the first tick. This closes the narrow startup race where Settings
         // can replace the file after the service loaded it but before its first metadata read.
         let mut config_modified = files.config.map(|_| SystemTime::UNIX_EPOCH);
@@ -539,7 +471,7 @@ mod app {
             status.last_error = cleanup_error(cleanup);
         }
         status.managed_processes = managed.len();
-        persist_controller_status(files.status, &mut status)?;
+        publish_controller_status(&mut status_publish_gate, files.status, &mut status, 0, true)?;
         sampler.prime()?;
         logger.emit(json!({
             "event": "controller_started",
@@ -554,11 +486,19 @@ mod app {
 
         let loop_result: Result<(), ServiceError> = loop {
             let interval = Duration::from_millis(config.sample_interval_ms);
-            match wait_for_command(control, interval) {
+            let command = wait_for_command(control, interval);
+            let evaluation_time_ms = controller_elapsed_ms(started);
+            match command {
                 ControllerCommand::Stop => {
                     status.phase = ControllerPhase::Stopping;
                     status.scheduler_latency = latency_probe.status();
-                    persist_controller_status(files.status, &mut status)?;
+                    publish_controller_status(
+                        &mut status_publish_gate,
+                        files.status,
+                        &mut status,
+                        evaluation_time_ms,
+                        true,
+                    )?;
                     break Ok(());
                 }
                 ControllerCommand::Enable => {
@@ -576,7 +516,13 @@ mod app {
                     status.last_activity = Some("Scheduling enabled from tray or CLI".to_owned());
                     status.last_error = None;
                     status.scheduler_latency = latency_probe.status();
-                    persist_controller_status(files.status, &mut status)?;
+                    publish_controller_status(
+                        &mut status_publish_gate,
+                        files.status,
+                        &mut status,
+                        evaluation_time_ms,
+                        true,
+                    )?;
                     continue;
                 }
                 ControllerCommand::Disable => {
@@ -603,7 +549,13 @@ mod app {
                     });
                     status.last_error = cleanup_error(cleanup);
                     status.scheduler_latency = latency_probe.status();
-                    persist_controller_status(files.status, &mut status)?;
+                    publish_controller_status(
+                        &mut status_publish_gate,
+                        files.status,
+                        &mut status,
+                        evaluation_time_ms,
+                        true,
+                    )?;
                     continue;
                 }
                 ControllerCommand::Tick => {}
@@ -631,17 +583,31 @@ mod app {
             if let Some(event) = apply_reload_status(&mut status, &config, &reserve_plan, reload) {
                 // This status receipt is authoritative for Settings and must reach disk before
                 // any optional event-log write or rotation can fail.
-                persist_controller_status(files.status, &mut status)?;
+                publish_controller_status(
+                    &mut status_publish_gate,
+                    files.status,
+                    &mut status,
+                    evaluation_time_ms,
+                    true,
+                )?;
                 logger.emit(event);
             }
             if !controller_evaluation_active(&config, &runtime) {
+                let prior_error = status.last_error.clone();
                 let cleanup = cleanup_managed(logger, &mut managed, files.managed_state)?;
                 status.phase = ControllerPhase::Disabled;
                 status.managed_processes = managed.len();
                 status.last_error = cleanup_error(cleanup);
                 iteration = iteration.saturating_add(1);
                 status.iteration = iteration;
-                persist_controller_status(files.status, &mut status)?;
+                let important_status_change = status.last_error != prior_error;
+                publish_controller_status(
+                    &mut status_publish_gate,
+                    files.status,
+                    &mut status,
+                    evaluation_time_ms,
+                    important_status_change,
+                )?;
                 if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
                     break Ok(());
                 }
@@ -665,13 +631,20 @@ mod app {
                     }
                     iteration = iteration.saturating_add(1);
                     status.iteration = iteration;
-                    persist_controller_status(files.status, &mut status)?;
+                    publish_controller_status(
+                        &mut status_publish_gate,
+                        files.status,
+                        &mut status,
+                        evaluation_time_ms,
+                        true,
+                    )?;
                     if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
                         break Ok(());
                     }
                     continue;
                 }
             };
+            let status_error_before_evaluation = status.last_error.clone();
             if status
                 .last_error
                 .as_deref()
@@ -689,14 +662,13 @@ mod app {
                 .map(|load| load.interrupt_time_bps)
                 .max()
                 .unwrap_or(0);
-            let evaluation_time_ms =
-                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            if let Some(adjustment) = width_controller.evaluate(
+            let adjustment = width_controller.evaluate(
                 evaluation_time_ms,
                 status.scheduler_latency,
                 status.maximum_dpc_time_bps,
                 status.maximum_interrupt_time_bps,
-            ) {
+            );
+            if let Some(adjustment) = adjustment {
                 let detail = width_adjustment_summary(adjustment);
                 status.last_responsiveness_adjustment = Some(detail.clone());
                 logger.emit(json!({
@@ -710,15 +682,26 @@ mod app {
             }
             status.memory_profile_physical_cores = width_controller.current_physical_cores();
             status.responsiveness_pressure = width_controller.pressure();
-            logger.emit(json!({
-                "event": "responsiveness_sample",
-                "scheduler_latency": status.scheduler_latency,
-                "maximum_dpc_time_bps": status.maximum_dpc_time_bps,
-                "maximum_interrupt_time_bps": status.maximum_interrupt_time_bps,
-                "memory_profile_physical_cores": status.memory_profile_physical_cores,
-                "pressure": status.responsiveness_pressure,
-                "domain_loads": loads,
-            }));
+            let responsiveness_signature = ResponsivenessSignature {
+                pressure: status.responsiveness_pressure,
+                memory_profile_physical_cores: status.memory_profile_physical_cores,
+            };
+            if let Some(reason) = responsiveness_log_gate.decide(
+                evaluation_time_ms,
+                responsiveness_signature,
+                adjustment.is_some(),
+            ) {
+                logger.emit(json!({
+                    "event": "responsiveness_sample",
+                    "reason": reason.as_str(),
+                    "scheduler_latency": status.scheduler_latency,
+                    "maximum_dpc_time_bps": status.maximum_dpc_time_bps,
+                    "maximum_interrupt_time_bps": status.maximum_interrupt_time_bps,
+                    "memory_profile_physical_cores": status.memory_profile_physical_cores,
+                    "pressure": status.responsiveness_pressure,
+                    "domain_loads": loads,
+                }));
+            }
             let processes = match platform::observe_processes(&topology) {
                 Ok(processes) => processes,
                 Err(error) => break Err(error.into()),
@@ -773,7 +756,15 @@ mod app {
             status.managed_processes = managed.len();
             status.phase = ControllerPhase::Running;
             status.scheduler_latency = latency_probe.status();
-            persist_controller_status(files.status, &mut status)?;
+            let important_status_change =
+                adjustment.is_some() || status.last_error != status_error_before_evaluation;
+            publish_controller_status(
+                &mut status_publish_gate,
+                files.status,
+                &mut status,
+                evaluation_time_ms,
+                important_status_change,
+            )?;
             if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
                 break Ok(());
             }
@@ -801,7 +792,13 @@ mod app {
         } else if let Err(error) = &cleanup_result {
             status.last_error = Some(error.to_string());
         }
-        let status_result = persist_controller_status(files.status, &mut status);
+        let status_result = publish_controller_status(
+            &mut status_publish_gate,
+            files.status,
+            &mut status,
+            controller_elapsed_ms(started),
+            true,
+        );
         logger.emit(json!({
             "event": "controller_stopped",
             "success": loop_result.is_ok(),
@@ -1582,6 +1579,25 @@ mod app {
         status.updated_at_unix_ms = unix_time_ms();
         atomic_write(path, &serde_json::to_vec_pretty(status)?)?;
         Ok(())
+    }
+
+    fn publish_controller_status(
+        gate: &mut StatusPublishGate,
+        path: Option<&Path>,
+        status: &mut ControllerStatus,
+        monotonic_ms: u64,
+        force: bool,
+    ) -> Result<(), ServiceError> {
+        if !gate.should_publish(monotonic_ms, force) {
+            return Ok(());
+        }
+        persist_controller_status(path, status)?;
+        gate.mark_published(monotonic_ms);
+        Ok(())
+    }
+
+    fn controller_elapsed_ms(started: Instant) -> u64 {
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     fn install(config_path: &Path, start_now: bool, allow_auto: bool) -> Result<(), ServiceError> {

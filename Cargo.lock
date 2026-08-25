@@ -3553,7 +3553,7 @@ dependencies = [
 
 [[package]]
 name = "winsched"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "clap",
  "serde",
@@ -3561,12 +3561,13 @@ dependencies = [
  "thiserror 2.0.20",
  "windows",
  "winsched-config",
+ "winsched-control",
  "winsched-core",
 ]
 
 [[package]]
 name = "winsched-config"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3576,7 +3577,7 @@ dependencies = [
 
 [[package]]
 name = "winsched-control"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "serde",
  "winsched-config",
@@ -3585,7 +3586,7 @@ dependencies = [
 
 [[package]]
 name = "winsched-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3593,7 +3594,7 @@ dependencies = [
 
 [[package]]
 name = "winsched-service"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "clap",
  "serde",
@@ -3609,7 +3610,7 @@ dependencies = [
 
 [[package]]
 name = "winsched-settings"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "atomic-write-file",
  "eframe",
@@ -3617,6 +3618,7 @@ dependencies = [
  "thiserror 2.0.20",
  "toml",
  "winresource",
+ "winsched",
  "winsched-config",
  "winsched-control",
  "winsched-core",
@@ -3624,7 +3626,7 @@ dependencies = [
 
 [[package]]
 name = "winsched-tray"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "image",
  "serde_json",
@@ -3709,7 +3711,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "ico",
  "image",
