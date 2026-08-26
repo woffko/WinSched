@@ -2,7 +2,9 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDirectory,
-    [string]$InstallDirectory = "$env:ProgramFiles\WinSched"
+    [string]$InstallDirectory = "$env:ProgramFiles\WinSched",
+    [string]$DataDirectory = "$env:ProgramData\WinSched",
+    [string]$ResultFileName = "settings-tooltips-result.json"
 )
 
 $ErrorActionPreference = "Stop"
@@ -161,7 +163,7 @@ function Assert-Tooltip(
 }
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-$resultPath = Join-Path $OutputDirectory "settings-tooltips-result.json"
+$resultPath = Join-Path $OutputDirectory $ResultFileName
 $settingsPath = Join-Path $InstallDirectory "winsched-settings.exe"
 $process = $null
 $window = $null
@@ -194,7 +196,7 @@ try {
     Assert-Tooltip `
         $window `
         "Default workload profile" `
-        "Interactive stays on one LLC, Memory spreads one thread per physical core by default, Compute uses both SMT siblings, and Background/Balanced retain LLC-aware adaptive behavior." `
+        "Interactive stays on one LLC, Memory spreads one thread per physical core by default, Compute uses both SMT siblings, and Background can opt an exact rule into reversible EcoQoS/memory handling. Balanced retains standard LLC-aware adaptive behavior." `
         (Join-Path $OutputDirectory "tooltip-workload-profile.png")
 
     Invoke-Element (Wait-Element $window "Responsiveness" $true)
@@ -203,6 +205,13 @@ try {
         "Enable topology-aware system reserve" `
         "Excludes complete physical-core CPU Sets from managed application plans while leaving Windows and protected system processes unrestricted." `
         (Join-Path $OutputDirectory "tooltip-responsiveness.png")
+
+    Invoke-Element (Wait-Element $window "Background" $true)
+    Assert-Tooltip `
+        $window `
+        "Enable background efficiency" `
+        "Enables journaled process-level EcoQoS and memory-priority handling for explicitly marked background processes. Both mutations are off by default: native acceptance confirmed that a parent's memory priority propagates to children created later, and parent rollback does not restore those live children. Enable a property only for a known leaf workload." `
+        (Join-Path $OutputDirectory "tooltip-background.png")
 
     Invoke-Element (Wait-Element $window "Logging" $true)
     Assert-Tooltip `
@@ -223,9 +232,10 @@ try {
             "Sample interval (milliseconds)",
             "Default workload profile",
             "Enable topology-aware system reserve",
+            "Enable background efficiency",
             "Enable detailed service logging"
         )
-        pages = @("General", "Responsiveness", "Logging")
+        pages = @("General", "Responsiveness", "Background", "Logging")
         configuration_changed = $false
     } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $resultPath -Encoding UTF8
 } catch {

@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$InstallDirectory = "$env:ProgramData\WinSched",
-    [string]$DataDirectory = "$env:ProgramData\WinSched"
+    [string]$InstallDirectory = (Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "WinSched"),
+    [string]$DataDirectory = (Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "WinSched")
 )
 
 $ErrorActionPreference = "Stop"
@@ -170,7 +170,7 @@ function Wait-AppliedLogging(
     Wait-Condition $Description {
         $status = Read-Status
         $null -ne $status -and
-            [int]$status.schema_version -eq 3 -and
+            [int]$status.schema_version -eq 4 -and
             [uint64]$status.config_reload_sequence -gt $AfterSequence -and
             $status.config_reload_result -eq "reloaded" -and
             [bool]$status.applied_logging.enabled -eq $Enabled -and
@@ -339,7 +339,7 @@ function Wait-InitialStatus(
         $null -ne $status -and
             $null -ne $service -and
             $service.State -eq "Running" -and
-            [int]$status.schema_version -eq 3 -and
+            [int]$status.schema_version -eq 4 -and
             [int]$status.service_pid -eq [int]$service.ProcessId -and
             @("initial", "reloaded") -contains [string]$status.config_reload_result -and
             [bool]$status.applied_logging.enabled -eq $Enabled -and
@@ -490,7 +490,7 @@ try {
 
     $result = [ordered]@{
         result = "PASS"
-        status_schema = 3
+        status_schema = 4
         disabled_absent_file = $true
         disabled_hot_reload_byte_stable = $true
         disabled_restart_byte_stable = $true

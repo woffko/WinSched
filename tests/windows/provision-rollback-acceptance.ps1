@@ -61,7 +61,6 @@ function Assert-SnapshotEqual($Before, $After) {
 
 $serviceExe = Join-Path $InstallDirectory "winsched-service.exe"
 $configPath = Join-Path $DataDirectory "winsched.toml"
-$fakeSc = Join-Path $InstallDirectory "sc.exe"
 $stdoutPath = Join-Path $env:TEMP "winsched-provision-rollback-stdout.txt"
 $stderrPath = Join-Path $env:TEMP "winsched-provision-rollback-stderr.txt"
 $result = $null
@@ -76,14 +75,17 @@ try {
     $serviceHashBefore = (Get-FileHash -LiteralPath $serviceExe -Algorithm SHA256).Hash.ToLowerInvariant()
     $configHashBefore = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
-    Assert-True (-not (Test-Path -LiteralPath $fakeSc)) `
-        "fault-injection target already exists in the install directory"
-    Copy-Item -LiteralPath "$env:SystemRoot\System32\where.exe" -Destination $fakeSc -Force
     try {
         Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
         $process = Start-Process `
             -FilePath $serviceExe `
-            -ArgumentList @("provision", "--config", $configPath, "--allow-auto", "--start") `
+            -ArgumentList @(
+                "provision",
+                "--config", $configPath,
+                "--allow-auto",
+                "--start",
+                "--test-fail-after-change"
+            ) `
             -RedirectStandardOutput $stdoutPath `
             -RedirectStandardError $stderrPath `
             -Wait `
@@ -95,14 +97,13 @@ try {
         ) -join "`n"
         $commandOutput = $commandOutput.Trim()
     } finally {
-        Remove-Item -LiteralPath $fakeSc -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
     }
 
     Assert-True ($provisionExitCode -ne 0) `
         "fault-injected provisioning unexpectedly succeeded"
-    Assert-True ($commandOutput -match "sc\.exe|cannot find|not found|Command") `
-        "provisioning failure did not report the injected sc.exe resolution fault"
+    Assert-True ($commandOutput -match "injected provisioning failure") `
+        "provisioning failure did not report the explicit post-change fault"
 
     Wait-ServiceState "Running"
     $after = Get-ServiceSnapshot

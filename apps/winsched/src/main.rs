@@ -245,11 +245,32 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::ResponsivenessPlan { path, json } => run_responsiveness_plan(&path, json)?,
         Command::Inspect { pid, json } => {
             let snapshot = platform::inspect_process(pid)?;
+            let efficiency = platform::inspect_process_efficiency(pid);
             if json {
-                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                let mut value = serde_json::to_value(&snapshot)?;
+                let object = value
+                    .as_object_mut()
+                    .expect("serialized ProcessSnapshot is a JSON object");
+                object.insert(
+                    "efficiency".to_owned(),
+                    serde_json::to_value(efficiency.as_ref().ok())?,
+                );
+                object.insert(
+                    "efficiency_error".to_owned(),
+                    serde_json::to_value(efficiency.as_ref().err().map(ToString::to_string))?,
+                );
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!("PID: {}", snapshot.pid);
                 println!("Default CPU Sets: {:?}", snapshot.default_cpu_set_ids);
+                match efficiency {
+                    Ok(efficiency) => {
+                        println!("Process key: {:?}", efficiency.key);
+                        println!("EcoQoS: {:?}", efficiency.state.eco_qos);
+                        println!("Memory priority: {:?}", efficiency.state.memory_priority);
+                    }
+                    Err(error) => println!("Efficiency state: unavailable ({error})"),
+                }
                 print_topology(&snapshot.topology, false)?;
             }
         }

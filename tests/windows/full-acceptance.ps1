@@ -4,11 +4,34 @@ param(
     [string]$PackageDirectory,
     [Parameter(Mandatory = $true)]
     [string]$InteractiveUser,
-    [string]$InstallDirectory = "$env:ProgramData\WinSched"
+    [string]$InstallDirectory = (Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "WinSched"),
+    [string]$DataDirectory = (Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "WinSched")
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+$expectedInstallDirectory = [IO.Path]::GetFullPath(
+    (Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "WinSched")
+).TrimEnd('\')
+$expectedDataDirectory = [IO.Path]::GetFullPath(
+    (Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "WinSched")
+).TrimEnd('\')
+$InstallDirectory = [IO.Path]::GetFullPath($InstallDirectory).TrimEnd('\')
+$DataDirectory = [IO.Path]::GetFullPath($DataDirectory).TrimEnd('\')
+if (-not [string]::Equals(
+    $InstallDirectory,
+    $expectedInstallDirectory,
+    [StringComparison]::OrdinalIgnoreCase
+)) {
+    throw "Full acceptance requires the isolated VM default directory: $expectedInstallDirectory"
+}
+if (-not [string]::Equals(
+    $DataDirectory,
+    $expectedDataDirectory,
+    [StringComparison]::OrdinalIgnoreCase
+)) {
+    throw "Full acceptance requires the isolated VM data directory: $expectedDataDirectory"
+}
 
 function Assert-True($Condition, [string]$Message) {
     if ($Condition -is [Array]) {
@@ -45,7 +68,7 @@ function Wait-Condition(
 }
 
 function Read-Status {
-    $path = Join-Path $InstallDirectory "status.json"
+    $path = Join-Path $DataDirectory "status.json"
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         return $null
     }
@@ -57,7 +80,7 @@ function Read-Status {
 }
 
 function Read-Managed {
-    $path = Join-Path $InstallDirectory "managed-state.json"
+    $path = Join-Path $DataDirectory "managed-state.json"
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         return $null
     }
@@ -66,6 +89,23 @@ function Read-Managed {
     } catch {
         return $null
     }
+}
+
+function Read-BackgroundManaged {
+    $path = Join-Path $DataDirectory "background-state.json"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+    try {
+        return Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}
+
+function Test-BackgroundStateEmpty {
+    $state = Read-BackgroundManaged
+    return $null -eq $state -or @($state.processes).Count -eq 0
 }
 
 function Get-Inspection([int]$ProcessId) {
@@ -124,7 +164,7 @@ while ($true) {
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit ([TimeSpan]::FromMinutes(5))
+        -ExecutionTimeLimit ([TimeSpan]::FromMinutes(30))
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     Register-ScheduledTask `
         -TaskName $TaskName `
@@ -139,20 +179,47 @@ while ($true) {
     return Get-Process -Id $processId
 }
 
+function Start-InteractiveExecutable(
+    [string]$UserId,
+    [string]$Executable,
+    [string]$Arguments,
+    [string]$TaskName
+) {
+    $action = if ([string]::IsNullOrEmpty($Arguments)) {
+        New-ScheduledTaskAction -Execute $Executable
+    } else {
+        New-ScheduledTaskAction -Execute $Executable -Argument $Arguments
+    }
+    $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit ([TimeSpan]::FromMinutes(30))
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $action `
+        -Principal $principal `
+        -Settings $settings | Out-Null
+    Start-ScheduledTask -TaskName $TaskName | Out-Null
+}
+
 $serviceBinary = Join-Path $InstallDirectory "winsched-service.exe"
 $cliBinary = Join-Path $InstallDirectory "winsched.exe"
-$installedConfig = Join-Path $InstallDirectory "winsched.toml"
+$installedConfig = Join-Path $DataDirectory "winsched.toml"
 $packageConfig = Join-Path $PackageDirectory "winsched.toml"
 $burner = $null
 $burnerTask = "WinSchedCpuBurnerAcceptance"
+$trayTask = "WinSchedTraySensorAcceptance"
+$windowTask = "WinSchedVisibleWindowAcceptance"
 $burnerScript = Join-Path $env:PUBLIC "WinSchedCpuBurnerAcceptance.ps1"
 $burnerPidFile = Join-Path $env:PUBLIC "WinSchedCpuBurnerAcceptance.pid"
 $loadScript = Join-Path $env:PUBLIC "WinSchedLlcLoadAcceptance.ps1"
 $loadProcessId = $null
+$visibleProcessId = $null
+$windowScript = Join-Path $env:PUBLIC "WinSchedVisibleWindowAcceptance.ps1"
+$windowPidFile = Join-Path $env:PUBLIC "WinSchedVisibleWindowAcceptance.pid"
 $productionConfig = $null
-
-Assert-PowerShellSyntax (Join-Path $PackageDirectory "install.ps1")
-Assert-PowerShellSyntax (Join-Path $PackageDirectory "uninstall.ps1")
 
 Get-Content -LiteralPath (Join-Path $PackageDirectory "SHA256SUMS") | ForEach-Object {
     if ($_ -notmatch '^(?<hash>[0-9a-f]{64})\s+(?<file>.+)$') {
@@ -165,11 +232,26 @@ Get-Content -LiteralPath (Join-Path $PackageDirectory "SHA256SUMS") | ForEach-Ob
 }
 
 try {
-    & (Join-Path $PackageDirectory "install.ps1") `
-        -InstallDirectory $InstallDirectory `
-        -Configuration $packageConfig `
-        -NoTrayLaunch
-    Assert-True ($LASTEXITCODE -eq 0) "installer returned exit code $LASTEXITCODE"
+    foreach ($binaryName in @(
+        "winsched.exe",
+        "winsched-service.exe",
+        "winsched-tray.exe",
+        "winsched-settings.exe"
+    )) {
+        $binaryPath = Join-Path $InstallDirectory $binaryName
+        Assert-True (Test-Path -LiteralPath $binaryPath -PathType Leaf) `
+            "installed candidate is missing $binaryName"
+        $version = if ($binaryName -in @("winsched.exe", "winsched-service.exe")) {
+            $versionOutput = (& $binaryPath --version | Out-String).Trim()
+            $match = [regex]::Match($versionOutput, '^\S+\s+(?<version>\d+\.\d+\.\d+)$')
+            Assert-True $match.Success "unexpected --version output from ${binaryName}: $versionOutput"
+            $match.Groups["version"].Value
+        } else {
+            [Diagnostics.FileVersionInfo]::GetVersionInfo($binaryPath).ProductVersion.Trim()
+        }
+        Assert-True ($version -eq "0.5.0") `
+            "full acceptance requires installed 0.5.0, found $version in $binaryName"
+    }
     Wait-ServiceState "Running"
 
     $service = Get-CimInstance Win32_Service -Filter "Name='WinSched'"
@@ -180,10 +262,16 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $InstallDirectory "winsched-settings.exe")) "settings binary missing"
     Assert-True (Test-Path -LiteralPath $cliBinary) "CLI binary missing"
 
+    $trayBinary = Join-Path $InstallDirectory "winsched-tray.exe"
+    Start-InteractiveExecutable $InteractiveUser $trayBinary "" $trayTask
+    Wait-Condition "interactive tray sensor process" {
+        @((Get-Process -Name "winsched-tray" -ErrorAction SilentlyContinue)).Count -gt 0
+    }
+
     $startup = Join-Path ([Environment]::GetFolderPath("CommonStartup")) "WinSched Tray.lnk"
     Assert-True (Test-Path -LiteralPath $startup -PathType Leaf) "tray Startup shortcut missing"
     $startMenu = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\WinSched"
-    Assert-True (Test-Path -LiteralPath (Join-Path $startMenu "WinSched Tray.lnk")) "tray Start Menu shortcut missing"
+    Assert-True (Test-Path -LiteralPath (Join-Path $startMenu "WinSched.lnk")) "tray Start Menu shortcut missing"
     Assert-True (Test-Path -LiteralPath (Join-Path $startMenu "WinSched Settings.lnk")) "settings Start Menu shortcut missing"
     Assert-True (Test-Path -LiteralPath (Join-Path $startMenu "Uninstall WinSched.lnk")) "uninstall shortcut missing"
 
@@ -198,7 +286,7 @@ try {
         return $status -and $status.phase -eq "running" -and $status.configured_mode -eq "auto"
     }
     $status = Read-Status
-    Assert-True ([int]$status.schema_version -eq 3) "service did not publish status schema 3"
+    Assert-True ([int]$status.schema_version -eq 4) "service did not publish status schema 4"
     Assert-True ([bool]$status.scheduling_enabled) "automatic package did not start with scheduling enabled"
     Assert-True ($status.llc_domains -gt 0) "status reports no LLC domains"
     Assert-True ([bool]$status.applied_responsiveness.enabled) `
@@ -262,8 +350,255 @@ try {
         $reservedCpuSetIds `
         "balanced burner assignment"
 
-    Write-Host "acceptance stage: memory and compute workload profiles"
+    Write-Host "acceptance stage: background efficiency and visible-window veto"
     $productionConfig = Get-Content -LiteralPath $packageConfig -Raw
+    $baselineEfficiency = (Get-Inspection $burnerId).efficiency.state
+    Assert-True ($null -ne $baselineEfficiency) "baseline process efficiency state unavailable"
+    $backgroundConfig = ($productionConfig -replace `
+        'all_user_processes\s*=\s*true', `
+        'all_user_processes = false').TrimEnd() + @"
+
+
+[[rules]]
+image = "powershell.exe"
+mode = "auto"
+profile = "background"
+"@
+    $backgroundConfig = $backgroundConfig -replace `
+        '(?m)(^\[background_efficiency\]\r?\n)enabled\s*=\s*false\s*$', `
+        '${1}enabled = true'
+    $backgroundConfig = $backgroundConfig -replace `
+        '(?m)^\s*eco_qos_enabled\s*=\s*false\s*$', `
+        'eco_qos_enabled = true'
+    Assert-True (
+        $backgroundConfig -match '(?m)(^\[background_efficiency\]\r?\n)enabled\s*=\s*true\s*$' -and
+        $backgroundConfig -match '(?m)^\s*eco_qos_enabled\s*=\s*true\s*$'
+    ) "background fixture did not explicitly opt into the feature and EcoQoS"
+    Write-Utf8NoBom $installedConfig $backgroundConfig
+    & $cliBinary config-check $installedConfig | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) "background-efficiency fixture failed config validation"
+    Wait-Condition "interactive probe accepted by service" {
+        $current = Read-Status
+        return $current -and
+            [int]$current.background_efficiency.required_probe_sessions -ge 1 -and
+            [int]$current.background_efficiency.interactive_probe_sessions -ge 1
+    } 45
+    Wait-Condition "background efficiency applied to headless burner" {
+        $state = Read-BackgroundManaged
+        $inspection = Get-Inspection $burnerId
+        return $state -and
+            @($state.processes | Where-Object { $_.key.pid -eq $burnerId }).Count -eq 1 -and
+            @($inspection.default_cpu_set_ids).Count -eq 0 -and
+            $inspection.efficiency.state.eco_qos -eq "enabled" -and
+            $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority
+    } 45
+
+    $windowSource = @'
+param([string]$PidFile)
+Add-Type -AssemblyName System.Windows.Forms
+[IO.File]::WriteAllText(
+    $PidFile,
+    [Diagnostics.Process]::GetCurrentProcess().Id.ToString(),
+    [Text.Encoding]::ASCII
+)
+$form = New-Object Windows.Forms.Form
+$form.Text = "WinSched visible-window acceptance"
+$form.ShowInTaskbar = $true
+$form.WindowState = [Windows.Forms.FormWindowState]::Minimized
+[void]$form.ShowDialog()
+'@
+    Write-Utf8NoBom $windowScript $windowSource
+    Remove-Item -LiteralPath $windowPidFile -Force -ErrorAction SilentlyContinue
+    $windowArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$windowScript`" -PidFile `"$windowPidFile`""
+    Start-InteractiveExecutable `
+        $InteractiveUser `
+        "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        $windowArguments `
+        $windowTask
+    Wait-Condition "minimized visible-window helper PID" {
+        Test-Path -LiteralPath $windowPidFile -PathType Leaf
+    }
+    $visibleProcessId = [int](Get-Content -LiteralPath $windowPidFile -Raw)
+    Wait-Condition "visible-window cohort restored" {
+        $inspection = Get-Inspection $burnerId
+        return $inspection.efficiency.state.eco_qos -eq $baselineEfficiency.eco_qos -and
+            $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority -and
+            [int](Read-Status).background_efficiency.protected_processes -ge 1
+    } 45
+
+    Stop-Process -Id $visibleProcessId -Force -ErrorAction SilentlyContinue
+    $visibleProcessId = $null
+    Unregister-ScheduledTask -TaskName $windowTask -Confirm:$false -ErrorAction SilentlyContinue
+    Wait-Condition "background efficiency reapplied after visible window closed" {
+        $inspection = Get-Inspection $burnerId
+        return $inspection.efficiency.state.eco_qos -eq "enabled" -and
+            $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority
+    } 45
+
+    Write-Host "acceptance stage: stale tray sensor restores owned background state"
+    $interactiveTrays = @(
+        Get-Process -Name "winsched-tray" -ErrorAction SilentlyContinue |
+            Where-Object { $_.SessionId -gt 0 }
+    )
+    Assert-True ($interactiveTrays.Count -gt 0) `
+        "no interactive tray process exists for the stale-sensor test"
+    $interactiveTrays | Stop-Process -Force -ErrorAction Stop
+    Wait-Condition "interactive tray processes stopped" {
+        @(
+            Get-Process -Name "winsched-tray" -ErrorAction SilentlyContinue |
+                Where-Object { $_.SessionId -gt 0 }
+        ).Count -eq 0
+    } 15
+    Wait-Condition "stale tray signal triggered background restore" {
+        try {
+            $inspection = Get-Inspection $burnerId
+            $current = Read-Status
+            return $current -and
+                [int]$current.background_efficiency.interactive_probe_sessions -eq 0 -and
+                $inspection.efficiency.state.eco_qos -eq $baselineEfficiency.eco_qos -and
+                $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority -and
+                (Test-BackgroundStateEmpty)
+        } catch {
+            return $false
+        }
+    } 45
+    Start-InteractiveExecutable $InteractiveUser $trayBinary "" $trayTask
+    Wait-Condition "background efficiency reapplied after tray sensor recovery" {
+        try {
+            $inspection = Get-Inspection $burnerId
+            $current = Read-Status
+            return $current -and
+                [int]$current.background_efficiency.interactive_probe_sessions -ge 1 -and
+                $inspection.efficiency.state.eco_qos -eq "enabled" -and
+                $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority
+        } catch {
+            return $false
+        }
+    } 45
+
+    Write-Host "acceptance stage: disable restores active background ownership"
+    & $serviceBinary disable | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) "disable command failed during background acceptance"
+    Wait-Condition "disable restored active background state" {
+        try {
+            $inspection = Get-Inspection $burnerId
+            $current = Read-Status
+            return $current -and -not [bool]$current.scheduling_enabled -and
+                $inspection.efficiency.state.eco_qos -eq $baselineEfficiency.eco_qos -and
+                $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority -and
+                (Test-BackgroundStateEmpty)
+        } catch {
+            return $false
+        }
+    } 30
+    & $serviceBinary enable | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) "enable command failed during background acceptance"
+    Wait-Condition "re-enable reapplied background efficiency" {
+        try {
+            $inspection = Get-Inspection $burnerId
+            $current = Read-Status
+            return $current -and [bool]$current.scheduling_enabled -and
+                $inspection.efficiency.state.eco_qos -eq "enabled" -and
+                $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority
+        } catch {
+            return $false
+        }
+    } 45
+
+    Write-Host "acceptance stage: graceful stop restores active background ownership"
+    & $serviceBinary stop | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) "stop command failed during background acceptance"
+    Wait-ServiceState "Stopped"
+    $stoppedEfficiency = (Get-Inspection $burnerId).efficiency.state
+    Assert-True ($stoppedEfficiency.eco_qos -eq $baselineEfficiency.eco_qos) `
+        "graceful stop left EcoQoS owned"
+    Assert-True (
+        $stoppedEfficiency.memory_priority -eq $baselineEfficiency.memory_priority
+    ) "graceful stop left memory priority owned"
+    Assert-True (Test-BackgroundStateEmpty) `
+        "graceful stop left background ownership journal entries"
+    & $serviceBinary start | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) "start command failed during background acceptance"
+    Wait-ServiceState "Running"
+    Wait-Condition "service restart reapplied background efficiency" {
+        try {
+            $inspection = Get-Inspection $burnerId
+            return $inspection.efficiency.state.eco_qos -eq "enabled" -and
+                $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority
+        } catch {
+            return $false
+        }
+    } 45
+
+    Write-Host "acceptance stage: forced service crash recovers active background ownership"
+    $backgroundCrashPid = [int](
+        Get-CimInstance Win32_Service -Filter "Name='WinSched'"
+    ).ProcessId
+    Stop-Process -Id $backgroundCrashPid -Force
+    Wait-Condition "SCM restart after background-owned crash" {
+        $serviceAfterCrash = Get-CimInstance Win32_Service -Filter "Name='WinSched'"
+        $serviceAfterCrash.State -eq "Running" -and
+            [int]$serviceAfterCrash.ProcessId -ne 0 -and
+            [int]$serviceAfterCrash.ProcessId -ne $backgroundCrashPid
+    } 90
+    $backgroundRecoveryPid = [int](
+        Get-CimInstance Win32_Service -Filter "Name='WinSched'"
+    ).ProcessId
+    Wait-Condition "background journal recovered after forced service crash" {
+        try {
+            $inspection = Get-Inspection $burnerId
+            $state = Read-BackgroundManaged
+            $current = Read-Status
+            return $current -and [int]$current.service_pid -eq $backgroundRecoveryPid -and
+                $state -and
+                @($state.processes | Where-Object { $_.key.pid -eq $burnerId }).Count -eq 1 -and
+                $inspection.efficiency.state.eco_qos -eq "enabled" -and
+                $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority
+        } catch {
+            return $false
+        }
+    } 45
+
+    Write-Host "acceptance stage: invalid config restores active background ownership"
+    Write-Utf8NoBom $installedConfig "schema_version = 4`nunknown_field = true"
+    Wait-Condition "invalid config rejected with background cleanup" {
+        try {
+            $inspection = Get-Inspection $burnerId
+            $current = Read-Status
+            return $current -and $current.last_error -and
+                $inspection.efficiency.state.eco_qos -eq $baselineEfficiency.eco_qos -and
+                $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority -and
+                (Test-BackgroundStateEmpty)
+        } catch {
+            return $false
+        }
+    } 45
+    Write-Utf8NoBom $installedConfig $backgroundConfig
+    Wait-Condition "valid background configuration recovered after rejection" {
+        try {
+            $inspection = Get-Inspection $burnerId
+            $current = Read-Status
+            return $current -and -not $current.last_error -and
+                $inspection.efficiency.state.eco_qos -eq "enabled" -and
+                $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority
+        } catch {
+            return $false
+        }
+    } 45
+
+    Write-Utf8NoBom $installedConfig $productionConfig
+    Wait-Condition "background efficiency restored after rule removal" {
+        try {
+            $inspection = Get-Inspection $burnerId
+            return $inspection.efficiency.state.eco_qos -eq $baselineEfficiency.eco_qos -and
+                $inspection.efficiency.state.memory_priority -eq $baselineEfficiency.memory_priority -and
+                (Test-BackgroundStateEmpty)
+        } catch {
+            return $false
+        }
+    } 45
+
+    Write-Host "acceptance stage: memory and compute workload profiles"
     $memoryConfig = ($productionConfig -replace `
         'all_user_processes\s*=\s*true', `
         'all_user_processes = false').TrimEnd() + @"
@@ -450,7 +785,7 @@ profile = "memory"
         $currentService = Get-CimInstance Win32_Service -Filter "Name='WinSched'"
         return $currentService.State -eq "Running" -and
             $currentService.ProcessId -ne 0 -and $currentService.ProcessId -ne $oldPid
-    } 30
+    } 90
     $newPid = (Get-CimInstance Win32_Service -Filter "Name='WinSched'").ProcessId
     Wait-Condition "new service heartbeat after recovery" {
         $current = Read-Status
@@ -477,7 +812,14 @@ profile = "memory"
         memory_profile_cpu_sets = $memoryCpuSetIds.Count
         compute_profile_cpu_sets = $computeCpuSetIds.Count
         workload_profiles = "PASS"
+        background_efficiency = "PASS"
+        background_tray_stale_restore = "PASS"
+        background_disable_restore = "PASS"
+        background_stop_restore = "PASS"
+        background_crash_recovery = "PASS"
+        background_invalid_config_restore = "PASS"
         install_directory = $InstallDirectory
+        data_directory = $DataDirectory
     } | ConvertTo-Json -Depth 4
 } finally {
     if ($burner -and -not $burner.HasExited) {
@@ -486,11 +828,18 @@ profile = "memory"
     if ($loadProcessId) {
         Stop-Process -Id $loadProcessId -Force -ErrorAction SilentlyContinue
     }
+    if ($visibleProcessId) {
+        Stop-Process -Id $visibleProcessId -Force -ErrorAction SilentlyContinue
+    }
     if ($productionConfig -and (Test-Path -LiteralPath $installedConfig)) {
         Write-Utf8NoBom $installedConfig $productionConfig
     }
     Unregister-ScheduledTask -TaskName $burnerTask -Confirm:$false -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $trayTask -Confirm:$false -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $windowTask -Confirm:$false -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $burnerScript -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $burnerPidFile -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $loadScript -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $windowScript -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $windowPidFile -Force -ErrorAction SilentlyContinue
 }

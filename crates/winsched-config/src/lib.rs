@@ -15,7 +15,8 @@ use winsched_core::{
 
 pub const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const LOGGING_CONFIG_SCHEMA_VERSION: u32 = 2;
-pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+pub const RESPONSIVENESS_CONFIG_SCHEMA_VERSION: u32 = 3;
+pub const CONFIG_SCHEMA_VERSION: u32 = 4;
 pub const MIN_LOG_FILE_SIZE_MIB: u16 = 1;
 pub const MAX_LOG_FILE_SIZE_MIB: u16 = 100;
 pub const MAX_RETAINED_LOG_ARCHIVES: u8 = 10;
@@ -157,6 +158,36 @@ impl LoggingConfig {
     }
 }
 
+/// Opt-in `QoS` and memory policy for exact rules using the background workload profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // Independent GUI safety switches are intentional.
+pub struct BackgroundEfficiencyConfig {
+    pub enabled: bool,
+    pub eco_qos_enabled: bool,
+    pub memory_priority_enabled: bool,
+    pub memory_pressure_guard_enabled: bool,
+    pub protect_foreground: bool,
+    pub protect_visible: bool,
+    pub protect_audio: bool,
+}
+
+impl Default for BackgroundEfficiencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Process-level policies are explicit opt-ins until the workload's child tree is
+            // understood. Native acceptance confirms memory priority propagates to later children.
+            eco_qos_enabled: false,
+            memory_priority_enabled: false,
+            memory_pressure_guard_enabled: true,
+            protect_foreground: true,
+            protect_visible: true,
+            protect_audio: true,
+        }
+    }
+}
+
 /// Full service configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -169,6 +200,7 @@ pub struct ControllerConfig {
     pub default_rule_mode: RuleMode,
     pub default_workload_profile: WorkloadProfile,
     pub logging: LoggingConfig,
+    pub background_efficiency: BackgroundEfficiencyConfig,
     pub responsiveness: ResponsivenessConfig,
     pub policy: PolicyConfig,
     pub rules: Vec<ProcessRule>,
@@ -185,6 +217,7 @@ impl Default for ControllerConfig {
             default_rule_mode: RuleMode::Auto,
             default_workload_profile: WorkloadProfile::Balanced,
             logging: LoggingConfig::default(),
+            background_efficiency: BackgroundEfficiencyConfig::default(),
             responsiveness: ResponsivenessConfig::default(),
             policy: PolicyConfig::default(),
             rules: Vec::new(),
@@ -259,9 +292,23 @@ impl ControllerConfig {
         let mut config = toml::from_str::<Self>(value)?;
         if matches!(
             config.schema_version,
-            LEGACY_CONFIG_SCHEMA_VERSION | LOGGING_CONFIG_SCHEMA_VERSION
+            LEGACY_CONFIG_SCHEMA_VERSION
+                | LOGGING_CONFIG_SCHEMA_VERSION
+                | RESPONSIVENESS_CONFIG_SCHEMA_VERSION
         ) {
             config.schema_version = CONFIG_SCHEMA_VERSION;
+            // Schema 1-3 users opted into placement profiles, not process QoS mutation.
+            // Balanced had the same placement behavior, so normalize legacy Background
+            // profiles before schema 4 gives Background its QoS-only meaning.
+            if config.default_workload_profile == WorkloadProfile::Background {
+                config.default_workload_profile = WorkloadProfile::Balanced;
+            }
+            for rule in &mut config.rules {
+                if rule.profile == WorkloadProfile::Background {
+                    rule.profile = WorkloadProfile::Balanced;
+                }
+            }
+            config.background_efficiency.enabled = false;
         }
         config.validate()
     }
@@ -367,21 +414,25 @@ impl ControllerConfig {
         }
         let mode = rule.map_or(self.default_rule_mode, |rule| rule.mode);
         let profile = rule.map_or(self.default_workload_profile, |rule| rule.profile);
-        let placement = match mode {
-            RuleMode::Off => PlacementMode::Off,
-            RuleMode::Sticky => PlacementMode::Sticky,
-            RuleMode::Auto => PlacementMode::Auto,
-            RuleMode::Performance => PlacementMode::Performance,
-            RuleMode::Efficiency => PlacementMode::Efficiency,
-            RuleMode::Strict => {
-                let rule = rule?;
-                let (Some(group), Some(last_level_cache_index)) = (rule.group, rule.llc) else {
-                    return None;
-                };
-                PlacementMode::Strict(LlcDomainKey {
-                    group,
-                    last_level_cache_index,
-                })
+        let placement = if rule.is_some() && profile == WorkloadProfile::Background {
+            PlacementMode::Off
+        } else {
+            match mode {
+                RuleMode::Off => PlacementMode::Off,
+                RuleMode::Sticky => PlacementMode::Sticky,
+                RuleMode::Auto => PlacementMode::Auto,
+                RuleMode::Performance => PlacementMode::Performance,
+                RuleMode::Efficiency => PlacementMode::Efficiency,
+                RuleMode::Strict => {
+                    let rule = rule?;
+                    let (Some(group), Some(last_level_cache_index)) = (rule.group, rule.llc) else {
+                        return None;
+                    };
+                    PlacementMode::Strict(LlcDomainKey {
+                        group,
+                        last_level_cache_index,
+                    })
+                }
             }
         };
         Some(ResolvedRule {
@@ -394,6 +445,22 @@ impl ControllerConfig {
             profile,
         })
     }
+
+    /// Returns whether an exact rule opts this image into background `QoS` handling.
+    ///
+    /// Broad process scope and the default workload profile intentionally never
+    /// opt a process into this independent mutation surface.
+    #[must_use]
+    pub fn background_efficiency_applies(&self, image_name: &str) -> bool {
+        self.background_efficiency.enabled
+            && (self.background_efficiency.eco_qos_enabled
+                || self.background_efficiency.memory_priority_enabled)
+            && self.rules.iter().any(|rule| {
+                rule.image.eq_ignore_ascii_case(image_name)
+                    && rule.profile == WorkloadProfile::Background
+                    && rule.mode != RuleMode::Off
+            })
+    }
 }
 
 #[cfg(test)]
@@ -405,6 +472,9 @@ mod tests {
         let config = ControllerConfig::from_toml("schema_version = 1").unwrap();
         assert_eq!(config.controller_mode, ControllerMode::Observe);
         assert_eq!(config.resolve("app.exe"), None);
+        assert!(!config.background_efficiency.enabled);
+        assert!(!config.background_efficiency.eco_qos_enabled);
+        assert!(!config.background_efficiency.memory_priority_enabled);
     }
 
     #[test]
@@ -507,8 +577,10 @@ stability_samples = 5
     fn fingerprint_matches_normalized_legacy_config_and_changes_with_content() {
         let legacy = ControllerConfig::from_toml("schema_version = 1").unwrap();
         let logging_schema = ControllerConfig::from_toml("schema_version = 2").unwrap();
-        let current = ControllerConfig::from_toml("schema_version = 3").unwrap();
+        let responsiveness_schema = ControllerConfig::from_toml("schema_version = 3").unwrap();
+        let current = ControllerConfig::from_toml("schema_version = 4").unwrap();
         assert_eq!(legacy.fingerprint(), logging_schema.fingerprint());
+        assert_eq!(legacy.fingerprint(), responsiveness_schema.fingerprint());
         assert_eq!(legacy.fingerprint(), current.fingerprint());
 
         let mut changed = current;
@@ -544,7 +616,7 @@ enabled = false
 
     #[test]
     fn unsupported_config_schema_is_rejected() {
-        for schema in [0, 4] {
+        for schema in [0, 5] {
             let error =
                 ControllerConfig::from_toml(&format!("schema_version = {schema}")).unwrap_err();
             assert!(matches!(error, ConfigError::SchemaVersion(value) if value == schema));
@@ -553,13 +625,76 @@ enabled = false
 
     #[test]
     fn legacy_schemas_keep_the_responsiveness_controller_disabled() {
-        for schema in [1, 2] {
+        for schema in [1, 2, 3] {
             let config =
                 ControllerConfig::from_toml(&format!("schema_version = {schema}")).unwrap();
             assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
             assert_eq!(config.responsiveness, ResponsivenessConfig::default());
             assert!(!config.responsiveness.enabled);
+            assert!(!config.background_efficiency.enabled);
         }
+    }
+
+    #[test]
+    fn legacy_background_profiles_keep_their_old_balanced_placement_semantics() {
+        let config = ControllerConfig::from_toml(
+            r#"
+schema_version = 3
+controller_mode = "auto"
+all_user_processes = true
+default_workload_profile = "background"
+
+[[rules]]
+image = "legacy.exe"
+mode = "sticky"
+profile = "background"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.default_workload_profile, WorkloadProfile::Balanced);
+        assert_eq!(config.rules[0].profile, WorkloadProfile::Balanced);
+        assert_eq!(
+            config.resolve("legacy.exe").unwrap().placement,
+            PlacementMode::Sticky
+        );
+        assert!(!config.background_efficiency_applies("legacy.exe"));
+    }
+
+    #[test]
+    fn background_efficiency_requires_an_exact_background_rule_and_disables_placement() {
+        let mut config = ControllerConfig::from_toml(
+            r#"
+schema_version = 4
+controller_mode = "auto"
+all_user_processes = true
+default_workload_profile = "background"
+
+[background_efficiency]
+enabled = true
+memory_priority_enabled = true
+
+[[rules]]
+image = "worker.exe"
+mode = "auto"
+profile = "background"
+
+[[rules]]
+image = "disabled.exe"
+mode = "off"
+profile = "background"
+"#,
+        )
+        .unwrap();
+        assert!(config.background_efficiency_applies("WORKER.EXE"));
+        assert!(!config.background_efficiency_applies("implicit.exe"));
+        assert!(!config.background_efficiency_applies("disabled.exe"));
+        assert_eq!(
+            config.resolve("worker.exe").unwrap().placement,
+            PlacementMode::Off
+        );
+        config.background_efficiency.enabled = false;
+        assert!(!config.background_efficiency_applies("worker.exe"));
     }
 
     #[test]

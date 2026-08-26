@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDirectory,
     [string]$InstallDirectory = "$env:ProgramFiles\WinSched",
-    [string]$DataDirectory = "$env:ProgramData\WinSched"
+    [string]$DataDirectory = "$env:ProgramData\WinSched",
+    [string]$ResultFileName = "diagnostics-ui-result.json"
 )
 
 $ErrorActionPreference = "Stop"
@@ -135,7 +136,7 @@ function Find-SettingsWindow([int]$ProcessId) {
 }
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-$resultPath = Join-Path $OutputDirectory "settings-ui-result.json"
+$resultPath = Join-Path $OutputDirectory $ResultFileName
 $settingsPath = Join-Path $InstallDirectory "winsched-settings.exe"
 $configPath = Join-Path $DataDirectory "winsched.toml"
 $process = $null

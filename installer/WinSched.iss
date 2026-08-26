@@ -1,6 +1,6 @@
 #define AppName "WinSched"
 #ifndef AppVersion
-  #define AppVersion "0.4.0"
+  #define AppVersion "0.5.0"
 #endif
 
 #ifndef PayloadDir
@@ -39,14 +39,18 @@ WizardSmallImageFile={#ProjectRoot}\assets\installer\winsched-wizard-small.png
 WizardSmallImageFileDynamicDark={#ProjectRoot}\assets\installer\winsched-wizard-small-dark.png
 DisableWelcomePage=no
 DisableProgramGroupPage=auto
+DisableDirPage=yes
 PrivilegesRequired=admin
 SetupArchitecture=x64
 ArchitecturesAllowed=x64os
-MinVersion=10.0.22000
+MinVersion=10.0.22621
+AllowUNCPath=no
+AllowNetworkDrive=no
+AllowRootDirectory=no
 CloseApplications=yes
 CloseApplicationsFilter=winsched-tray.exe,winsched-settings.exe
 RestartApplications=no
-UsePreviousAppDir=yes
+UsePreviousAppDir=no
 UsePreviousTasks=yes
 UninstallLogMode=append
 SetupMutex=Global\WinSched.Setup
@@ -66,8 +70,18 @@ english.ServiceInstallFailed=The WinSched service could not be registered or sta
 russian.ServiceInstallFailed=Не удалось зарегистрировать или запустить службу WinSched. Установка не может быть продолжена.
 english.ServiceRemoveFailed=The existing WinSched service could not be stopped and removed.
 russian.ServiceRemoveFailed=Не удалось остановить и удалить существующую службу WinSched.
+english.DataDirectorySecurityFailed=Setup could not secure the WinSched data directory. Installation cannot continue.
+russian.DataDirectorySecurityFailed=Не удалось защитить каталог данных WinSched. Установка не может быть продолжена.
+english.InstallPathInvalid=WinSched must be installed in the protected Program Files\WinSched directory.
+russian.InstallPathInvalid=WinSched должен быть установлен в защищённый каталог Program Files\WinSched.
+english.LegacyInstallPathUnsupported=An older WinSched GUI installation uses a non-default directory. Uninstall that version first, preserve ProgramData, then run this Setup again.
+russian.LegacyInstallPathUnsupported=Предыдущая GUI-версия WinSched установлена в нестандартный каталог. Сначала удалите её, сохранив ProgramData, затем снова запустите этот установщик.
+english.UntrustedDataDirectory=Setup found an orphaned WinSched data directory without a trusted service or GUI-install record. Move or remove that directory after reviewing it, then retry.
+russian.UntrustedDataDirectory=Обнаружен оставшийся каталог данных WinSched без доверенной службы или записи GUI-установки. Проверьте и переместите либо удалите этот каталог, затем повторите установку.
 english.PurgeDataPrompt=Also remove the WinSched configuration, logs, and saved state?%n%nThe default is No.
 russian.PurgeDataPrompt=Также удалить конфигурацию, журналы и сохранённое состояние WinSched?%n%nПо умолчанию выбран ответ «Нет».
+english.PurgeDataFailed=WinSched was removed, but its data directory could not be fully purged.
+russian.PurgeDataFailed=WinSched удалён, но каталог данных не удалось удалить полностью.
 
 [Tasks]
 Name: "startup"; Description: "{cm:StartupTask}"; GroupDescription: "{cm:AdditionalIcons}"
@@ -88,9 +102,11 @@ Source: "{#PayloadDir}\winsched-settings.exe"; DestDir: "{app}"; Flags: ignoreve
 Source: "{#PayloadDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\winsched.toml"; DestDir: "{commonappdata}\WinSched"; DestName: "winsched.toml"; Flags: onlyifdoesntexist uninsneveruninstall
+Source: "{#PayloadDir}\secure-data.ps1"; Flags: dontcopy
+Source: "{#PayloadDir}\winsched-service.exe"; DestName: "winsched-service-helper.exe"; Flags: dontcopy
 
 [Registry]
-Root: HKLM64; Subkey: "Software\WinSched"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekeyifempty uninsdeletevalue; AfterInstall: ProvisionService
+Root: HKLM64; Subkey: "Software\WinSched"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"
 
 [Icons]
 Name: "{group}\WinSched"; Filename: "{app}\winsched-tray.exe"; WorkingDir: "{app}"
@@ -102,7 +118,8 @@ Name: "{commondesktop}\WinSched"; Filename: "{app}\winsched-tray.exe"; WorkingDi
 Name: "{commonstartup}\WinSched Tray"; Filename: "{app}\winsched-tray.exe"; WorkingDir: "{app}"; Tasks: startup
 
 [Run]
-Filename: "{app}\winsched-tray.exe"; Description: "{cm:LaunchProgram,WinSched}"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent runasoriginaluser
+Filename: "{app}\winsched-service.exe"; Parameters: "provision --config ""{commonappdata}\WinSched\winsched.toml"" --allow-auto --start --result-file ""{commonappdata}\WinSched\provision-result.txt"""; Flags: runhidden logoutput; AfterInstall: VerifyProvisionService
+Filename: "{app}\winsched-tray.exe"; Description: "{cm:LaunchProgram,WinSched}"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent runasoriginaluser; Check: ProvisionWasSuccessful
 
 [UninstallDelete]
 Type: files; Name: "{group}\WinSched Tray.lnk"
@@ -116,13 +133,21 @@ const
 
 var
   ExistingService: Boolean;
+  PriorServiceStateCaptured: Boolean;
+  ServiceWasRunning: Boolean;
   ServiceStoppedBySetup: Boolean;
+  ProvisionAttempted: Boolean;
   ProvisionSucceeded: Boolean;
   PurgeDataRequested: Boolean;
 
 function ExecQuiet(const FileName, Parameters: String; var ResultCode: Integer): Boolean;
 begin
   Result := Exec(FileName, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function ProvisionWasSuccessful: Boolean;
+begin
+  Result := ProvisionSucceeded;
 end;
 
 function ServiceExists: Boolean;
@@ -137,8 +162,18 @@ end;
 function ServiceExecutable: String;
 begin
   Result := ExpandConstant('{app}\winsched-service.exe');
-  if not FileExists(Result) then
-    Result := ExpandConstant('{commonappdata}\WinSched\winsched-service.exe');
+end;
+
+function TrustedSetupServiceHelper(var HelperPath: String): Boolean;
+begin
+  Result := False;
+  try
+    ExtractTemporaryFile('winsched-service-helper.exe');
+  except
+    exit;
+  end;
+  HelperPath := ExpandConstant('{tmp}\winsched-service-helper.exe');
+  Result := FileExists(HelperPath);
 end;
 
 function ServiceIsStopped: Boolean;
@@ -177,36 +212,34 @@ end;
 
 function StopExistingService: Boolean;
 var
-  ServiceExe: String;
+  ServiceHelper: String;
   ResultCode: Integer;
-  Attempt: Integer;
+  CommandSucceeded: Boolean;
+  ActuallyStopped: Boolean;
 begin
   Result := True;
   if not ServiceExists then
     exit;
-
-  ServiceExe := ServiceExecutable;
-  if FileExists(ServiceExe) then begin
-    Result := ExecQuiet(ServiceExe, 'stop', ResultCode) and (ResultCode = 0);
-    if Result then begin
-      ServiceStoppedBySetup := True;
-      exit;
-    end;
+  if not TrustedSetupServiceHelper(ServiceHelper) then begin
+    Result := False;
+    exit;
   end;
-
-  ExecQuiet(
-    ExpandConstant('{sys}\sc.exe'),
-    'stop ' + ServiceName,
-    ResultCode);
-  for Attempt := 1 to 80 do begin
-    if ServiceIsStopped then begin
-      ServiceStoppedBySetup := True;
-      Result := True;
-      exit;
-    end;
-    Sleep(250);
+  CommandSucceeded :=
+    ExecQuiet(ServiceHelper, 'stop', ResultCode) and (ResultCode = 0);
+  ActuallyStopped := ServiceIsStopped;
+  if ActuallyStopped then begin
+    ServiceStoppedBySetup := True;
   end;
-  Result := False;
+  Result := CommandSucceeded and ActuallyStopped;
+end;
+
+function OwnershipJournalsExist: Boolean;
+begin
+  Result :=
+    FileExists(ExpandConstant('{commonappdata}\WinSched\managed-state.json')) or
+    FileExists(ExpandConstant('{commonappdata}\WinSched\managed-state.bak')) or
+    FileExists(ExpandConstant('{commonappdata}\WinSched\background-state.json')) or
+    FileExists(ExpandConstant('{commonappdata}\WinSched\background-state.bak'));
 end;
 
 function UnregisterExistingService: Boolean;
@@ -216,18 +249,37 @@ var
   Attempt: Integer;
 begin
   Result := True;
-  if not ServiceExists then
-    exit;
-
   ServiceExe := ServiceExecutable;
 
-  if FileExists(ServiceExe) then
-    ExecQuiet(ServiceExe, 'uninstall', ResultCode);
+  if not ServiceExists then begin
+    if FileExists(ServiceExe) then begin
+      Result :=
+        ExecQuiet(
+          ServiceExe,
+          'uninstall --data-directory "' +
+            ExpandConstant('{commonappdata}\WinSched') + '"',
+          ResultCode) and
+        (ResultCode = 0);
+    end else if OwnershipJournalsExist then begin
+      Result := False;
+    end;
+    exit;
+  end;
 
-  if ServiceExists then begin
-    ExecQuiet(ExpandConstant('{sys}\sc.exe'), 'stop ' + ServiceName, ResultCode);
-    Sleep(500);
-    ExecQuiet(ExpandConstant('{sys}\sc.exe'), 'delete ' + ServiceName, ResultCode);
+  if not FileExists(ServiceExe) then begin
+    Result := False;
+    exit;
+  end;
+  if FileExists(ServiceExe) then begin
+    if (not ExecQuiet(
+         ServiceExe,
+         'uninstall --data-directory "' +
+           ExpandConstant('{commonappdata}\WinSched') + '"',
+         ResultCode)) or
+       (ResultCode <> 0) then begin
+      Result := False;
+      exit;
+    end;
   end;
 
   for Attempt := 1 to 80 do begin
@@ -238,36 +290,189 @@ begin
   Result := False;
 end;
 
+function RunSecurityScript(const Directory: String; ValidateControlFiles: Boolean): Boolean;
+var
+  ScriptPath: String;
+  Parameters: String;
+  ResultCode: Integer;
+begin
+  Result := False;
+  try
+    ExtractTemporaryFile('secure-data.ps1');
+  except
+    exit;
+  end;
+  ScriptPath := ExpandConstant('{tmp}\secure-data.ps1');
+  Parameters :=
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+    ScriptPath + '" -Directory "' + Directory + '" -Harden';
+  if ValidateControlFiles then
+    Parameters := Parameters + ' -Purpose Data -ValidateControlFiles'
+  else
+    Parameters := Parameters + ' -Purpose Application';
+  Result :=
+    ExecQuiet(
+      ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      Parameters,
+      ResultCode) and
+    (ResultCode = 0);
+end;
+
+function HardenDataDirectory: Boolean;
+begin
+  Result :=
+    RunSecurityScript(ExpandConstant('{commonappdata}\WinSched'), True);
+  if Result then
+    Result := SaveStringToFile(
+      ExpandConstant('{commonappdata}\WinSched\setup-provenance.txt'),
+      'WinSched Setup controlled directory' + #13#10,
+      False);
+  if Result then
+    Result :=
+      RunSecurityScript(ExpandConstant('{commonappdata}\WinSched'), True);
+end;
+
+function HardenApplicationDirectory: Boolean;
+begin
+  Result := RunSecurityScript(ExpandConstant('{app}'), False);
+end;
+
+function ClearProvisionReceipt: Boolean;
+var
+  ReceiptPath: String;
+begin
+  ReceiptPath := ExpandConstant('{commonappdata}\WinSched\provision-result.txt');
+  Result := (not FileExists(ReceiptPath)) or DeleteFile(ReceiptPath);
+  Result := Result and (not FileExists(ReceiptPath));
+end;
+
+function PriorGuiInstallPathIsCompatible: Boolean;
+var
+  PriorPath: String;
+begin
+  Result := True;
+  if RegQueryStringValue(HKLM64, 'Software\WinSched', 'InstallPath', PriorPath) then
+    Result := CompareText(PriorPath, ExpandConstant('{autopf}\WinSched')) = 0;
+end;
+
+function ValidateSetupDataMarker: Boolean;
+var
+  ScriptPath: String;
+  Parameters: String;
+  ResultCode: Integer;
+  MarkerLines: TArrayOfString;
+begin
+  Result := False;
+  try
+    ExtractTemporaryFile('secure-data.ps1');
+  except
+    exit;
+  end;
+  ScriptPath := ExpandConstant('{tmp}\secure-data.ps1');
+  Parameters :=
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+    ScriptPath + '" -Directory "' +
+    ExpandConstant('{commonappdata}\WinSched') +
+    '" -Purpose Data -ValidateControlFiles';
+  if (not ExecQuiet(
+       ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+       Parameters,
+       ResultCode)) or
+     (ResultCode <> 0) then
+    exit;
+  if not LoadStringsFromFile(
+       ExpandConstant('{commonappdata}\WinSched\setup-provenance.txt'),
+       MarkerLines) then
+    exit;
+  if GetArrayLength(MarkerLines) <> 1 then
+    exit;
+  Result :=
+    CompareText(Trim(MarkerLines[0]), 'WinSched Setup controlled directory') = 0;
+end;
+
+function DataDirectoryProvenanceIsTrusted: Boolean;
+var
+  PriorPath: String;
+begin
+  if not DirExists(ExpandConstant('{commonappdata}\WinSched')) then begin
+    Result := True;
+    exit;
+  end;
+  if ExistingService then begin
+    Result := True;
+    exit;
+  end;
+  Result :=
+    RegQueryStringValue(HKLM64, 'Software\WinSched', 'InstallPath', PriorPath) and
+    (CompareText(PriorPath, ExpandConstant('{autopf}\WinSched')) = 0);
+  if not Result then
+    Result := ValidateSetupDataMarker;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
   NeedsRestart := False;
+  if CompareText(ExpandConstant('{app}'), ExpandConstant('{autopf}\WinSched')) <> 0 then begin
+    Result := CustomMessage('InstallPathInvalid');
+    exit;
+  end;
+  if not PriorGuiInstallPathIsCompatible then begin
+    Result := CustomMessage('LegacyInstallPathUnsupported');
+    exit;
+  end;
   StopTray;
-  ExistingService := ServiceExists;
-  if ExistingService and (not StopExistingService) then
-    Result := CustomMessage('ServiceRemoveFailed');
+  if not PriorServiceStateCaptured then begin
+    ExistingService := ServiceExists;
+    ServiceWasRunning := ExistingService and (not ServiceIsStopped);
+    PriorServiceStateCaptured := True;
+  end;
+  if not DataDirectoryProvenanceIsTrusted then
+    Result := CustomMessage('UntrustedDataDirectory')
+  else if ExistingService and (not StopExistingService) then
+    Result := CustomMessage('ServiceRemoveFailed')
+  else if not HardenDataDirectory then
+    Result := CustomMessage('DataDirectorySecurityFailed')
+  else if not ClearProvisionReceipt then
+    Result := CustomMessage('DataDirectorySecurityFailed')
+  else if not HardenApplicationDirectory then
+    Result := CustomMessage('InstallPathInvalid');
 end;
 
-procedure ProvisionService;
+function ProvisionReceiptIsSuccess: Boolean;
 var
-  ResultCode: Integer;
-  Parameters: String;
-  ServiceExe: String;
-  ConfigPath: String;
+  ReceiptLines: TArrayOfString;
 begin
-  ServiceExe := ExpandConstant('{app}\winsched-service.exe');
-  ConfigPath := ExpandConstant('{commonappdata}\WinSched\winsched.toml');
-  Parameters :=
-    'provision --config "' + ConfigPath + '" --allow-auto --start';
-  if (not ExecQuiet(ServiceExe, Parameters, ResultCode)) or (ResultCode <> 0) then begin
+  Result := False;
+  if not LoadStringsFromFile(
+       ExpandConstant('{commonappdata}\WinSched\provision-result.txt'),
+       ReceiptLines) then
+    exit;
+  if GetArrayLength(ReceiptLines) <> 1 then
+    exit;
+  Result := CompareText(Trim(ReceiptLines[0]), 'SUCCESS') = 0;
+end;
+
+procedure VerifyProvisionService;
+begin
+  ProvisionAttempted := True;
+  if not ProvisionReceiptIsSuccess then begin
     RaiseException(CustomMessage('ServiceInstallFailed'));
   end;
   ProvisionSucceeded := True;
+  DeleteFile(ExpandConstant('{commonappdata}\WinSched\provision-result.txt'));
   DeleteFile(ExpandConstant('{commonappdata}\WinSched\winsched.exe'));
   DeleteFile(ExpandConstant('{commonappdata}\WinSched\winsched-service.exe'));
   DeleteFile(ExpandConstant('{commonappdata}\WinSched\winsched-tray.exe'));
   DeleteFile(ExpandConstant('{commonappdata}\WinSched\winsched-settings.exe'));
+  DeleteFile(ExpandConstant('{commonappdata}\WinSched\install.ps1'));
   DeleteFile(ExpandConstant('{commonappdata}\WinSched\uninstall.ps1'));
+  DeleteFile(ExpandConstant('{commonappdata}\WinSched\secure-data.ps1'));
+  DeleteFile(ExpandConstant('{commonappdata}\WinSched\Install WinSched.cmd'));
+  DeleteFile(ExpandConstant('{commonappdata}\WinSched\Uninstall WinSched.cmd'));
+  DeleteFile(ExpandConstant('{commonappdata}\WinSched\README.md'));
+  DeleteFile(ExpandConstant('{commonappdata}\WinSched\LICENSE'));
+  DeleteFile(ExpandConstant('{commonappdata}\WinSched\SHA256SUMS'));
 end;
 
 function HasCommandLineSwitch(const Switch: String): Boolean;
@@ -282,25 +487,24 @@ begin
     end;
 end;
 
+function GetCustomSetupExitCode: Integer;
+begin
+  Result := 0;
+  if ProvisionAttempted and (not ProvisionSucceeded) then
+    Result := 9;
+end;
+
 procedure DeinitializeSetup;
 var
-  ServiceExe: String;
   ResultCode: Integer;
 begin
-  if ExistingService and ServiceStoppedBySetup and
-     (not ProvisionSucceeded) then begin
-    ServiceExe := ServiceExecutable;
-    if FileExists(ServiceExe) then begin
-      if (not ExecQuiet(ServiceExe, 'start', ResultCode)) or
-         (ResultCode <> 0) then
-        Log('WinSched rollback restart through the service executable failed');
-    end else begin
-      if (not ExecQuiet(
-        ExpandConstant('{sys}\sc.exe'),
-        'start ' + ServiceName,
-        ResultCode)) or (ResultCode <> 0) then
-        Log('WinSched rollback restart through sc.exe failed');
-    end;
+  if ExistingService and ServiceWasRunning and ServiceStoppedBySetup and
+     (not ProvisionSucceeded) and ServiceIsStopped then begin
+    if (not ExecQuiet(
+      ExpandConstant('{sys}\sc.exe'),
+      'start ' + ServiceName,
+      ResultCode)) or (ResultCode <> 0) then
+      Log('WinSched rollback restart through sc.exe failed');
   end;
 end;
 
@@ -319,6 +523,13 @@ begin
           MB_YESNO or MB_DEFBUTTON2) = IDYES;
   end;
   if (CurUninstallStep = usPostUninstall) and
-     PurgeDataRequested then
-    DelTree(ExpandConstant('{commonappdata}\WinSched'), True, True, True);
+     PurgeDataRequested then begin
+    if (not DelTree(ExpandConstant('{commonappdata}\WinSched'), True, True, True)) or
+       DirExists(ExpandConstant('{commonappdata}\WinSched')) then
+      RaiseException(CustomMessage('PurgeDataFailed'));
+    if RegValueExists(HKLM64, 'Software\WinSched', 'InstallPath') and
+       (not RegDeleteValue(HKLM64, 'Software\WinSched', 'InstallPath')) then
+      RaiseException(CustomMessage('PurgeDataFailed'));
+    RegDeleteKeyIfEmpty(HKLM64, 'Software\WinSched');
+  end;
 end;

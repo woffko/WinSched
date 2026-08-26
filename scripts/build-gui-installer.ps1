@@ -27,6 +27,16 @@ if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $ProjectRoot "dist\gui-installer"
 }
 
+$payloadFiles = @(
+    "winsched.exe",
+    "winsched-service.exe",
+    "winsched-tray.exe",
+    "winsched-settings.exe",
+    "winsched.toml",
+    "secure-data.ps1",
+    "README.md",
+    "LICENSE"
+)
 $required = @(
     $ISCC,
     (Join-Path $ProjectRoot "installer\WinSched.iss"),
@@ -35,14 +45,10 @@ $required = @(
     (Join-Path $ProjectRoot "assets\installer\winsched-wizard.png"),
     (Join-Path $ProjectRoot "assets\installer\winsched-wizard-dark.png"),
     (Join-Path $ProjectRoot "assets\installer\winsched-wizard-small.png"),
-    (Join-Path $ProjectRoot "assets\installer\winsched-wizard-small-dark.png"),
-    (Join-Path $PayloadDirectory "winsched.exe"),
-    (Join-Path $PayloadDirectory "winsched-service.exe"),
-    (Join-Path $PayloadDirectory "winsched-tray.exe"),
-    (Join-Path $PayloadDirectory "winsched-settings.exe"),
-    (Join-Path $PayloadDirectory "winsched.toml"),
-    (Join-Path $PayloadDirectory "README.md"),
-    (Join-Path $PayloadDirectory "LICENSE"),
+    (Join-Path $ProjectRoot "assets\installer\winsched-wizard-small-dark.png")
+) + @(
+    $payloadFiles | ForEach-Object { Join-Path $PayloadDirectory $_ }
+) + @(
     (Join-Path $PayloadDirectory "SHA256SUMS")
 )
 foreach ($path in $required) {
@@ -51,18 +57,35 @@ foreach ($path in $required) {
     }
 }
 
+$manifestEntries = @{}
 Get-Content -LiteralPath (Join-Path $PayloadDirectory "SHA256SUMS") | ForEach-Object {
-    if ($_ -notmatch '^(?<hash>[0-9a-f]{64})\s+(?<file>.+)$') {
+    if ($_ -notmatch '^(?<hash>[0-9a-f]{64})\s{2}(?<file>[A-Za-z0-9][A-Za-z0-9._-]*)$') {
         throw "Invalid SHA256SUMS line: $_"
     }
-    $path = Join-Path $PayloadDirectory $Matches.file
+    $fileName = $Matches.file
+    if ($payloadFiles -notcontains $fileName) {
+        throw "Unexpected SHA256SUMS entry: $fileName"
+    }
+    if ($manifestEntries.ContainsKey($fileName)) {
+        throw "Duplicate SHA256SUMS entry: $fileName"
+    }
+    $manifestEntries[$fileName] = $Matches.hash
+    $path = Join-Path $PayloadDirectory $fileName
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "SHA256SUMS target is missing: $path"
     }
     $actual = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actual -ne $Matches.hash) {
-        throw "Frozen payload hash mismatch: $($Matches.file)"
+    if ($actual -ne $manifestEntries[$fileName]) {
+        throw "Frozen payload hash mismatch: $fileName"
     }
+}
+foreach ($fileName in $payloadFiles) {
+    if (-not $manifestEntries.ContainsKey($fileName)) {
+        throw "SHA256SUMS is missing required payload: $fileName"
+    }
+}
+if ($manifestEntries.Count -ne $payloadFiles.Count) {
+    throw "SHA256SUMS entry count does not match the frozen payload"
 }
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null

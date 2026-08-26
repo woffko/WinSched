@@ -7,14 +7,15 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$InteractiveUser,
     [string]$InstallDirectory = "$env:ProgramFiles\WinSched",
-    [string]$DataDirectory = "$env:ProgramData\WinSched"
+    [string]$DataDirectory = "$env:ProgramData\WinSched",
+    [string]$ResultFileName = "settings-ui-result.json"
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $taskName = "WinSchedSettingsUiAcceptance"
-$resultPath = Join-Path $OutputDirectory "settings-ui-result.json"
+$resultPath = Join-Path $OutputDirectory $ResultFileName
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
 
@@ -27,7 +28,12 @@ $arguments = @(
     "-OutputDirectory $quote$OutputDirectory$quote"
     "-InstallDirectory $quote$InstallDirectory$quote"
     "-DataDirectory $quote$DataDirectory$quote"
-) -join " "
+)
+$acceptanceSource = Get-Content -LiteralPath $AcceptanceScript -Raw
+if ($acceptanceSource -match '(?m)\$ResultFileName\b') {
+    $arguments += "-ResultFileName $quote$ResultFileName$quote"
+}
+$arguments = $arguments -join " "
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments
 $principal = New-ScheduledTaskPrincipal `
     -UserId $InteractiveUser `

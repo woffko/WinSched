@@ -296,6 +296,7 @@ $scenario = $PurgeChoice.ToLowerInvariant()
 $resultPath = Join-Path $OutputDirectory "gui-uninstaller-$scenario-result.json"
 $confirmationScreenshot = Join-Path $OutputDirectory "uninstaller-$scenario-confirmation.png"
 $purgeScreenshot = Join-Path $OutputDirectory "uninstaller-$scenario-purge-prompt.png"
+$completionScreenshot = Join-Path $OutputDirectory "uninstaller-$scenario-complete.png"
 $errorScreenshot = Join-Path $OutputDirectory "uninstaller-$scenario-error.png"
 Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
 
@@ -305,6 +306,7 @@ $script:launchedAfter = [DateTime]::MaxValue
 $launcher = $null
 $confirmationDialog = $null
 $purgeDialog = $null
+$completionDialog = $null
 $result = $null
 $exitCode = 0
 $resultWritten = $false
@@ -389,6 +391,22 @@ try {
         Invoke-NativeDialogButton $purgeDialog $purgeYes "%Y"
     }
 
+    Wait-Condition -Description "WinSched uninstall completion dialog" -TimeoutSeconds 90 -Condition {
+        $candidate = Find-UninstallDialog `
+            $script:launchedAfter `
+            "*successfully removed*"
+        if ($null -ne $candidate) {
+            $script:completionDialog = $candidate
+            return $true
+        }
+        return $false
+    }
+    $completionDialog = $script:completionDialog
+    Capture-Window $completionDialog $completionScreenshot
+    $completionOk = Find-DialogButton $completionDialog "OK"
+    Assert-True ($null -ne $completionOk) "Uninstall completion OK button was not found"
+    Invoke-NativeDialogButton $completionDialog $completionOk "{ENTER}"
+
     Wait-Condition -Description "all WinSched uninstaller windows closed" -TimeoutSeconds 90 -Condition {
         @(Get-FreshUninstallWindows $script:launchedAfter).Count -eq 0
     }
@@ -423,6 +441,9 @@ try {
         $configHashAfter = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
         Assert-True ($configHashAfter -eq $configHashBefore) `
             "WinSched configuration bytes changed during preserve uninstall"
+        Remove-Item -LiteralPath $markerPath -Force
+        Assert-True (-not (Test-Path -LiteralPath $markerPath)) `
+            "Acceptance marker cleanup failed after preserve verification"
     } else {
         Assert-True (-not (Test-Path -LiteralPath $DataDirectory)) `
             "WinSched data directory remains after choosing Yes"
@@ -443,16 +464,18 @@ try {
         desktop_shortcut_removed_if_present = $true
         data_directory_preserved = ($PurgeChoice -eq "Preserve")
         data_directory_purged = ($PurgeChoice -eq "Purge")
+        acceptance_marker_cleaned = ($PurgeChoice -eq "Preserve")
         config_sha256_before = $configHashBefore
         config_sha256_after = $configHashAfter
         screenshots = @(
             [IO.Path]::GetFileName($confirmationScreenshot),
-            [IO.Path]::GetFileName($purgeScreenshot)
+            [IO.Path]::GetFileName($purgeScreenshot),
+            [IO.Path]::GetFileName($completionScreenshot)
         )
     }
 } catch {
     $exitCode = 1
-    foreach ($window in @($purgeDialog, $confirmationDialog)) {
+    foreach ($window in @($completionDialog, $purgeDialog, $confirmationDialog)) {
         if ($null -eq $window) {
             continue
         }

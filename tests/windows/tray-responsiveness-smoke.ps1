@@ -4,7 +4,7 @@ param(
     [string]$OutputDirectory,
     [string]$InstallDirectory = "$env:ProgramFiles\WinSched",
     [string]$DataDirectory = "$env:ProgramData\WinSched",
-    [string]$ExpectedVersion = "0.3.1"
+    [string]$ExpectedVersion = "0.5.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -133,7 +133,7 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $InstallDirectory "winsched-tray.exe")) `
         "tray executable is missing"
     $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
-    Assert-True ([int]$status.schema_version -eq 3) "service status is not schema 3"
+    Assert-True ([int]$status.schema_version -eq 4) "service status is not schema 4"
 
     $script:trayIcon = $null
     Wait-Condition "WinSched tray icon" {
@@ -149,11 +149,13 @@ try {
 
     $reserve = Find-Element "System reserve:*" ([System.Windows.Automation.ControlType]::MenuItem)
     $latency = Find-Element "Latency:*" ([System.Windows.Automation.ControlType]::MenuItem)
+    $background = Find-Element "Background QoS:*" ([System.Windows.Automation.ControlType]::MenuItem)
     $mode = Find-Element "Mode: Auto" ([System.Windows.Automation.ControlType]::MenuItem)
     $about = Find-Element "About WinSched*" ([System.Windows.Automation.ControlType]::MenuItem)
     $github = Find-Element "GitHub Repository" ([System.Windows.Automation.ControlType]::MenuItem)
     Assert-True ($null -ne $reserve) "System reserve tray row is missing"
     Assert-True ($null -ne $latency) "Latency tray row is missing"
+    Assert-True ($null -ne $background) "Background QoS tray row is missing"
     Assert-True ($null -ne $mode) "Mode tray row is missing"
     Assert-True ($null -ne $about) "About tray action is missing"
     Assert-True ($null -ne $github) "GitHub tray action is missing"
@@ -195,6 +197,7 @@ try {
         session_id = [Diagnostics.Process]::GetCurrentProcess().SessionId
         reserve_text = $reserve.Current.Name
         latency_text = $latency.Current.Name
+        background_text = $background.Current.Name
         mode_text = $mode.Current.Name
         about_menu_text = $aboutMenuText
         github_menu_text = $githubMenuText

@@ -1,7 +1,8 @@
+#![allow(unsafe_code)] // Narrow Win32 UI and locale calls are documented at each use.
+
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,6 +11,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Color32, RichText};
+use windows::Win32::Globalization::GetUserDefaultLocaleName;
+use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+use windows::core::PCWSTR;
 use winsched::diagnostics::{
     self, DiagnosticFindingCode, DiagnosticOptions, DiagnosticReport, DiagnosticSeverity,
 };
@@ -29,8 +33,6 @@ use winsched_settings::{
 };
 
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
 pub fn run() -> Result<(), Box<dyn Error>> {
     let paths = SettingsPaths::discover();
     let _instance = InstanceLock::acquire(&paths.instance_lock)?;
@@ -59,17 +61,20 @@ pub fn show_startup_error(message: &str) {
     let detail = format!(
         "WinSched Settings could not start. / Не удалось запустить настройки WinSched.\n\n{message}"
     );
-    let _ = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.MessageBox]::Show($env:WINSCHED_SETTINGS_STARTUP_ERROR, 'WinSched Settings / Настройки WinSched', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)",
-        ])
-        .env("WINSCHED_SETTINGS_STARTUP_ERROR", detail)
-        .creation_flags(CREATE_NO_WINDOW)
-        .status();
+    let text = detail.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let caption = "WinSched Settings / Настройки WinSched"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: Both UTF-16 buffers are NUL-terminated and live for the complete call.
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,22 +98,14 @@ fn detect_language() -> Language {
             return Language::Russian;
         }
     }
-    let output = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "[Globalization.CultureInfo]::CurrentUICulture.Name",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    if output.is_ok_and(|output| {
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
+    let mut locale = [0u16; 85];
+    // SAFETY: The fixed buffer is writable and meets LOCALE_NAME_MAX_LENGTH.
+    let length = unsafe { GetUserDefaultLocaleName(&mut locale) };
+    if length > 0
+        && String::from_utf16_lossy(&locale[..usize::try_from(length).unwrap_or(0)])
             .to_ascii_lowercase()
             .starts_with("ru")
-    }) {
+    {
         Language::Russian
     } else {
         Language::English
@@ -148,6 +145,7 @@ enum SettingsTab {
     General,
     Adaptive,
     Responsiveness,
+    BackgroundEfficiency,
     Rules,
     Logging,
     Diagnostics,
@@ -682,6 +680,11 @@ impl SettingsApp {
                 &mut self.tab,
                 SettingsTab::Responsiveness,
                 language.text("Responsiveness", "Отзывчивость"),
+            );
+            ui.selectable_value(
+                &mut self.tab,
+                SettingsTab::BackgroundEfficiency,
+                language.text("Background", "Фоновые задачи"),
             );
             ui.selectable_value(
                 &mut self.tab,
@@ -1409,8 +1412,173 @@ impl SettingsApp {
             }
             None => {
                 ui.label(language.text(
-                    "Live reserve information is unavailable until a schema-3 service is running.",
-                    "Информация о резерве появится после запуска службы со схемой статуса 3.",
+                    "Live reserve information is unavailable until a schema-4 service is running.",
+                    "Информация о резерве появится после запуска службы со схемой статуса 4.",
+                ));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // One tab keeps related bilingual controls together.
+    fn background_efficiency_tab(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.heading(language.text("Background efficiency", "Эффективность фоновых задач"));
+        ui.label(language.text(
+            "Applies only to an exact process rule whose workload profile is Background. Broad process scope and the default profile never opt a process into this policy.",
+            "Применяется только к точному правилу процесса с профилем нагрузки Background. Общий охват процессов и профиль по умолчанию никогда не включают эту политику.",
+        ));
+        ui.label(language.text(
+            "The non-elevated tray supplies foreground, visible-window, and active-audio veto signals. Missing or stale signals request a safe restore on the bounded safety cadence.",
+            "Трей без повышения прав передаёт запрещающие сигналы foreground, видимых окон и активного аудио. При отсутствии или устаревании сигналов безопасное восстановление выполняется в пределах ограниченного защитного интервала.",
+        ));
+        ui.add_space(8.0);
+
+        let master_help = language.text(
+            "Enables journaled process-level EcoQoS and memory-priority handling for explicitly marked background processes. Both mutations are off by default: native acceptance confirmed that a parent's memory priority propagates to children created later, and parent rollback does not restore those live children. Enable a property only for a known leaf workload.",
+            "Включает журналируемое управление EcoQoS и приоритетом памяти на уровне процесса для явно отмеченных фоновых процессов. Оба изменения по умолчанию выключены: native-тест подтвердил передачу приоритета памяти новым дочерним процессам, а восстановление родителя не восстанавливает уже работающих детей. Включайте параметр только для заведомо конечной фоновой задачи без дочерних процессов.",
+        );
+        ui.checkbox(
+            &mut self.config.background_efficiency.enabled,
+            language.text(
+                "Enable background efficiency",
+                "Включить эффективность фоновых задач",
+            ),
+        )
+        .on_hover_text(master_help);
+        let enabled = self.config.background_efficiency.enabled;
+
+        background_efficiency_toggle(
+            ui,
+            &mut self.config.background_efficiency.eco_qos_enabled,
+            enabled,
+            language.text("Apply EcoQoS", "Применять EcoQoS"),
+            language.text(
+                "Opt-in for known leaf workloads. The validated cmd-to-ping case did not inherit EcoQoS, but process-wide behavior must still be tested across the target application's complete child tree. WinSched never forces HighQoS.",
+                "Только для проверенных конечных фоновых задач. В тесте cmd→ping EcoQoS не наследовался, но поведение конкретного приложения всё равно нужно проверить по всему дереву дочерних процессов. WinSched никогда не навязывает HighQoS.",
+            ),
+        );
+        background_efficiency_toggle(
+            ui,
+            &mut self.config.background_efficiency.memory_priority_enabled,
+            enabled,
+            language.text(
+                "Lower background memory priority",
+                "Понижать приоритет памяти фоновых задач",
+            ),
+            language.text(
+                "Opt-in for known leaf workloads. Uses Below Normal as the process default for pages added to its working set. Windows propagated this value to a later child in native acceptance; restoring the parent neither restores that child nor immediately retags pages populated meanwhile.",
+                "Только для проверенных конечных фоновых задач. Задаёт Below Normal как приоритет процесса по умолчанию для новых страниц working set. Native-тест подтвердил передачу значения новому дочернему процессу; восстановление родителя не восстанавливает ребёнка и не меняет мгновенно метки уже загруженных страниц.",
+            ),
+        );
+        let memory_guard_enabled =
+            enabled && self.config.background_efficiency.memory_priority_enabled;
+        background_efficiency_toggle(
+            ui,
+            &mut self
+                .config
+                .background_efficiency
+                .memory_pressure_guard_enabled,
+            memory_guard_enabled,
+            language.text(
+                "React to Windows low-memory notifications",
+                "Реагировать на уведомления Windows о нехватке памяти",
+            ),
+            language.text(
+                "Changes owned background memory priority from Below Normal to Low only while Windows reports low-memory pressure, with system hysteresis.",
+                "Меняет управляемый приоритет фоновой памяти с Below Normal на Low только пока Windows сообщает о нехватке памяти, с системным гистерезисом.",
+            ),
+        );
+
+        ui.add_space(8.0);
+        ui.label(RichText::new(language.text("Safety guards", "Защитные условия")).strong());
+        background_efficiency_toggle(
+            ui,
+            &mut self.config.background_efficiency.protect_foreground,
+            enabled,
+            language.text(
+                "Protect the foreground application",
+                "Защищать приложение foreground",
+            ),
+            language.text(
+                "A foreground process and its matching process cohort are restored immediately.",
+                "Процесс foreground и связанные процессы с тем же правилом немедленно восстанавливаются.",
+            ),
+        );
+        background_efficiency_toggle(
+            ui,
+            &mut self.config.background_efficiency.protect_visible,
+            enabled,
+            language.text(
+                "Protect visible and minimized applications",
+                "Защищать видимые и свёрнутые приложения",
+            ),
+            language.text(
+                "Includes minimized top-level windows so restoring Firefox or Explorer from the taskbar is never delayed by this policy.",
+                "Включает свёрнутые окна верхнего уровня, чтобы эта политика не задерживала восстановление Firefox или Explorer с панели задач.",
+            ),
+        );
+        background_efficiency_toggle(
+            ui,
+            &mut self.config.background_efficiency.protect_audio,
+            enabled,
+            language.text(
+                "Protect applications with active audio",
+                "Защищать приложения с активным аудио",
+            ),
+            language.text(
+                "Protects active render and capture sessions, including playback, calls, and recording.",
+                "Защищает активные сессии воспроизведения и захвата, включая видео, звонки и запись.",
+            ),
+        );
+
+        ui.add_space(12.0);
+        ui.heading(language.text("Live service state", "Текущее состояние службы"));
+        match read_status(&self.paths.status)
+            .filter(|status| status.schema_version == STATUS_SCHEMA_VERSION)
+        {
+            Some(status) => {
+                let background = status.background_efficiency;
+                ui.label(match language {
+                    Language::English => format!(
+                        "Eligible: {}. Managed: {}. Protected: {}.",
+                        background.eligible_processes,
+                        background.managed_processes,
+                        background.protected_processes,
+                    ),
+                    Language::Russian => format!(
+                        "Подходят: {}. Управляются: {}. Защищены: {}.",
+                        background.eligible_processes,
+                        background.managed_processes,
+                        background.protected_processes,
+                    ),
+                });
+                ui.label(match language {
+                    Language::English => format!(
+                        "Interactive sensors: {} available / {} required sessions. Memory monitor: {}. Pressure: {}.",
+                        background.interactive_probe_sessions,
+                        background.required_probe_sessions,
+                        if background.memory_pressure_monitor_available { "available" } else { "unavailable" },
+                        if background.low_memory_condition { "low memory" } else { "normal" },
+                    ),
+                    Language::Russian => format!(
+                        "Интерактивные датчики: доступно {} / требуется {} сессий. Контроль памяти: {}. Давление: {}.",
+                        background.interactive_probe_sessions,
+                        background.required_probe_sessions,
+                        if background.memory_pressure_monitor_available { "доступен" } else { "недоступен" },
+                        if background.low_memory_condition { "нехватка памяти" } else { "норма" },
+                    ),
+                });
+                if let Some(action) = background.last_action {
+                    ui.label(match language {
+                        Language::English => format!("Last transition: {action}"),
+                        Language::Russian => format!("Последний переход: {action}"),
+                    });
+                }
+            }
+            None => {
+                ui.label(language.text(
+                    "Live background-efficiency information is unavailable until a schema-4 service is running.",
+                    "Информация об эффективности фоновых задач появится после запуска службы со схемой статуса 4.",
                 ));
             }
         }
@@ -1715,6 +1883,9 @@ impl eframe::App for SettingsApp {
                         SettingsTab::General => self.general_tab(ui),
                         SettingsTab::Adaptive => self.adaptive_tab(ui),
                         SettingsTab::Responsiveness => self.responsiveness_tab(ui),
+                        SettingsTab::BackgroundEfficiency => {
+                            self.background_efficiency_tab(ui);
+                        }
                         SettingsTab::Rules => self.rules_tab(ui),
                         SettingsTab::Logging => self.logging_tab(ui),
                         SettingsTab::Diagnostics => self.diagnostics_tab(ui),
@@ -2288,9 +2459,20 @@ fn workload_profile_combo(
 
 const fn workload_profile_help(language: Language) -> &'static str {
     language.text(
-        "Interactive stays on one LLC, Memory spreads one thread per physical core by default, Compute uses both SMT siblings, and Background/Balanced retain LLC-aware adaptive behavior.",
-        "Interactive остаётся в одном LLC, Memory по умолчанию распределяет по одному потоку на физическое ядро, Compute использует оба SMT-потока, а Background/Balanced сохраняют адаптивное LLC-размещение.",
+        "Interactive stays on one LLC, Memory spreads one thread per physical core by default, Compute uses both SMT siblings, and Background can opt an exact rule into reversible EcoQoS/memory handling. Balanced retains standard LLC-aware adaptive behavior.",
+        "Interactive остаётся в одном LLC, Memory по умолчанию распределяет по одному потоку на физическое ядро, Compute использует оба SMT-потока, а Background может включить для точного правила обратимое управление EcoQoS/памятью. Balanced сохраняет обычное адаптивное LLC-размещение.",
     )
+}
+
+fn background_efficiency_toggle(
+    ui: &mut egui::Ui,
+    value: &mut bool,
+    enabled: bool,
+    label: &str,
+    explanation: &str,
+) {
+    ui.add_enabled(enabled, egui::Checkbox::new(value, label))
+        .on_hover_text(explanation);
 }
 
 fn responsiveness_value_u8(

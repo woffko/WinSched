@@ -93,6 +93,9 @@ try {
         $configHashAfter = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
         Assert-True ($configHashAfter -eq $configHashBefore) `
             "preserve uninstall changed config bytes"
+        Remove-Item -LiteralPath $markerPath -Force
+        Assert-True (-not (Test-Path -LiteralPath $markerPath)) `
+            "silent preserve acceptance marker cleanup failed"
     } else {
         Assert-True (-not (Test-Path -LiteralPath $dataDirectory)) `
             "purge uninstall left ProgramData"
@@ -112,6 +115,7 @@ try {
         data_purged = ($Scenario -eq "Purge")
         config_sha256_before = $configHashBefore
         config_sha256_after = $configHashAfter
+        acceptance_marker_cleaned = ($Scenario -eq "Preserve")
     }
     $exitCode = 0
 } catch {

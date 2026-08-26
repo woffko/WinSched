@@ -1,14 +1,62 @@
 # Testing and release validation
 
-This document describes the validation used for WinSched 0.4.0. It separates
+This document describes the validation used for WinSched 0.5.0. It separates
 source-level checks, Windows VM acceptance, physical Threadripper acceptance,
 and artifact verification so that a passing narrow test is not presented as
 proof of a broader behavior.
+
+## Schema-4 final validation
+
+| Area | Environment | Current result |
+|---|---|---:|
+| Schema 1-3 migration and exact-rule scope | Native Rust tests | PASS |
+| Workspace unit tests | WSL/Linux | PASS, 104 tests |
+| Windows-target Clippy | WSL/cargo-xwin | PASS, `-D warnings` |
+| Windows-native matrix | Designated VM | PASS, 152 tests |
+| EcoQoS + memory-priority apply/readback/restore | Owned child processes | PASS |
+| Per-property external override preservation | Native Windows and runtime VM | PASS |
+| Authenticated local named pipe | Windows-native positive and negative tests | PASS |
+| Event-driven wake, stale restore, and fallback safety cadence | Designated VM | PASS |
+| Low/high memory APIs, transient retention, and WASAPI enumeration | Windows-native tests | PASS |
+| Service policy apply then minimized/visible cohort restore | Windows-native child-process test | PASS |
+| PowerShell syntax | Windows PowerShell 5.1 parser | PASS |
+| Parent-to-later-child process-policy characterization | Interactive `cmd.exe` -> `ping.exe` | PASS: memory priority propagated, EcoQoS did not; parent rollback did not change the live child |
+| Windows VM service/tray/GUI/installer/lifecycle acceptance | Designated VM | PASS |
+| 75-second service plus tray quiet-I/O gate | Designated VM | PASS: 7 status writes; logs byte-stable |
+| Physical Threadripper performance comparison | Physical host | NOT REPEATED for this feature |
+
+The final Windows-native console suites passed 152 substantive tests across the
+platform, CLI, configuration, control, core, service, Settings, and tray layers.
+Zero-test GUI entry binaries were excluded from that count. The same frozen
+payload then passed installed service, crash-recovery, interactive UI, upgrade,
+uninstall, ACL, rollback, logging, and quiet-I/O acceptance.
+
+The intended timing contract is a 250 ms interactive tray sample, an
+event-driven controller wake after each authenticated pipe receipt, and a
+one-second fallback safety cadence while an exact Background rule or owned
+record exists. It is not an instantaneous or hard real-time guarantee. The
+named-pipe worker uses cancellable overlapped event waits rather than periodic
+polling.
+
+Ownership and rollback are masked independently for EcoQoS and memory priority:
+an external override relinquishes only the changed property. The Background
+master switch and both mutations remain off in the packaged defaults. The VM
+observed memory-priority inheritance, no EcoQoS inheritance in the tested
+`cmd.exe` to `ping.exe` path, and no retroactive child restore when the parent
+was restored. Process-level memory-priority restoration also does not retag
+pages already populated under a different priority. These are explicit design
+constraints, not broader rollback claims.
+
+See [Background efficiency architecture](background-efficiency-design.md) for
+the trust boundary, write-ahead journal, and per-property rollback contract.
+The final evidence is
+`tests/evidence/2026-08-26-v0.5.0-final-acceptance.md`.
 
 ## Test environments
 
 ### Windows installer and lifecycle VM
 
+- Supported product baseline: 64-bit Windows 11 22H2, build 22621 or newer
 - Windows 11 x64 (`Microsoft Windows NT 10.0.26340.0`)
 - two logical processors and two visible LLC domains
 - interactive user session for tray and Settings UI Automation
@@ -36,39 +84,42 @@ memory-contention performance gate.
 | Area | Test and scope | Environment | Result | Key evidence |
 |---|---|---|---|---|
 | Formatting | `cargo fmt --all -- --check` | WSL/Linux | PASS | No formatting diff |
-| Rust tests | Workspace unit and all-target tests | WSL/Linux | PASS | 100 tests, 0 failures |
+| Rust tests | Workspace unit and all-target tests | WSL/Linux | PASS | 104 tests, 0 failures |
 | Native lint | Workspace Clippy with `-D warnings` | WSL/Linux | PASS | No warnings |
 | Windows lint | MSVC-target workspace Clippy with `-D warnings` | WSL/xwin | PASS | No warnings |
 | Dependency audit | `cargo audit` | WSL/Linux | PASS | 383 dependencies, no vulnerability finding |
 | Windows build | Optimized x64 MSVC workspace build | WSL/xwin | PASS | Four release executables produced |
 | Compatibility import | Tray PE import scan | WSL/Linux | PASS | `TaskDialogIndirect` absent |
-| PowerShell syntax | Installer and Windows acceptance scripts | Windows PowerShell 5.1 | PASS | 23 scripts, 0 parser errors |
+| PowerShell syntax | Installer and Windows acceptance scripts | Windows PowerShell 5.1 | PASS | Full final parser sweep, 0 errors |
 | Frozen payload | `SHA256SUMS` verification | WSL/Linux and Windows VM | PASS | Every staged file matched |
 | Inno Setup | Frozen payload verification and Setup compile | Windows VM | PASS | Inno Setup 7.1.0 |
-| In-place upgrade | Final Setup 0.4.0 over all four frozen 0.3.1 EXEs | Windows VM | PASS | Configuration byte-identical; installed EXEs matched payload |
+| Frozen Setup artifact | Eleven-stage exact-SHA lifecycle/runtime suite | Windows VM | PASS | Setup `5971a182...d553`; ZIP `bc9703f3...7a17` |
+| Windows-native tests | Ten substantive test executables | Windows VM | PASS | 152 tests, 0 failures |
+| In-place upgrade | Final Setup 0.5.0 over all four frozen 0.4.0 EXEs | Windows VM | PASS | Schema-3 configuration byte-identical; installed EXEs matched payload |
 | Service state | SCM registration after upgrade | Windows VM | PASS | Running, Automatic, LocalSystem, Program Files path |
-| Controller runtime | Profiles, reserve exclusion, adaptive move, disable/enable, invalid-config fail-close, SCM recovery | Windows VM | PASS | Exact CPU Set ownership and cleanup |
-| Lifecycle | Legacy schema, normal uninstall, purge uninstall, Startup integrity | Windows VM | PASS | Preserve and purge paths verified |
+| Controller runtime | Session 0 exclusion, profiles, Background veto/restore, adaptive move, disable, invalid config, two crash recoveries | Windows VM | PASS | Exact CPU Set and per-property QoS ownership cleanup |
+| Pipe authentication | Installed tray identity plus mismatched-image negative test | Windows VM | PASS | Invalid client published no state or wake |
+| Installer rollback | Fault after SCM provisioning | Windows VM | PASS | SCM fields, state, SDDL, failure actions, config and binary hashes restored |
+| Provision receipt failure | Invalid configuration through exact final Setup | Windows VM | PASS | `ERROR` receipt, Setup exit 9, prior service and config restored |
+| Lifecycle | GUI and silent preserve/purge uninstall, final clean install | Windows VM | PASS | Data semantics, marker cleanup, shortcuts and Startup integrity verified |
 | Circular logging | Enable/disable, size limit, retention, rotation, recovery | Windows VM | PASS | Transactional reconfiguration and complete records |
 | Passive CLI diagnostic | Session 0 and interactive Session 1; privacy-safe schema 1 | Physical host and Windows VM | PASS | Bounded read-only collection |
 | Diagnostics GUI | Background worker, cancellation contract, localized results, save/cleanup | Windows VM | PASS | 40 samples; taskbar available; config unchanged |
-| Status/log cadence | 10-second heartbeat and 60-second responsiveness summary | Windows VM | PASS | 8 writes/75 s; periodic log reasons |
-| Reload receipt | Byte-identical TOML rewrite bypasses heartbeat delay | Windows VM | PASS | Receipt in 128 ms; hash unchanged |
-| Settings GUI | EN/RU pages, Diagnostics, atomic Apply, service receipt, defaults, single instance | Windows VM | PASS | AccessKit/UI Automation |
-| Settings tooltips | Real pointer hover on important controls | Windows VM | PASS | Four rendered tooltips on three pages; config unchanged |
-| Tray About | About dialog version and GitHub URL | Windows VM | PASS | Version 0.4.0 and repository URL visible |
+| Status/log cadence | 10-second heartbeat, change writes, 60-second responsiveness summary | Windows VM | PASS | 7 writes/75 s; disabled service/tray logs byte-stable |
+| Retained 0.4 diagnostic baseline | Byte-identical TOML rewrite bypasses heartbeat delay | Windows VM | PASS | Receipt in 128 ms; current schema-4 Settings reload separately passed |
+| Settings GUI | Six EN/RU configuration pages, Diagnostics, atomic Apply, service receipt, defaults, single instance | Windows VM | PASS | 27 controls/actions and 15 screenshots through AccessKit/UI Automation |
+| Settings tooltips | Real pointer hover on important controls | Windows VM | PASS | Five rendered tooltips; config unchanged |
+| Tray About | About dialog version and GitHub URL | Windows VM | PASS | Version 0.5.0 and repository URL visible |
 | GitHub action | Repository tray item | Windows VM | PASS | Enabled and exposes InvokePattern |
-| Tray status | Reserve, p99/DPC, memory width, mode | Windows VM | PASS | Live schema-3 status rows visible |
+| Tray status/control | Service/scheduling actions, reserve, latency, mode, Background status | Windows VM | PASS | Live schema-4 rows and absolute System32 Notepad actions |
 | Physical topology | Reserve, Memory, and Compute plans | Threadripper 3970X | PASS | 4 reserved cores; 28 Memory and 56 Compute CPU Sets |
 | Physical rollback | Apply and clear exact partitions | Threadripper 3970X | PASS | No CPU Set remained after controller exit |
 | Performance gate | Six-phase 48-worker, 1-GiB memory contention A/B | Threadripper 3970X | PASS | p99 improved 83.27%; throughput increased 15.10% |
 
-The controller runtime, lifecycle, circular logging, and physical Threadripper
-performance rows remain the accepted 0.3.x scheduling baseline. Version 0.4.0
-adds read-only diagnostics, lower-level WSL/system mutation protection, a
-10-second status heartbeat, and coalesced responsiveness samples. Those changes
-received separate physical-host, VM, GUI, cadence, upgrade, and frozen-artifact
-acceptance rather than inheriting broad claims from the earlier baseline.
+The physical Threadripper rows are the retained scheduling baseline from the
+earlier release and were not repeated for Background Efficiency. Version 0.5.0
+received a separate final source/native and installed-VM matrix rather than
+inheriting acceptance from that baseline.
 
 The detailed acceptance records are:
 
@@ -77,6 +128,7 @@ The detailed acceptance records are:
 - `tests/evidence/2026-08-24-logging-settings-acceptance.md`
 - `tests/evidence/2026-08-24-about-tooltips-acceptance.md`
 - `tests/evidence/2026-08-25-diagnostics-quiet-io-acceptance.md`
+- `tests/evidence/2026-08-26-v0.5.0-final-acceptance.md`
 
 ## Representative performance result
 
@@ -142,9 +194,8 @@ Run from an elevated Windows PowerShell in an interactive test session:
 
 ```powershell
 .\tests\windows\full-acceptance.ps1 `
-  -PackageDirectory .\dist\WinSched-0.4.0-windows-x64 `
-  -InteractiveUser $env:USERNAME `
-  -InstallDirectory C:\ProgramData\WinSchedAcceptance
+  -PackageDirectory .\dist\WinSched-0.5.0-windows-x64 `
+  -InteractiveUser $env:USERNAME
 ```
 
 The script creates a real interactive CPU burner, verifies profile partitions
@@ -222,7 +273,7 @@ With the tray already running in the interactive session:
 ```powershell
 .\tests\windows\tray-responsiveness-smoke.ps1 `
   -OutputDirectory C:\Users\Public\WinSchedTrayEvidence `
-  -ExpectedVersion 0.4.0
+  -ExpectedVersion 0.5.0
 ```
 
 Example accepted result:
@@ -233,7 +284,7 @@ Example accepted result:
   "about_menu_text": "About WinSched...",
   "github_menu_text": "GitHub Repository",
   "github_action_invokable": true,
-  "about_version": "0.4.0",
+  "about_version": "0.5.0",
   "about_github_url": "https://github.com/woffko/WinSched"
 }
 ```
@@ -243,14 +294,14 @@ Example accepted result:
 On Windows:
 
 ```powershell
-Get-FileHash .\WinSched-0.4.0-Setup-x64.exe -Algorithm SHA256
-Get-FileHash .\WinSched-0.4.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\WinSched-0.5.0-Setup-x64.exe -Algorithm SHA256
+Get-FileHash .\WinSched-0.5.0-windows-x64.zip -Algorithm SHA256
 ```
 
 On Linux or WSL:
 
 ```bash
-(cd dist/WinSched-0.4.0-windows-x64 && sha256sum -c SHA256SUMS)
+(cd dist/WinSched-0.5.0-windows-x64 && sha256sum -c SHA256SUMS)
 ```
 
 ## Interpretation and boundaries
@@ -269,5 +320,9 @@ On Linux or WSL:
   specific third-party fault.
 - `.wslconfig` advice is pressure-gated and read-only. It is not workload
   attribution and never edits WSL state.
+- A real low/high-memory notification transition, a live multi-user-session
+  quorum, and a real render/capture audio veto were not executed on the
+  designated VM. Native tests cover the APIs, state machines, and fail-closed
+  paths, but do not turn those environment-specific live gates into PASS rows.
 - Artifacts are intentionally unsigned. SmartScreen behavior and production
   Authenticode signing remain external release concerns.

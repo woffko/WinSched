@@ -1,4 +1,4 @@
-schema_version = 3
+schema_version = 4
 controller_mode = "observe"
 sample_interval_ms = 1000
 minimum_process_utilization_bps = 500
@@ -10,6 +10,19 @@ default_workload_profile = "balanced"
 enabled = true
 max_file_size_mib = 10
 retained_archives = 1
+
+[background_efficiency]
+enabled = false
+# Process-level policies stay opt-in for known leaf workloads. Native acceptance
+# observed memory priority propagating to children created by a tagged parent.
+eco_qos_enabled = false
+# Parent rollback cannot retroactively restore a live child, and restoring the
+# process default cannot retag pages populated in the interim.
+memory_priority_enabled = false
+memory_pressure_guard_enabled = true
+protect_foreground = true
+protect_visible = true
+protect_audio = true
 
 [responsiveness]
 enabled = false
@@ -39,3 +52,10 @@ max_mutations_per_evaluation = 1
 image = "winsched.exe"
 mode = "auto"
 profile = "balanced"
+
+# Background efficiency is applied only to an exact rule with profile = "background".
+# Keep interactive applications and VM/WSL hosts out unless you have tested the workload.
+# [[rules]]
+# image = "renderer.exe"
+# mode = "auto"
+# profile = "background"

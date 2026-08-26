@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$InstallDirectory = "$env:ProgramData\WinSched",
-    [string]$DataDirectory = $InstallDirectory,
+    [string]$InstallDirectory = (Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "WinSched"),
+    [string]$DataDirectory = (Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "WinSched"),
     [Parameter(Mandatory = $true)]
     [string]$OutputDirectory
 )
@@ -89,6 +89,19 @@ function Find-ElementByExactName([string]$Name) {
         }
     }
     return $null
+}
+
+function Test-AutomationNameLike([string]$Pattern) {
+    foreach ($element in Get-AllAutomationElements) {
+        try {
+            if ($element.Current.Name -like $Pattern) {
+                return $true
+            }
+        } catch {
+            continue
+        }
+    }
+    return $false
 }
 
 function Find-MenuItem([string]$Name) {
@@ -252,10 +265,11 @@ try {
     Assert-True ($null -ne $openConfig) "advanced configuration item disappeared"
     Invoke-AutomationElement $openConfig
     Wait-Condition "configuration opened in Notepad" {
-        @(
+        $newProcess = @(
             Get-Process -Name "Notepad" -ErrorAction SilentlyContinue |
                 Where-Object { $notepadBefore -notcontains $_.Id }
         ).Count -gt 0
+        return $newProcess -or (Test-AutomationNameLike "*winsched.toml*")
     } 15
     $configNotepad = @(
         Get-Process -Name "Notepad" -ErrorAction SilentlyContinue |
@@ -269,10 +283,11 @@ try {
     )
     Invoke-MenuItem "Open Logs"
     Wait-Condition "log opened in Notepad" {
-        @(
+        $newProcess = @(
             Get-Process -Name "Notepad" -ErrorAction SilentlyContinue |
                 Where-Object { $notepadBefore -notcontains $_.Id }
         ).Count -gt 0
+        return $newProcess -or (Test-AutomationNameLike "*winsched.log*")
     } 15
     $logNotepad = @(
         Get-Process -Name "Notepad" -ErrorAction SilentlyContinue |

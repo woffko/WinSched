@@ -51,6 +51,7 @@ pub struct MenuModel {
     pub managed: String,
     pub reserve: String,
     pub latency: String,
+    pub background: String,
     pub activity: String,
     pub error: String,
     pub tooltip: String,
@@ -80,6 +81,10 @@ pub fn build_menu_model(
     let managed = status.map_or(0, |status| status.managed_processes);
     let reserve = status.map_or_else(|| "System reserve: unavailable".to_owned(), reserve_label);
     let latency = status.map_or_else(|| "Latency guard: unavailable".to_owned(), latency_label);
+    let background = status.map_or_else(
+        || "Background QoS: unavailable".to_owned(),
+        background_efficiency_label,
+    );
     let activity = status
         .and_then(|status| status.last_activity.as_deref())
         .map_or_else(
@@ -116,6 +121,7 @@ pub fn build_menu_model(
         managed: format!("Managed processes: {managed}"),
         reserve,
         latency,
+        background,
         activity,
         error: format!(
             "Last error: {}",
@@ -161,6 +167,30 @@ fn latency_label(status: &ControllerStatus) -> String {
         status.maximum_dpc_time_bps % 100,
         if memory_cores == 1 { "core" } else { "cores" },
         pressure_label(status.responsiveness_pressure),
+    )
+}
+
+fn background_efficiency_label(status: &ControllerStatus) -> String {
+    if !status.applied_background_efficiency.enabled {
+        return "Background QoS: disabled".to_owned();
+    }
+    let background = &status.background_efficiency;
+    let sensors = if background.required_probe_sessions == 0
+        || background.interactive_probe_sessions >= background.required_probe_sessions
+    {
+        "sensors ready"
+    } else {
+        "sensors missing"
+    };
+    format!(
+        "Background QoS: {} active / {} protected; memory {}; {sensors}",
+        background.managed_processes,
+        background.protected_processes,
+        if background.low_memory_condition {
+            "low"
+        } else {
+            "normal"
+        }
     )
 }
 
@@ -221,8 +251,12 @@ fn menu_text(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winsched_config::{ControllerConfig, LoggingConfig, ResponsivenessConfig};
-    use winsched_control::{ConfigReloadResult, ControllerStatus, STATUS_SCHEMA_VERSION};
+    use winsched_config::{
+        BackgroundEfficiencyConfig, ControllerConfig, LoggingConfig, ResponsivenessConfig,
+    };
+    use winsched_control::{
+        BackgroundEfficiencyStatus, ConfigReloadResult, ControllerStatus, STATUS_SCHEMA_VERSION,
+    };
     use winsched_core::responsiveness::ResponsivenessPressure;
     use winsched_core::{PhysicalCoreKey, SystemReservePlan, latency::SchedulerLatencyStatus};
 
@@ -242,7 +276,9 @@ mod tests {
             config_reload_error: None,
             applied_config_fingerprint: ControllerConfig::default().fingerprint(),
             applied_logging: LoggingConfig::default(),
+            applied_background_efficiency: BackgroundEfficiencyConfig::default(),
             applied_responsiveness: ResponsivenessConfig::default(),
+            background_efficiency: BackgroundEfficiencyStatus::default(),
             system_reserve: SystemReservePlan::default(),
             scheduler_latency: SchedulerLatencyStatus::default(),
             maximum_dpc_time_bps: 0,
@@ -281,6 +317,12 @@ mod tests {
         status.scheduler_latency.enabled = true;
         status.scheduler_latency.p99_lateness_us = 750;
         status.maximum_dpc_time_bps = 125;
+        status.applied_background_efficiency.enabled = true;
+        status.applied_background_efficiency.memory_priority_enabled = true;
+        status.background_efficiency.managed_processes = 2;
+        status.background_efficiency.protected_processes = 1;
+        status.background_efficiency.required_probe_sessions = 1;
+        status.background_efficiency.interactive_probe_sessions = 1;
         let model = build_menu_model(&ServiceViewState::Running, Some(&status), None);
         assert_eq!(model.scheduling_action, "Disable Scheduling");
         assert!(model.scheduling_action_enabled);
@@ -291,6 +333,10 @@ mod tests {
         assert_eq!(
             model.latency,
             "Latency: p99 750 us / DPC 1.25% / memory 28 cores (unknown)"
+        );
+        assert_eq!(
+            model.background,
+            "Background QoS: 2 active / 1 protected; memory normal; sensors ready"
         );
     }
 

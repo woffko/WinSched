@@ -30,18 +30,24 @@ mod app {
     use std::cmp::Reverse;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::{OsStr, OsString};
-    use std::fs::{self, File, OpenOptions};
+    use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::num::NonZeroU16;
+    use std::os::windows::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
     use std::process::Command as ProcessCommand;
-    use std::sync::{OnceLock, mpsc};
+    use std::sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use clap::{Parser, Subcommand};
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
     use thiserror::Error;
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
     use windows_service::Error as WindowsServiceError;
     use windows_service::define_windows_service;
     use windows_service::service::{
@@ -53,11 +59,15 @@ mod app {
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_dispatcher;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
-    use winsched::platform::{self, MutationReport};
+    use winsched::platform::{
+        self, MutationReport, ProcessEcoQosState, ProcessEfficiencyOwnership,
+        ProcessEfficiencyState, ProcessMemoryPriority,
+    };
     use winsched_config::{ControllerConfig, ControllerMode, LoggingConfig, WorkloadProfile};
     use winsched_control::{
-        CONFIG_FILE_NAME, CONTROL_DISABLE, CONTROL_ENABLE, ConfigReloadResult, ControllerPhase,
-        ControllerStatus, INSTALL_DIRECTORY_NAME, LOG_FILE_NAME, MANAGED_STATE_FILE_NAME,
+        BACKGROUND_STATE_FILE_NAME, BackgroundEfficiencyStatus, CONFIG_FILE_NAME, CONTROL_DISABLE,
+        CONTROL_ENABLE, ConfigReloadResult, ControllerPhase, ControllerStatus,
+        INSTALL_DIRECTORY_NAME, InteractiveActivityState, LOG_FILE_NAME, MANAGED_STATE_FILE_NAME,
         RUNTIME_SCHEMA_VERSION, RUNTIME_STATE_FILE_NAME, RuntimeState, SERVICE_NAME,
         STATUS_FILE_NAME,
     };
@@ -77,6 +87,8 @@ mod app {
     const LATENCY_PROBE_WINDOW_SAMPLES: usize = 6_000;
     const LEGACY_STATE_SCHEMA_VERSION: u32 = 1;
     const STATE_SCHEMA_VERSION: u32 = 2;
+    const BACKGROUND_STATE_SCHEMA_VERSION: u32 = 2;
+    const BACKGROUND_SAFETY_INTERVAL: Duration = Duration::from_secs(1);
     const INTERACTIVE_SERVICE_SDDL: &str = concat!(
         "D:",
         "(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)",
@@ -107,6 +119,51 @@ mod app {
     }
 
     type ManagedAssignments = BTreeMap<ProcessKey, ManagedPlacement>;
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BackgroundStateFile {
+        schema_version: u32,
+        processes: Vec<ManagedBackgroundProcess>,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct ManagedBackgroundProcess {
+        key: ProcessKey,
+        original: ProcessEfficiencyState,
+        applied: ProcessEfficiencyState,
+        #[serde(default)]
+        ownership: ProcessEfficiencyOwnership,
+        #[serde(default)]
+        pending: Option<ProcessEfficiencyState>,
+        #[serde(default)]
+        pending_ownership: Option<ProcessEfficiencyOwnership>,
+        #[serde(default)]
+        blocked_by_external_override: ProcessEfficiencyOwnership,
+    }
+
+    type ManagedBackground = BTreeMap<ProcessKey, ManagedBackgroundProcess>;
+
+    #[derive(Debug, Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyBackgroundStateFile {
+        #[serde(rename = "schema_version")]
+        _schema_version: u32,
+        processes: Vec<LegacyManagedBackgroundProcess>,
+    }
+
+    #[derive(Debug, Clone, Copy, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyManagedBackgroundProcess {
+        key: ProcessKey,
+        original: ProcessEfficiencyState,
+        applied: ProcessEfficiencyState,
+        #[serde(default)]
+        pending: Option<ProcessEfficiencyState>,
+        #[serde(default)]
+        blocked_by_external_override: bool,
+    }
 
     #[derive(Debug, Default, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -147,6 +204,8 @@ mod app {
     struct ControllerFiles<'a> {
         config: Option<&'a Path>,
         managed_state: Option<&'a Path>,
+        background_state: Option<&'a Path>,
+        tray_binary: Option<&'a Path>,
         runtime_state: Option<&'a Path>,
         status: Option<&'a Path>,
     }
@@ -179,6 +238,8 @@ mod app {
             #[arg(long)]
             config: PathBuf,
             #[arg(long)]
+            data_directory: Option<PathBuf>,
+            #[arg(long)]
             start: bool,
             #[arg(long)]
             allow_auto: bool,
@@ -200,13 +261,20 @@ mod app {
             start: bool,
             #[arg(long)]
             allow_auto: bool,
+            #[arg(long, hide = true)]
+            test_fail_after_change: bool,
+            #[arg(long)]
+            result_file: Option<PathBuf>,
         },
         Start,
         Stop,
         Enable,
         Disable,
         Status,
-        Uninstall,
+        Uninstall {
+            #[arg(long)]
+            data_directory: Option<PathBuf>,
+        },
     }
 
     #[derive(Debug, Error)]
@@ -227,16 +295,20 @@ mod app {
         Json(#[from] serde_json::Error),
         #[error("unsupported managed-state schema {0}")]
         StateSchema(u32),
+        #[error("invalid background-state journal: {0}")]
+        InvalidBackgroundState(&'static str),
         #[error("unsupported runtime-state schema {0}")]
         RuntimeStateSchema(u32),
         #[error("controller_mode=auto requires explicit --allow-auto during installation")]
         AutoNeedsConfirmation,
         #[error("service configuration path was not initialized")]
         MissingServiceConfig,
-        #[error("failed to clear {0} managed CPU Set assignment(s)")]
+        #[error("failed to restore {0} managed process state record(s)")]
         CleanupIncomplete(usize),
         #[error("service did not stop before the 20-second timeout")]
         ServiceStopTimeout,
+        #[error("service stopped after a controller failure: {0}")]
+        ServiceStoppedWithError(String),
         #[error("service did not reach Running before the 20-second timeout")]
         ServiceStartTimeout,
         #[error("service registration did not disappear before the 20-second timeout")]
@@ -253,6 +325,8 @@ mod app {
             operation: Box<ServiceError>,
             recovery: String,
         },
+        #[error("injected provisioning failure after service configuration change")]
+        InjectedProvisionFailure,
         #[error("{program} failed with exit code {exit_code:?}: {stderr}")]
         CommandFailed {
             program: &'static str,
@@ -296,6 +370,7 @@ mod app {
                     },
                     None,
                     Some(iterations.get()),
+                    None,
                     &mut logger,
                 )
             }
@@ -308,9 +383,10 @@ mod app {
             }
             Command::Install {
                 config,
+                data_directory,
                 start,
                 allow_auto,
-            } => install(&config, start, allow_auto),
+            } => install(&config, data_directory.as_deref(), start, allow_auto),
             Command::Register {
                 config,
                 start,
@@ -320,13 +396,32 @@ mod app {
                 config,
                 start,
                 allow_auto,
-            } => provision_in_place(&config, start, allow_auto),
+                test_fail_after_change,
+                result_file,
+            } => {
+                let result = provision_in_place(&config, start, allow_auto, test_fail_after_change);
+                if let Some(path) = result_file {
+                    let receipt = match &result {
+                        Ok(()) => "SUCCESS\n".to_owned(),
+                        Err(error) => format!("ERROR: {error}\n"),
+                    };
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    if let Err(receipt_error) = atomic_write(&path, receipt.as_bytes())
+                        && result.is_ok()
+                    {
+                        return Err(receipt_error.into());
+                    }
+                }
+                result
+            }
             Command::Start => start(),
             Command::Stop => stop(),
             Command::Enable => set_scheduling(true),
             Command::Disable => set_scheduling(false),
             Command::Status => status(),
-            Command::Uninstall => uninstall(),
+            Command::Uninstall { data_directory } => uninstall(data_directory.as_deref()),
         }
     }
 
@@ -352,6 +447,7 @@ mod app {
 
     fn run_service(config_path: &Path) -> Result<(), ServiceError> {
         let (control_tx, control_rx) = mpsc::channel();
+        let interactive_wake_tx = control_tx.clone();
         let event_handler = move |event| -> ServiceControlHandlerResult {
             match event {
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -373,30 +469,71 @@ mod app {
         let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
         status_handle.set_service_status(service_status(ServiceState::StartPending, 0))?;
 
-        let config = load_config(config_path)?;
         let install_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
         let log_path = install_dir.join(LOG_FILE_NAME);
         let managed_state_path = install_dir.join(MANAGED_STATE_FILE_NAME);
+        let background_state_path = install_dir.join(BACKGROUND_STATE_FILE_NAME);
         let runtime_state_path = install_dir.join(RUNTIME_STATE_FILE_NAME);
         let status_path = install_dir.join(STATUS_FILE_NAME);
-        let mut logger = EventLogger::service(log_path, config.logging)?;
-        status_handle.set_service_status(service_status(ServiceState::Running, 0))?;
+        let fail_start = |operation: ServiceError| {
+            let result = match cleanup_persisted_state(install_dir) {
+                Ok(()) => Err(operation),
+                Err(recovery) => Err(ServiceError::TransactionRecovery {
+                    operation: Box::new(operation),
+                    recovery: recovery.to_string(),
+                }),
+            };
+            let _ = status_handle.set_service_status(service_status(ServiceState::Stopped, 1));
+            result
+        };
+        let config = match load_config(config_path) {
+            Ok(config) => config,
+            Err(error) => return fail_start(error),
+        };
+        let tray_binary_path = match std::env::current_exe() {
+            Ok(path) => path
+                .parent()
+                .unwrap_or(install_dir)
+                .join("winsched-tray.exe"),
+            Err(error) => return fail_start(ServiceError::Io(error)),
+        };
+        let mut logger = match EventLogger::service(log_path, config.logging) {
+            Ok(logger) => logger,
+            Err(error) => {
+                let detail = format!("service log initialization failed: {error}");
+                let _ = emergency_log(&detail);
+                return fail_start(ServiceError::Io(error));
+            }
+        };
+        if let Err(error) =
+            status_handle.set_service_status(service_status(ServiceState::Running, 0))
+        {
+            return fail_start(error.into());
+        }
 
         let result = run_controller(
             config,
             ControllerFiles {
                 config: Some(config_path),
                 managed_state: Some(&managed_state_path),
+                background_state: Some(&background_state_path),
+                tray_binary: Some(&tray_binary_path),
                 runtime_state: Some(&runtime_state_path),
                 status: Some(&status_path),
             },
             Some(&control_rx),
             None,
+            Some(interactive_wake_tx),
             &mut logger,
         );
         let exit_code = u32::from(result.is_err());
-        status_handle.set_service_status(service_status(ServiceState::Stopped, exit_code))?;
-        result
+        let status_result = status_handle
+            .set_service_status(service_status(ServiceState::Stopped, exit_code))
+            .map_err(ServiceError::from);
+        match (result, status_result) {
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     fn service_status(state: ServiceState, exit_code: u32) -> ServiceStatus {
@@ -415,35 +552,172 @@ mod app {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn recover_controller_initialization<T>(
+        result: Result<T, ServiceError>,
+        logger: &mut EventLogger,
+        managed: &mut ManagedAssignments,
+        managed_state_path: Option<&Path>,
+        background: &mut ManagedBackground,
+        background_state_path: Option<&Path>,
+    ) -> Result<T, ServiceError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let placement = cleanup_managed(logger, managed, managed_state_path);
+                let efficiency = cleanup_background(logger, background, background_state_path);
+                match (placement, efficiency) {
+                    (Ok(placement), Ok(efficiency))
+                        if placement.failed == 0 && efficiency.failed == 0 =>
+                    {
+                        Err(error)
+                    }
+                    (placement, efficiency) => Err(ServiceError::TransactionRecovery {
+                        operation: Box::new(error),
+                        recovery: format!(
+                            "ownership cleanup after initialization failure: placement={placement:?}, background={efficiency:?}"
+                        ),
+                    }),
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn run_controller(
         mut config: ControllerConfig,
         files: ControllerFiles<'_>,
         control: Option<&mpsc::Receiver<ControllerCommand>>,
         max_iterations: Option<u16>,
+        interactive_wake_tx: Option<mpsc::Sender<ControllerCommand>>,
         logger: &mut EventLogger,
     ) -> Result<(), ServiceError> {
-        let topology = platform::system_topology()?;
+        let managed_result = files
+            .managed_state
+            .map_or_else(|| Ok(BTreeMap::new()), load_managed_state);
+        let background_result = files
+            .background_state
+            .map_or_else(|| Ok(BTreeMap::new()), load_background_state);
+        let (mut managed, mut managed_background) = match (managed_result, background_result) {
+            (Ok(managed), Ok(background)) => (managed, background),
+            (Ok(mut managed), Err(error)) => {
+                return match cleanup_managed(logger, &mut managed, files.managed_state) {
+                    Ok(report) if report.failed == 0 => Err(error),
+                    cleanup => Err(ServiceError::TransactionRecovery {
+                        operation: Box::new(error),
+                        recovery: format!(
+                            "placement cleanup after background journal load failure: {cleanup:?}"
+                        ),
+                    }),
+                };
+            }
+            (Err(error), Ok(mut background)) => {
+                return match cleanup_background(logger, &mut background, files.background_state) {
+                    Ok(report) if report.failed == 0 => Err(error),
+                    cleanup => Err(ServiceError::TransactionRecovery {
+                        operation: Box::new(error),
+                        recovery: format!(
+                            "background cleanup after placement journal load failure: {cleanup:?}"
+                        ),
+                    }),
+                };
+            }
+            (Err(error), Err(_)) => return Err(error),
+        };
+        let mut runtime = recover_controller_initialization(
+            files.runtime_state.map_or_else(
+                || Ok(RuntimeState::for_controller_mode(config.controller_mode)),
+                |path| load_runtime_state(path, config.controller_mode),
+            ),
+            logger,
+            &mut managed,
+            files.managed_state,
+            &mut managed_background,
+            files.background_state,
+        )?;
+        let topology = recover_controller_initialization(
+            platform::system_topology().map_err(ServiceError::from),
+            logger,
+            &mut managed,
+            files.managed_state,
+            &mut managed_background,
+            files.background_state,
+        )?;
         let mut reserve_plan = system_reserve_plan(&topology, &config);
         let mut placement_topology = topology.excluding_reserved_cpu_sets(&reserve_plan);
-        let mut sampler = platform::LoadSampler::new(&topology)?;
-        let mut engine = PolicyEngine::new(config.policy)?;
-        let latency_probe = SchedulerLatencyProbe::start(
-            config.responsiveness.enabled && config.responsiveness.latency_guard_enabled,
-            LATENCY_PROBE_INTERVAL,
-            LATENCY_PROBE_WINDOW_SAMPLES,
+        let mut sampler = recover_controller_initialization(
+            platform::LoadSampler::new(&topology).map_err(ServiceError::from),
+            logger,
+            &mut managed,
+            files.managed_state,
+            &mut managed_background,
+            files.background_state,
+        )?;
+        let mut engine = recover_controller_initialization(
+            PolicyEngine::new(config.policy).map_err(ServiceError::from),
+            logger,
+            &mut managed,
+            files.managed_state,
+            &mut managed_background,
+            files.background_state,
+        )?;
+        let latency_probe = recover_controller_initialization(
+            SchedulerLatencyProbe::start(
+                config.responsiveness.enabled && config.responsiveness.latency_guard_enabled,
+                LATENCY_PROBE_INTERVAL,
+                LATENCY_PROBE_WINDOW_SAMPLES,
+            )
+            .map_err(ServiceError::from),
+            logger,
+            &mut managed,
+            files.managed_state,
+            &mut managed_background,
+            files.background_state,
         )?;
         let mut width_controller =
             AdaptiveWidthController::new(adaptive_width_config(&config, &placement_topology));
-        let mut managed = files
-            .managed_state
-            .map_or_else(|| Ok(BTreeMap::new()), load_managed_state)?;
-        let mut runtime = files.runtime_state.map_or_else(
-            || Ok(RuntimeState::for_controller_mode(config.controller_mode)),
-            |path| load_runtime_state(path, config.controller_mode),
-        )?;
+        let interactive_wake_pending = Arc::new(AtomicBool::new(false));
+        let interactive_wake_enabled = Arc::new(AtomicBool::new(
+            managed_background
+                .values()
+                .any(|record| !record.ownership.is_empty()),
+        ));
+        let interactive_wake = interactive_wake_tx.map(|sender| {
+            let pending = Arc::clone(&interactive_wake_pending);
+            let enabled = Arc::clone(&interactive_wake_enabled);
+            Arc::new(move || {
+                if enabled.load(Ordering::Acquire) {
+                    request_interactive_wake(&sender, &pending);
+                }
+            }) as platform::InteractiveStateWake
+        });
+        let interactive_server = files.tray_binary.and_then(|path| {
+            match platform::InteractiveStateServer::start(path, interactive_wake) {
+                Ok(server) => Some(server),
+                Err(error) => {
+                    logger.emit(json!({
+                        "event": "interactive_probe_server_unavailable",
+                        "error": error.to_string(),
+                    }));
+                    None
+                }
+            }
+        });
+        let memory_pressure_monitor = match platform::MemoryPressureMonitor::new() {
+            Ok(monitor) => Some(monitor),
+            Err(error) => {
+                logger.emit(json!({
+                    "event": "memory_pressure_monitor_unavailable",
+                    "error": error.to_string(),
+                }));
+                None
+            }
+        };
+        let mut background_clear_streaks = BTreeMap::<ProcessKey, u8>::new();
         let mut previous_cpu_times = BTreeMap::<ProcessKey, u64>::new();
+        let mut last_low_memory = None;
         let started = Instant::now();
+        let mut last_policy_evaluation = Instant::now();
         let mut iteration = 0u64;
         let mut status_publish_gate = StatusPublishGate::default();
         let mut responsiveness_log_gate = ResponsivenessLogGate::default();
@@ -466,32 +740,165 @@ mod app {
         status.scheduler_latency = latency_probe.status();
         status.memory_profile_physical_cores = width_controller.current_physical_cores();
         status.responsiveness_pressure = width_controller.pressure();
-        if !controller_mutations_active(&config, &runtime) {
-            let cleanup = cleanup_managed(logger, &mut managed, files.managed_state)?;
-            status.last_error = cleanup_error(cleanup);
-        }
-        status.managed_processes = managed.len();
-        publish_controller_status(&mut status_publish_gate, files.status, &mut status, 0, true)?;
-        sampler.prime()?;
-        logger.emit(json!({
-            "event": "controller_started",
-            "controller_mode": config.controller_mode,
-            "scheduling_enabled": runtime.scheduling_enabled,
-            "llc_domains": topology.llc_domains.len(),
-            "physical_cores": reserve_plan.physical_core_count,
-            "reserved_physical_cores": reserve_plan.reserved_physical_cores,
-            "reserved_cpu_sets": reserve_plan.reserved_cpu_set_ids,
-            "rules": config.rules.len(),
-        }));
+        let loop_result: Result<(), ServiceError> = (|| {
+            if !controller_mutations_active(&config, &runtime) {
+                let cleanup = cleanup_managed(logger, &mut managed, files.managed_state)?;
+                let background_cleanup =
+                    cleanup_background(logger, &mut managed_background, files.background_state)?;
+                if let Some(error) = combined_cleanup_error(cleanup, background_cleanup) {
+                    status.last_error = Some(error);
+                }
+            }
+            status.managed_processes = managed.len();
+            status.background_efficiency.managed_processes = managed_background.len();
+            publish_controller_status(
+                &mut status_publish_gate,
+                files.status,
+                &mut status,
+                0,
+                true,
+            )?;
+            sampler.prime()?;
+            logger.emit(json!({
+                "event": "controller_started",
+                "controller_mode": config.controller_mode,
+                "scheduling_enabled": runtime.scheduling_enabled,
+                "llc_domains": topology.llc_domains.len(),
+                "physical_cores": reserve_plan.physical_core_count,
+                "reserved_physical_cores": reserve_plan.reserved_physical_cores,
+                "reserved_cpu_sets": reserve_plan.reserved_cpu_set_ids,
+                "rules": config.rules.len(),
+                "background_efficiency": config.background_efficiency,
+            }));
 
-        let loop_result: Result<(), ServiceError> = loop {
-            let interval = Duration::from_millis(config.sample_interval_ms);
-            let command = wait_for_command(control, interval);
-            let evaluation_time_ms = controller_elapsed_ms(started);
-            match command {
-                ControllerCommand::Stop => {
-                    status.phase = ControllerPhase::Stopping;
-                    status.scheduler_latency = latency_probe.status();
+            loop {
+                interactive_wake_enabled.store(
+                    managed_background
+                        .values()
+                        .any(|record| !record.ownership.is_empty()),
+                    Ordering::Release,
+                );
+                let interval = controller_wait_interval(
+                    &config,
+                    &runtime,
+                    &managed_background,
+                    last_policy_evaluation,
+                );
+                let command = wait_for_command(control, interval);
+                if command == ControllerCommand::Tick {
+                    interactive_wake_pending.store(false, Ordering::Release);
+                }
+                let evaluation_time_ms = controller_elapsed_ms(started);
+                match command {
+                    ControllerCommand::Stop => {
+                        status.phase = ControllerPhase::Stopping;
+                        status.scheduler_latency = latency_probe.status();
+                        publish_controller_status(
+                            &mut status_publish_gate,
+                            files.status,
+                            &mut status,
+                            evaluation_time_ms,
+                            true,
+                        )?;
+                        break Ok(());
+                    }
+                    ControllerCommand::Enable => {
+                        set_runtime_enabled(
+                            true,
+                            &mut runtime,
+                            files.runtime_state,
+                            &mut engine,
+                            config.policy,
+                            &mut previous_cpu_times,
+                            logger,
+                        )?;
+                        status.scheduling_enabled = true;
+                        status.phase = ControllerPhase::Running;
+                        status.last_activity =
+                            Some("Scheduling enabled from tray or CLI".to_owned());
+                        status.last_error = None;
+                        status.scheduler_latency = latency_probe.status();
+                        publish_controller_status(
+                            &mut status_publish_gate,
+                            files.status,
+                            &mut status,
+                            evaluation_time_ms,
+                            true,
+                        )?;
+                        continue;
+                    }
+                    ControllerCommand::Disable => {
+                        set_runtime_enabled(
+                            false,
+                            &mut runtime,
+                            files.runtime_state,
+                            &mut engine,
+                            config.policy,
+                            &mut previous_cpu_times,
+                            logger,
+                        )?;
+                        let cleanup = cleanup_managed(logger, &mut managed, files.managed_state)?;
+                        let background_cleanup = cleanup_background(
+                            logger,
+                            &mut managed_background,
+                            files.background_state,
+                        )?;
+                        background_clear_streaks.clear();
+                        status.scheduling_enabled = false;
+                        status.phase = ControllerPhase::Disabled;
+                        status.managed_processes = managed.len();
+                        status.background_efficiency.managed_processes = managed_background.len();
+                        status.last_activity = Some(
+                            if cleanup.failed == 0 && background_cleanup.failed == 0 {
+                                "Scheduling disabled; managed assignments and background policies cleared"
+                            .to_owned()
+                            } else {
+                                format!(
+                                    "Scheduling disabled; {} CPU assignment(s) and {} background policy(s) await cleanup retry",
+                                    cleanup.failed, background_cleanup.failed
+                                )
+                            },
+                        );
+                        status.last_error = combined_cleanup_error(cleanup, background_cleanup);
+                        status.scheduler_latency = latency_probe.status();
+                        publish_controller_status(
+                            &mut status_publish_gate,
+                            files.status,
+                            &mut status,
+                            evaluation_time_ms,
+                            true,
+                        )?;
+                        continue;
+                    }
+                    ControllerCommand::Tick => {}
+                }
+                let reload = reload_config_if_changed(
+                    files.config,
+                    &mut config_modified,
+                    &mut config,
+                    &mut engine,
+                    &mut managed,
+                    files.managed_state,
+                    logger,
+                )?;
+                if !matches!(&reload, ConfigReload::Unchanged) {
+                    reserve_plan = system_reserve_plan(&topology, &config);
+                    placement_topology = topology.excluding_reserved_cpu_sets(&reserve_plan);
+                    latency_probe.set_enabled(
+                        config.responsiveness.enabled
+                            && config.responsiveness.latency_guard_enabled,
+                    );
+                    width_controller
+                        .reconfigure(adaptive_width_config(&config, &placement_topology));
+                }
+                status.scheduler_latency = latency_probe.status();
+                status.memory_profile_physical_cores = width_controller.current_physical_cores();
+                status.responsiveness_pressure = width_controller.pressure();
+                if let Some(event) =
+                    apply_reload_status(&mut status, &config, &reserve_plan, reload)
+                {
+                    // This status receipt is authoritative for Settings and must reach disk before
+                    // any optional event-log write or rotation can fail.
                     publish_controller_status(
                         &mut status_publish_gate,
                         files.status,
@@ -499,108 +906,247 @@ mod app {
                         evaluation_time_ms,
                         true,
                     )?;
-                    break Ok(());
+                    logger.emit(event);
                 }
-                ControllerCommand::Enable => {
-                    set_runtime_enabled(
-                        true,
-                        &mut runtime,
-                        files.runtime_state,
-                        &mut engine,
-                        config.policy,
-                        &mut previous_cpu_times,
-                        logger,
-                    )?;
-                    status.scheduling_enabled = true;
-                    status.phase = ControllerPhase::Running;
-                    status.last_activity = Some("Scheduling enabled from tray or CLI".to_owned());
-                    status.last_error = None;
-                    status.scheduler_latency = latency_probe.status();
-                    publish_controller_status(
-                        &mut status_publish_gate,
-                        files.status,
-                        &mut status,
-                        evaluation_time_ms,
-                        true,
-                    )?;
-                    continue;
-                }
-                ControllerCommand::Disable => {
-                    set_runtime_enabled(
-                        false,
-                        &mut runtime,
-                        files.runtime_state,
-                        &mut engine,
-                        config.policy,
-                        &mut previous_cpu_times,
-                        logger,
-                    )?;
+                if !controller_evaluation_active(&config, &runtime) {
+                    let prior_error = status.last_error.clone();
                     let cleanup = cleanup_managed(logger, &mut managed, files.managed_state)?;
-                    status.scheduling_enabled = false;
+                    let background_cleanup = cleanup_background(
+                        logger,
+                        &mut managed_background,
+                        files.background_state,
+                    )?;
+                    background_clear_streaks.clear();
                     status.phase = ControllerPhase::Disabled;
                     status.managed_processes = managed.len();
-                    status.last_activity = Some(if cleanup.failed == 0 {
-                        "Scheduling disabled; managed assignments cleared".to_owned()
-                    } else {
-                        format!(
-                            "Scheduling disabled; {} assignment(s) await cleanup retry",
-                            cleanup.failed
-                        )
-                    });
-                    status.last_error = cleanup_error(cleanup);
-                    status.scheduler_latency = latency_probe.status();
+                    status.background_efficiency.managed_processes = managed_background.len();
+                    status.last_error = combined_cleanup_error(cleanup, background_cleanup);
+                    iteration = iteration.saturating_add(1);
+                    status.iteration = iteration;
+                    let important_status_change = status.last_error != prior_error;
                     publish_controller_status(
                         &mut status_publish_gate,
                         files.status,
                         &mut status,
                         evaluation_time_ms,
-                        true,
+                        important_status_change,
+                    )?;
+                    if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
+                        break Ok(());
+                    }
+                    continue;
+                }
+                let policy_elapsed = last_policy_evaluation.elapsed();
+                let configured_policy_interval = Duration::from_millis(config.sample_interval_ms);
+                if policy_elapsed < configured_policy_interval {
+                    let status_error_before_guard = status.last_error.clone();
+                    let tick = run_background_safety_tick(
+                        &config,
+                        &runtime,
+                        &topology,
+                        interactive_server.as_ref(),
+                        memory_pressure_monitor.as_ref(),
+                        &mut last_low_memory,
+                        &mut previous_cpu_times,
+                        &mut background_clear_streaks,
+                        &mut managed,
+                        files.managed_state,
+                        &mut managed_background,
+                        files.background_state,
+                        &mut status,
+                        logger,
+                    )?;
+                    status.managed_processes = managed.len();
+                    status.phase = ControllerPhase::Running;
+                    status.scheduler_latency = latency_probe.status();
+                    let important_status_change = status.last_error != status_error_before_guard
+                        || status.background_efficiency != tick.prior_status;
+                    publish_controller_status(
+                        &mut status_publish_gate,
+                        files.status,
+                        &mut status,
+                        evaluation_time_ms,
+                        important_status_change,
                     )?;
                     continue;
                 }
-                ControllerCommand::Tick => {}
-            }
-            let reload = reload_config_if_changed(
-                files.config,
-                &mut config_modified,
-                &mut config,
-                &mut engine,
-                &mut managed,
-                files.managed_state,
-                logger,
-            )?;
-            if !matches!(&reload, ConfigReload::Unchanged) {
-                reserve_plan = system_reserve_plan(&topology, &config);
-                placement_topology = topology.excluding_reserved_cpu_sets(&reserve_plan);
-                latency_probe.set_enabled(
-                    config.responsiveness.enabled && config.responsiveness.latency_guard_enabled,
-                );
-                width_controller.reconfigure(adaptive_width_config(&config, &placement_topology));
-            }
-            status.scheduler_latency = latency_probe.status();
-            status.memory_profile_physical_cores = width_controller.current_physical_cores();
-            status.responsiveness_pressure = width_controller.pressure();
-            if let Some(event) = apply_reload_status(&mut status, &config, &reserve_plan, reload) {
-                // This status receipt is authoritative for Settings and must reach disk before
-                // any optional event-log write or rotation can fail.
-                publish_controller_status(
-                    &mut status_publish_gate,
-                    files.status,
-                    &mut status,
+                last_policy_evaluation = Instant::now();
+                let effective_sample_interval_ms =
+                    u64::try_from(policy_elapsed.as_millis()).unwrap_or(u64::MAX);
+                let loads = match sampler.sample() {
+                    Ok(loads) => loads,
+                    Err(error) => {
+                        let detail = format!("Load telemetry sample skipped: {error}");
+                        status.last_activity = Some("Load telemetry sample skipped".to_owned());
+                        status.last_error = Some(detail.clone());
+                        status.scheduler_latency = latency_probe.status();
+                        logger.emit(json!({
+                            "event": "load_sample_skipped",
+                            "error": error.to_string(),
+                        }));
+                        if let Ok(mut replacement) = platform::LoadSampler::new(&topology)
+                            && replacement.prime().is_ok()
+                        {
+                            sampler = replacement;
+                        }
+                        let _ = run_background_safety_tick(
+                            &config,
+                            &runtime,
+                            &topology,
+                            interactive_server.as_ref(),
+                            memory_pressure_monitor.as_ref(),
+                            &mut last_low_memory,
+                            &mut previous_cpu_times,
+                            &mut background_clear_streaks,
+                            &mut managed,
+                            files.managed_state,
+                            &mut managed_background,
+                            files.background_state,
+                            &mut status,
+                            logger,
+                        )?;
+                        iteration = iteration.saturating_add(1);
+                        status.iteration = iteration;
+                        publish_controller_status(
+                            &mut status_publish_gate,
+                            files.status,
+                            &mut status,
+                            evaluation_time_ms,
+                            true,
+                        )?;
+                        if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
+                            break Ok(());
+                        }
+                        continue;
+                    }
+                };
+                let status_error_before_evaluation = status.last_error.clone();
+                if status
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with("Load telemetry sample skipped:"))
+                {
+                    status.last_error = None;
+                }
+                status.maximum_dpc_time_bps = loads
+                    .iter()
+                    .map(|load| load.dpc_time_bps)
+                    .max()
+                    .unwrap_or(0);
+                status.maximum_interrupt_time_bps = loads
+                    .iter()
+                    .map(|load| load.interrupt_time_bps)
+                    .max()
+                    .unwrap_or(0);
+                let adjustment = width_controller.evaluate(
                     evaluation_time_ms,
-                    true,
+                    status.scheduler_latency,
+                    status.maximum_dpc_time_bps,
+                    status.maximum_interrupt_time_bps,
+                );
+                if let Some(adjustment) = adjustment {
+                    let detail = width_adjustment_summary(adjustment);
+                    status.last_responsiveness_adjustment = Some(detail.clone());
+                    logger.emit(json!({
+                        "event": "memory_profile_width_changed",
+                        "adjustment": detail,
+                        "pressure": width_controller.pressure(),
+                        "scheduler_latency": status.scheduler_latency,
+                        "maximum_dpc_time_bps": status.maximum_dpc_time_bps,
+                        "maximum_interrupt_time_bps": status.maximum_interrupt_time_bps,
+                    }));
+                }
+                status.memory_profile_physical_cores = width_controller.current_physical_cores();
+                status.responsiveness_pressure = width_controller.pressure();
+                let responsiveness_signature = ResponsivenessSignature {
+                    pressure: status.responsiveness_pressure,
+                    memory_profile_physical_cores: status.memory_profile_physical_cores,
+                };
+                if let Some(reason) = responsiveness_log_gate.decide(
+                    evaluation_time_ms,
+                    responsiveness_signature,
+                    adjustment.is_some(),
+                ) {
+                    logger.emit(json!({
+                        "event": "responsiveness_sample",
+                        "reason": reason.as_str(),
+                        "scheduler_latency": status.scheduler_latency,
+                        "maximum_dpc_time_bps": status.maximum_dpc_time_bps,
+                        "maximum_interrupt_time_bps": status.maximum_interrupt_time_bps,
+                        "memory_profile_physical_cores": status.memory_profile_physical_cores,
+                        "pressure": status.responsiveness_pressure,
+                        "domain_loads": loads,
+                    }));
+                }
+                let background_tick = run_background_safety_tick(
+                    &config,
+                    &runtime,
+                    &topology,
+                    interactive_server.as_ref(),
+                    memory_pressure_monitor.as_ref(),
+                    &mut last_low_memory,
+                    &mut previous_cpu_times,
+                    &mut background_clear_streaks,
+                    &mut managed,
+                    files.managed_state,
+                    &mut managed_background,
+                    files.background_state,
+                    &mut status,
+                    logger,
                 )?;
-                logger.emit(event);
-            }
-            if !controller_evaluation_active(&config, &runtime) {
-                let prior_error = status.last_error.clone();
-                let cleanup = cleanup_managed(logger, &mut managed, files.managed_state)?;
-                status.phase = ControllerPhase::Disabled;
-                status.managed_processes = managed.len();
-                status.last_error = cleanup_error(cleanup);
+                let processes = background_tick.processes;
+                let prior_background_status = background_tick.prior_status;
+                let background_error = background_tick.error;
+
+                let observations = build_ranked_observations(
+                    &config,
+                    &managed,
+                    &processes,
+                    &placement_topology,
+                    width_controller.current_physical_cores(),
+                    &mut previous_cpu_times,
+                    effective_sample_interval_ms,
+                );
+
+                let decisions = match engine.evaluate(
+                    evaluation_time_ms,
+                    &placement_topology,
+                    &loads,
+                    &observations,
+                ) {
+                    Ok(decisions) => decisions,
+                    Err(error) => break Err(error.into()),
+                };
+                for decision in decisions {
+                    log_decision(logger, &processes, &decision);
+                    status.last_activity = Some(decision_summary(&processes, &decision));
+                    if decision.enforce && decision.action.is_mutation() {
+                        if let Some(error) = enforce_decision(
+                            logger,
+                            &mut engine,
+                            &mut managed,
+                            files.managed_state,
+                            &decision,
+                            evaluation_time_ms,
+                        )? {
+                            status.last_error = Some(error);
+                        } else {
+                            status.last_error = None;
+                        }
+                    }
+                }
+                if let Some(error) = background_error {
+                    status.last_error = Some(format!("Background efficiency: {error}"));
+                }
+
                 iteration = iteration.saturating_add(1);
                 status.iteration = iteration;
-                let important_status_change = status.last_error != prior_error;
+                status.managed_processes = managed.len();
+                status.phase = ControllerPhase::Running;
+                status.scheduler_latency = latency_probe.status();
+                let important_status_change = adjustment.is_some()
+                    || status.last_error != status_error_before_evaluation
+                    || status.background_efficiency != prior_background_status;
                 publish_controller_status(
                     &mut status_publish_gate,
                     files.status,
@@ -611,179 +1157,28 @@ mod app {
                 if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
                     break Ok(());
                 }
-                continue;
             }
-            let loads = match sampler.sample() {
-                Ok(loads) => loads,
-                Err(error) => {
-                    let detail = format!("Load telemetry sample skipped: {error}");
-                    status.last_activity = Some("Load telemetry sample skipped".to_owned());
-                    status.last_error = Some(detail.clone());
-                    status.scheduler_latency = latency_probe.status();
-                    logger.emit(json!({
-                        "event": "load_sample_skipped",
-                        "error": error.to_string(),
-                    }));
-                    if let Ok(mut replacement) = platform::LoadSampler::new(&topology)
-                        && replacement.prime().is_ok()
-                    {
-                        sampler = replacement;
-                    }
-                    iteration = iteration.saturating_add(1);
-                    status.iteration = iteration;
-                    publish_controller_status(
-                        &mut status_publish_gate,
-                        files.status,
-                        &mut status,
-                        evaluation_time_ms,
-                        true,
-                    )?;
-                    if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
-                        break Ok(());
-                    }
-                    continue;
-                }
-            };
-            let status_error_before_evaluation = status.last_error.clone();
-            if status
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.starts_with("Load telemetry sample skipped:"))
-            {
-                status.last_error = None;
-            }
-            status.maximum_dpc_time_bps = loads
-                .iter()
-                .map(|load| load.dpc_time_bps)
-                .max()
-                .unwrap_or(0);
-            status.maximum_interrupt_time_bps = loads
-                .iter()
-                .map(|load| load.interrupt_time_bps)
-                .max()
-                .unwrap_or(0);
-            let adjustment = width_controller.evaluate(
-                evaluation_time_ms,
-                status.scheduler_latency,
-                status.maximum_dpc_time_bps,
-                status.maximum_interrupt_time_bps,
-            );
-            if let Some(adjustment) = adjustment {
-                let detail = width_adjustment_summary(adjustment);
-                status.last_responsiveness_adjustment = Some(detail.clone());
-                logger.emit(json!({
-                    "event": "memory_profile_width_changed",
-                    "adjustment": detail,
-                    "pressure": width_controller.pressure(),
-                    "scheduler_latency": status.scheduler_latency,
-                    "maximum_dpc_time_bps": status.maximum_dpc_time_bps,
-                    "maximum_interrupt_time_bps": status.maximum_interrupt_time_bps,
-                }));
-            }
-            status.memory_profile_physical_cores = width_controller.current_physical_cores();
-            status.responsiveness_pressure = width_controller.pressure();
-            let responsiveness_signature = ResponsivenessSignature {
-                pressure: status.responsiveness_pressure,
-                memory_profile_physical_cores: status.memory_profile_physical_cores,
-            };
-            if let Some(reason) = responsiveness_log_gate.decide(
-                evaluation_time_ms,
-                responsiveness_signature,
-                adjustment.is_some(),
-            ) {
-                logger.emit(json!({
-                    "event": "responsiveness_sample",
-                    "reason": reason.as_str(),
-                    "scheduler_latency": status.scheduler_latency,
-                    "maximum_dpc_time_bps": status.maximum_dpc_time_bps,
-                    "maximum_interrupt_time_bps": status.maximum_interrupt_time_bps,
-                    "memory_profile_physical_cores": status.memory_profile_physical_cores,
-                    "pressure": status.responsiveness_pressure,
-                    "domain_loads": loads,
-                }));
-            }
-            let processes = match platform::observe_processes(&topology) {
-                Ok(processes) => processes,
-                Err(error) => break Err(error.into()),
-            };
-            let live = processes
-                .iter()
-                .map(|process| process.key)
-                .collect::<BTreeSet<_>>();
-            reconcile_managed(logger, &mut managed, files.managed_state, &processes)?;
-            previous_cpu_times.retain(|key, _| live.contains(key));
+        })();
 
-            let observations = build_ranked_observations(
-                &config,
-                &managed,
-                &processes,
-                &placement_topology,
-                width_controller.current_physical_cores(),
-                &mut previous_cpu_times,
-                config.sample_interval_ms,
-            );
-
-            let decisions = match engine.evaluate(
-                evaluation_time_ms,
-                &placement_topology,
-                &loads,
-                &observations,
-            ) {
-                Ok(decisions) => decisions,
-                Err(error) => break Err(error.into()),
-            };
-            for decision in decisions {
-                log_decision(logger, &processes, &decision);
-                status.last_activity = Some(decision_summary(&processes, &decision));
-                if decision.enforce && decision.action.is_mutation() {
-                    if let Some(error) = enforce_decision(
-                        logger,
-                        &mut engine,
-                        &mut managed,
-                        files.managed_state,
-                        &decision,
-                        evaluation_time_ms,
-                    )? {
-                        status.last_error = Some(error);
-                    } else {
-                        status.last_error = None;
-                    }
-                }
+        let placement_cleanup = cleanup_managed(logger, &mut managed, files.managed_state);
+        let background_cleanup =
+            cleanup_background(logger, &mut managed_background, files.background_state);
+        let cleanup_result = match (placement_cleanup, background_cleanup) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(placement), Ok(background)) if placement.failed != 0 || background.failed != 0 => {
+                Err(ServiceError::CleanupIncomplete(
+                    placement.failed.saturating_add(background.failed),
+                ))
             }
-
-            iteration = iteration.saturating_add(1);
-            status.iteration = iteration;
-            status.managed_processes = managed.len();
-            status.phase = ControllerPhase::Running;
-            status.scheduler_latency = latency_probe.status();
-            let important_status_change =
-                adjustment.is_some() || status.last_error != status_error_before_evaluation;
-            publish_controller_status(
-                &mut status_publish_gate,
-                files.status,
-                &mut status,
-                evaluation_time_ms,
-                important_status_change,
-            )?;
-            if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
-                break Ok(());
-            }
+            (Ok(_), Ok(_)) => Ok(()),
         };
-
-        let cleanup_result =
-            cleanup_managed(logger, &mut managed, files.managed_state).and_then(|report| {
-                if report.failed == 0 {
-                    Ok(())
-                } else {
-                    Err(ServiceError::CleanupIncomplete(report.failed))
-                }
-            });
         status.phase = if loop_result.is_ok() && cleanup_result.is_ok() {
             ControllerPhase::Stopped
         } else {
             ControllerPhase::Error
         };
         status.managed_processes = managed.len();
+        status.background_efficiency.managed_processes = managed_background.len();
         status.scheduler_latency = latency_probe.status();
         status.memory_profile_physical_cores = width_controller.current_physical_cores();
         status.responsiveness_pressure = width_controller.pressure();
@@ -820,6 +1215,26 @@ mod app {
             config.responsiveness.minimum_reserved_cores,
             config.responsiveness.maximum_reserved_cores,
         )
+    }
+
+    fn controller_wait_interval(
+        config: &ControllerConfig,
+        runtime: &RuntimeState,
+        managed_background: &ManagedBackground,
+        last_policy_evaluation: Instant,
+    ) -> Duration {
+        let configured = Duration::from_millis(config.sample_interval_ms);
+        let until_policy = configured.saturating_sub(last_policy_evaluation.elapsed());
+        let background_rule_active = controller_mutations_active(config, runtime)
+            && config
+                .rules
+                .iter()
+                .any(|rule| config.background_efficiency_applies(&rule.image));
+        if background_rule_active || !managed_background.is_empty() {
+            until_policy.min(BACKGROUND_SAFETY_INTERVAL)
+        } else {
+            until_policy
+        }
     }
 
     const fn controller_evaluation_active(
@@ -1047,14 +1462,18 @@ mod app {
                 continue;
             };
             let result = platform::clear_process_key(key);
+            let target_gone = result
+                .as_ref()
+                .is_err_and(winsched::platform::PlatformError::process_no_longer_matches);
             logger.emit(json!({
                 "event": "cleanup_excluded",
                 "process": key,
                 "exclusion": exclusion,
-                "succeeded": result.is_ok(),
+                "succeeded": result.is_ok() || target_gone,
+                "target_gone_or_reused": target_gone,
                 "error": result.as_ref().err().map(ToString::to_string),
             }));
-            if result.is_ok() {
+            if result.is_ok() || target_gone {
                 managed.remove(&key);
                 changed = true;
             }
@@ -1081,6 +1500,7 @@ mod app {
         status.configured_mode = config.controller_mode;
         status.applied_config_fingerprint = config.fingerprint();
         status.applied_logging = config.logging;
+        status.applied_background_efficiency = config.background_efficiency;
         status.applied_responsiveness = config.responsiveness;
         status.system_reserve.clone_from(reserve_plan);
         match reload {
@@ -1095,6 +1515,7 @@ mod app {
                     "event": "config_reloaded",
                     "controller_mode": config.controller_mode,
                     "logging": config.logging,
+                    "background_efficiency": config.background_efficiency,
                     "responsiveness": config.responsiveness,
                     "reserved_physical_cores": reserve_plan.reserved_physical_cores.len(),
                     "reserved_cpu_sets": reserve_plan.reserved_cpu_set_ids.len(),
@@ -1190,6 +1611,16 @@ mod app {
         Ok(result)
     }
 
+    fn request_interactive_wake(sender: &mpsc::Sender<ControllerCommand>, pending: &AtomicBool) {
+        if pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && sender.send(ControllerCommand::Tick).is_err()
+        {
+            pending.store(false, Ordering::Release);
+        }
+    }
+
     fn wait_for_command(
         control: Option<&mpsc::Receiver<ControllerCommand>>,
         interval: Duration,
@@ -1200,6 +1631,14 @@ mod app {
                 ControllerCommand::Tick
             },
             |receiver| match receiver.recv_timeout(interval) {
+                Ok(ControllerCommand::Tick) => {
+                    while let Ok(command) = receiver.try_recv() {
+                        if command != ControllerCommand::Tick {
+                            return command;
+                        }
+                    }
+                    ControllerCommand::Tick
+                }
                 Ok(command) => command,
                 Err(mpsc::RecvTimeoutError::Disconnected) => ControllerCommand::Stop,
                 Err(mpsc::RecvTimeoutError::Timeout) => ControllerCommand::Tick,
@@ -1433,9 +1872,11 @@ mod app {
         state_path: Option<&Path>,
     ) -> Result<CleanupReport, ServiceError> {
         cleanup_managed_with(logger, managed, state_path, |process| {
-            platform::clear_process_key(process)
-                .map(|_| ())
-                .map_err(|error| error.to_string())
+            match platform::clear_process_key(process) {
+                Ok(_) => Ok(()),
+                Err(error) if error.process_no_longer_matches() => Ok(()),
+                Err(error) => Err(error.to_string()),
+            }
         })
     }
 
@@ -1479,20 +1920,948 @@ mod app {
         Ok(report)
     }
 
-    fn cleanup_error(report: CleanupReport) -> Option<String> {
-        (report.failed != 0).then(|| {
+    fn combined_cleanup_error(
+        placement: CleanupReport,
+        background: CleanupReport,
+    ) -> Option<String> {
+        (placement.failed != 0 || background.failed != 0).then(|| {
             format!(
-                "failed to clear {} managed CPU Set assignment(s); retry pending",
-                report.failed
+                "failed to restore {} CPU Set assignment(s) and {} background policy state(s); retry pending",
+                placement.failed, background.failed
             )
         })
     }
 
-    fn load_managed_state(path: &Path) -> Result<ManagedAssignments, ServiceError> {
-        if !path.exists() {
-            return Ok(BTreeMap::new());
+    const BACKGROUND_CLEAR_STABILITY_SAMPLES: u8 = 2;
+
+    struct BackgroundReconcileReport {
+        status: BackgroundEfficiencyStatus,
+        last_error: Option<String>,
+    }
+
+    struct BackgroundSafetyTick {
+        processes: Vec<platform::ObservedProcess>,
+        prior_status: BackgroundEfficiencyStatus,
+        error: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BackgroundProtection {
+        ProbeUnavailable,
+        Foreground,
+        Visible,
+        Audio,
+    }
+
+    #[derive(Default)]
+    struct SessionActivity {
+        publishers: usize,
+        window_probe_available: bool,
+        audio_probe_available: bool,
+        foreground_pids: BTreeSet<u32>,
+        visible_pids: BTreeSet<u32>,
+        audible_pids: BTreeSet<u32>,
+    }
+
+    fn interactive_sessions(
+        states: &[InteractiveActivityState],
+        now_unix_ms: u64,
+    ) -> BTreeMap<u32, SessionActivity> {
+        let mut sessions = BTreeMap::<u32, SessionActivity>::new();
+        for state in states
+            .iter()
+            .filter(|state| state.session_id != 0 && state.is_fresh_at(now_unix_ms))
+        {
+            let session = sessions
+                .entry(state.session_id)
+                .or_insert_with(|| SessionActivity {
+                    window_probe_available: true,
+                    audio_probe_available: true,
+                    ..SessionActivity::default()
+                });
+            session.publishers = session.publishers.saturating_add(1);
+            session.window_probe_available &= state.window_probe_available;
+            session.audio_probe_available &= state.audio_probe_available;
+            session.foreground_pids.extend(state.foreground_pid);
+            session
+                .visible_pids
+                .extend(state.visible_pids.iter().copied());
+            session
+                .audible_pids
+                .extend(state.audible_pids.iter().copied());
         }
-        let bytes = fs::read(path)?;
+        sessions
+    }
+
+    fn expand_protected_descendants(
+        processes: &[platform::ObservedProcess],
+        session_id: u32,
+        protected: &mut BTreeSet<u32>,
+    ) {
+        loop {
+            let mut changed = false;
+            for process in processes
+                .iter()
+                .filter(|process| process.session_id == Some(session_id))
+            {
+                if protected.contains(&process.parent_pid) && protected.insert(process.key.pid) {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn background_protection(
+        config: &ControllerConfig,
+        process: &platform::ObservedProcess,
+        processes: &[platform::ObservedProcess],
+        sessions: &BTreeMap<u32, SessionActivity>,
+    ) -> Option<BackgroundProtection> {
+        let session_id = process.session_id?;
+        let Some(session) = sessions.get(&session_id) else {
+            return Some(BackgroundProtection::ProbeUnavailable);
+        };
+        if (config.background_efficiency.protect_foreground
+            || config.background_efficiency.protect_visible)
+            && !session.window_probe_available
+            || config.background_efficiency.protect_audio && !session.audio_probe_available
+        {
+            return Some(BackgroundProtection::ProbeUnavailable);
+        }
+
+        let mut foreground = session.foreground_pids.clone();
+        let mut visible = session.visible_pids.clone();
+        let mut audible = session.audible_pids.clone();
+        expand_protected_descendants(processes, session_id, &mut foreground);
+        expand_protected_descendants(processes, session_id, &mut visible);
+        expand_protected_descendants(processes, session_id, &mut audible);
+        let cohort_contains = |protected: &BTreeSet<u32>| {
+            processes.iter().any(|candidate| {
+                candidate.session_id == Some(session_id)
+                    && candidate
+                        .image_name
+                        .eq_ignore_ascii_case(&process.image_name)
+                    && protected.contains(&candidate.key.pid)
+            })
+        };
+        if config.background_efficiency.protect_foreground && cohort_contains(&foreground) {
+            Some(BackgroundProtection::Foreground)
+        } else if config.background_efficiency.protect_visible && cohort_contains(&visible) {
+            Some(BackgroundProtection::Visible)
+        } else if config.background_efficiency.protect_audio && cohort_contains(&audible) {
+            Some(BackgroundProtection::Audio)
+        } else {
+            None
+        }
+    }
+
+    fn desired_background_state(
+        config: &ControllerConfig,
+        original: ProcessEfficiencyState,
+        low_memory: bool,
+    ) -> ProcessEfficiencyState {
+        ProcessEfficiencyState {
+            eco_qos: if config.background_efficiency.eco_qos_enabled {
+                ProcessEcoQosState::Enabled
+            } else {
+                original.eco_qos
+            },
+            memory_priority: if config.background_efficiency.memory_priority_enabled {
+                let requested =
+                    if low_memory && config.background_efficiency.memory_pressure_guard_enabled {
+                        ProcessMemoryPriority::Low
+                    } else {
+                        ProcessMemoryPriority::BelowNormal
+                    };
+                lower_memory_priority(original.memory_priority, requested)
+            } else {
+                original.memory_priority
+            },
+        }
+    }
+
+    const fn lower_memory_priority(
+        original: ProcessMemoryPriority,
+        requested: ProcessMemoryPriority,
+    ) -> ProcessMemoryPriority {
+        if memory_priority_rank(original) <= memory_priority_rank(requested) {
+            original
+        } else {
+            requested
+        }
+    }
+
+    const fn memory_priority_rank(priority: ProcessMemoryPriority) -> u8 {
+        match priority {
+            ProcessMemoryPriority::VeryLow => 1,
+            ProcessMemoryPriority::Low => 2,
+            ProcessMemoryPriority::Medium => 3,
+            ProcessMemoryPriority::BelowNormal => 4,
+            ProcessMemoryPriority::Normal => 5,
+        }
+    }
+
+    const fn configured_background_ownership(
+        config: &ControllerConfig,
+    ) -> ProcessEfficiencyOwnership {
+        ProcessEfficiencyOwnership {
+            eco_qos: config.background_efficiency.eco_qos_enabled,
+            memory_priority: config.background_efficiency.memory_priority_enabled,
+        }
+    }
+
+    fn external_override_mask(
+        expected: ProcessEfficiencyState,
+        observed: ProcessEfficiencyState,
+        ownership: ProcessEfficiencyOwnership,
+    ) -> ProcessEfficiencyOwnership {
+        ProcessEfficiencyOwnership {
+            eco_qos: ownership.eco_qos && expected.eco_qos != observed.eco_qos,
+            memory_priority: ownership.memory_priority
+                && expected.memory_priority != observed.memory_priority,
+        }
+    }
+
+    fn rebase_unowned_efficiency(
+        record: &mut ManagedBackgroundProcess,
+        observed: ProcessEfficiencyState,
+    ) {
+        if !record.ownership.eco_qos {
+            record.original.eco_qos = observed.eco_qos;
+            record.applied.eco_qos = observed.eco_qos;
+        }
+        if !record.ownership.memory_priority {
+            record.original.memory_priority = observed.memory_priority;
+            record.applied.memory_priority = observed.memory_priority;
+        }
+    }
+
+    fn relinquish_external_overrides(
+        record: &mut ManagedBackgroundProcess,
+        observed: ProcessEfficiencyState,
+        changed: ProcessEfficiencyOwnership,
+    ) {
+        record.ownership = record.ownership.without(changed);
+        record.blocked_by_external_override = record.blocked_by_external_override.union(changed);
+        if changed.eco_qos {
+            record.original.eco_qos = observed.eco_qos;
+            record.applied.eco_qos = observed.eco_qos;
+        }
+        if changed.memory_priority {
+            record.original.memory_priority = observed.memory_priority;
+            record.applied.memory_priority = observed.memory_priority;
+        }
+    }
+
+    fn apply_restore_report_to_record(
+        record: &mut ManagedBackgroundProcess,
+        report: &platform::EfficiencyMutationReport,
+    ) -> ProcessEfficiencyOwnership {
+        let externally_overridden = ProcessEfficiencyOwnership {
+            eco_qos: report.external_eco_qos_preserved,
+            memory_priority: report.external_memory_priority_preserved,
+        };
+        record.applied = report.observed;
+        if !report.unrestored_ownership.eco_qos {
+            record.original.eco_qos = report.observed.eco_qos;
+        }
+        if !report.unrestored_ownership.memory_priority {
+            record.original.memory_priority = report.observed.memory_priority;
+        }
+        record.ownership = report.unrestored_ownership;
+        record.pending = None;
+        record.pending_ownership = None;
+        record.blocked_by_external_override = record
+            .blocked_by_external_override
+            .union(externally_overridden);
+        externally_overridden
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_background_safety_tick(
+        config: &ControllerConfig,
+        runtime: &RuntimeState,
+        topology: &Topology,
+        interactive_server: Option<&platform::InteractiveStateServer>,
+        memory_pressure_monitor: Option<&platform::MemoryPressureMonitor>,
+        last_low_memory: &mut Option<bool>,
+        previous_cpu_times: &mut BTreeMap<ProcessKey, u64>,
+        clear_streaks: &mut BTreeMap<ProcessKey, u8>,
+        managed: &mut ManagedAssignments,
+        managed_state_path: Option<&Path>,
+        managed_background: &mut ManagedBackground,
+        background_state_path: Option<&Path>,
+        status: &mut ControllerStatus,
+        logger: &mut EventLogger,
+    ) -> Result<BackgroundSafetyTick, ServiceError> {
+        let processes = platform::observe_processes(topology)?;
+        let live = processes
+            .iter()
+            .map(|process| process.key)
+            .collect::<BTreeSet<_>>();
+        reconcile_managed(logger, managed, managed_state_path, &processes)?;
+        previous_cpu_times.retain(|key, _| live.contains(key));
+        clear_streaks.retain(|key, _| live.contains(key));
+
+        let interactive_states =
+            interactive_server.map_or_else(Vec::new, platform::InteractiveStateServer::states);
+        let (low_memory, memory_pressure_monitor_available) = match memory_pressure_monitor {
+            Some(monitor) => match monitor.is_low() {
+                Ok(value) => {
+                    *last_low_memory = Some(value);
+                    (Some(value), true)
+                }
+                Err(_) => (*last_low_memory, false),
+            },
+            None => (None, false),
+        };
+        let prior_status = status.background_efficiency.clone();
+        let report = reconcile_background_efficiency(
+            config,
+            controller_mutations_active(config, runtime),
+            &processes,
+            &interactive_states,
+            low_memory,
+            memory_pressure_monitor_available,
+            clear_streaks,
+            managed_background,
+            background_state_path,
+            logger,
+        )?;
+        let mut background_status = report.status;
+        if background_status.last_action.is_none() {
+            background_status
+                .last_action
+                .clone_from(&prior_status.last_action);
+        }
+        status.background_efficiency = background_status;
+        if let Some(error) = &report.last_error {
+            status.last_error = Some(format!("Background efficiency: {error}"));
+        } else if status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("Background efficiency:"))
+        {
+            status.last_error = None;
+        }
+        Ok(BackgroundSafetyTick {
+            processes,
+            prior_status,
+            error: report.last_error,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn reconcile_background_efficiency(
+        config: &ControllerConfig,
+        mutations_active: bool,
+        processes: &[platform::ObservedProcess],
+        interactive_states: &[InteractiveActivityState],
+        low_memory: Option<bool>,
+        memory_pressure_monitor_available: bool,
+        clear_streaks: &mut BTreeMap<ProcessKey, u8>,
+        managed: &mut ManagedBackground,
+        state_path: Option<&Path>,
+        logger: &mut EventLogger,
+    ) -> Result<BackgroundReconcileReport, ServiceError> {
+        let now = unix_time_ms();
+        let sessions = interactive_sessions(interactive_states, now);
+        let low_memory_condition = low_memory.unwrap_or(false);
+        let mut status = BackgroundEfficiencyStatus {
+            memory_pressure_monitor_available,
+            low_memory_condition,
+            ..BackgroundEfficiencyStatus::default()
+        };
+        let mut last_error = None;
+        let live = processes
+            .iter()
+            .map(|process| process.key)
+            .collect::<BTreeSet<_>>();
+        let mut required_sessions = BTreeSet::<u32>::new();
+        let dead = managed
+            .keys()
+            .filter(|key| {
+                !live.contains(key)
+                    && !processes.iter().any(|process| {
+                        process.key.pid == key.pid && process.key.creation_time_100ns == 0
+                    })
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if !dead.is_empty() {
+            for key in dead {
+                managed.remove(&key);
+            }
+            persist_background_state(state_path, managed)?;
+        }
+
+        let mut mutation_budget = usize::from(config.policy.max_mutations_per_evaluation);
+        for process in processes {
+            let exact_background = config.background_efficiency_applies(&process.image_name)
+                && process.exclusion.is_none()
+                && process.session_id.is_some_and(|session| session != 0);
+            if exact_background {
+                status.eligible_processes = status.eligible_processes.saturating_add(1);
+                if let Some(session_id) = process.session_id {
+                    required_sessions.insert(session_id);
+                }
+            }
+            let protection = exact_background
+                .then(|| background_protection(config, process, processes, &sessions))
+                .flatten();
+            let externally_blocked = managed
+                .get(&process.key)
+                .is_some_and(|record| !record.blocked_by_external_override.is_empty());
+            let desired_allowed = exact_background && protection.is_none() && mutations_active;
+            if exact_background && (protection.is_some() || !mutations_active || externally_blocked)
+            {
+                status.protected_processes = status.protected_processes.saturating_add(1);
+            }
+
+            if desired_allowed {
+                let streak = clear_streaks.entry(process.key).or_default();
+                *streak = streak.saturating_add(1);
+            } else {
+                clear_streaks.remove(&process.key);
+            }
+
+            if let Some(mut record) = managed.get(&process.key).copied() {
+                let mut current = match platform::query_process_efficiency_key(process.key) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        if error.process_no_longer_matches() {
+                            managed.remove(&process.key);
+                            persist_background_state(state_path, managed)?;
+                            continue;
+                        }
+                        last_error = Some(format!(
+                            "background state query failed for {} (PID {}): {error}",
+                            process.image_name, process.key.pid
+                        ));
+                        continue;
+                    }
+                };
+                if let Some(pending) = record.pending {
+                    if record.ownership.is_empty() {
+                        record.pending = None;
+                        record.pending_ownership = None;
+                        rebase_unowned_efficiency(&mut record, current);
+                        managed.insert(process.key, record);
+                        persist_background_state(state_path, managed)?;
+                        continue;
+                    }
+                    let final_ownership = record.pending_ownership.unwrap_or_else(|| {
+                        ProcessEfficiencyOwnership::between(record.original, pending)
+                    });
+                    let transaction_ownership = record.ownership;
+                    if transaction_ownership.matches(pending, current) {
+                        record.applied = current;
+                        record.ownership = final_ownership;
+                        record.pending = None;
+                        record.pending_ownership = None;
+                        rebase_unowned_efficiency(&mut record, current);
+                        managed.insert(process.key, record);
+                        persist_background_state(state_path, managed)?;
+                    } else if transaction_ownership.matches(record.applied, current) {
+                        record.ownership =
+                            ProcessEfficiencyOwnership::between(record.original, record.applied)
+                                .without(record.blocked_by_external_override);
+                        record.pending = None;
+                        record.pending_ownership = None;
+                        rebase_unowned_efficiency(&mut record, current);
+                        managed.insert(process.key, record);
+                        persist_background_state(state_path, managed)?;
+                    } else {
+                        match platform::restore_process_efficiency_key(
+                            process.key,
+                            record.original,
+                            record.applied,
+                            transaction_ownership,
+                            record.pending,
+                        ) {
+                            Ok(report) => {
+                                let changed = apply_restore_report_to_record(&mut record, &report);
+                                if !report.property_errors.is_empty() {
+                                    last_error = Some(report.property_errors.join("; "));
+                                }
+                                managed.insert(process.key, record);
+                                persist_background_state(state_path, managed)?;
+                                logger.emit(json!({
+                                    "event": "background_efficiency_pending_recovered",
+                                    "process": process.key,
+                                    "externally_overridden": changed,
+                                    "report": report,
+                                }));
+                            }
+                            Err(error) => {
+                                last_error = Some(error.to_string());
+                            }
+                        }
+                        continue;
+                    }
+                    current = match platform::query_process_efficiency_key(process.key) {
+                        Ok(current) => current,
+                        Err(error) => {
+                            last_error = Some(error.to_string());
+                            continue;
+                        }
+                    };
+                }
+
+                record = *managed
+                    .get(&process.key)
+                    .expect("managed background record remains present");
+                let changed = external_override_mask(record.applied, current, record.ownership);
+                if !changed.is_empty() {
+                    relinquish_external_overrides(&mut record, current, changed);
+                    clear_streaks.remove(&process.key);
+                    managed.insert(process.key, record);
+                    persist_background_state(state_path, managed)?;
+                    logger.emit(json!({
+                        "event": "background_efficiency_external_override",
+                        "process": process.key,
+                        "relinquished": changed,
+                        "observed": current,
+                    }));
+                }
+
+                if !desired_allowed {
+                    let transient_protection =
+                        exact_background && mutations_active && protection.is_some();
+                    if record.ownership.is_empty() {
+                        if !transient_protection || record.blocked_by_external_override.is_empty() {
+                            managed.remove(&process.key);
+                        }
+                        persist_background_state(state_path, managed)?;
+                        continue;
+                    }
+                    match platform::restore_process_efficiency_key(
+                        process.key,
+                        record.original,
+                        record.applied,
+                        record.ownership,
+                        None,
+                    ) {
+                        Ok(report) => {
+                            let externally_overridden =
+                                apply_restore_report_to_record(&mut record, &report);
+                            let cleanup_incomplete = !record.ownership.is_empty();
+                            if cleanup_incomplete
+                                || (transient_protection
+                                    && !record.blocked_by_external_override.is_empty())
+                            {
+                                managed.insert(process.key, record);
+                            } else {
+                                managed.remove(&process.key);
+                            }
+                            persist_background_state(state_path, managed)?;
+                            let action = if cleanup_incomplete {
+                                format!(
+                                    "Background policy cleanup remains pending for {} (PID {})",
+                                    process.image_name, process.key.pid
+                                )
+                            } else {
+                                format!(
+                                    "Restored background policy for {} (PID {})",
+                                    process.image_name, process.key.pid
+                                )
+                            };
+                            status.last_action = Some(action);
+                            if !report.property_errors.is_empty() {
+                                last_error = Some(report.property_errors.join("; "));
+                            }
+                            logger.emit(json!({
+                                "event": "background_efficiency_restored",
+                                "process": process.key,
+                                "protection": protection.map(|value| format!("{value:?}")),
+                                "externally_overridden": externally_overridden,
+                                "report": report,
+                            }));
+                        }
+                        Err(error) => last_error = Some(error.to_string()),
+                    }
+                    continue;
+                }
+
+                rebase_unowned_efficiency(&mut record, current);
+                let desired =
+                    desired_background_state(config, record.original, low_memory_condition);
+                let desired_ownership =
+                    ProcessEfficiencyOwnership::between(record.original, desired)
+                        .intersection(configured_background_ownership(config))
+                        .without(record.blocked_by_external_override);
+                let prior_ownership = record.ownership;
+                let transaction_ownership = prior_ownership.union(desired_ownership);
+                if transaction_ownership.is_empty() {
+                    managed.insert(process.key, record);
+                    continue;
+                }
+                if transaction_ownership.matches(desired, record.applied)
+                    && prior_ownership == desired_ownership
+                {
+                    continue;
+                }
+                if prior_ownership.is_empty()
+                    && clear_streaks.get(&process.key).copied().unwrap_or(0)
+                        < BACKGROUND_CLEAR_STABILITY_SAMPLES
+                {
+                    continue;
+                }
+                if mutation_budget == 0 {
+                    continue;
+                }
+                record.pending = Some(desired);
+                record.pending_ownership = Some(desired_ownership);
+                record.ownership = transaction_ownership;
+                managed.insert(process.key, record);
+                persist_background_state(state_path, managed)?;
+                mutation_budget = mutation_budget.saturating_sub(1);
+                match platform::apply_process_efficiency_key(
+                    process.key,
+                    record.applied,
+                    desired,
+                    transaction_ownership,
+                ) {
+                    Ok(report) => {
+                        record.applied = report.observed;
+                        record.ownership = desired_ownership;
+                        record.pending = None;
+                        record.pending_ownership = None;
+                        rebase_unowned_efficiency(&mut record, report.observed);
+                        managed.insert(process.key, record);
+                        persist_background_state(state_path, managed)?;
+                        status.last_action = Some(format!(
+                            "Updated background policy for {} (PID {})",
+                            process.image_name, process.key.pid
+                        ));
+                        logger.emit(json!({
+                            "event": "background_efficiency_updated",
+                            "process": process.key,
+                            "low_memory": low_memory_condition,
+                            "report": report,
+                        }));
+                    }
+                    Err(error) => {
+                        last_error = Some(error.to_string());
+                        if error.efficiency_ownership_changed()
+                            && let Ok(current) = platform::query_process_efficiency_key(process.key)
+                        {
+                            let changed = external_override_mask(
+                                record.applied,
+                                current,
+                                transaction_ownership,
+                            );
+                            record.ownership = prior_ownership;
+                            record.pending = None;
+                            record.pending_ownership = None;
+                            relinquish_external_overrides(&mut record, current, changed);
+                            rebase_unowned_efficiency(&mut record, current);
+                            clear_streaks.remove(&process.key);
+                            managed.insert(process.key, record);
+                            persist_background_state(state_path, managed)?;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if !desired_allowed
+                || clear_streaks.get(&process.key).copied().unwrap_or(0)
+                    < BACKGROUND_CLEAR_STABILITY_SAMPLES
+                || mutation_budget == 0
+            {
+                continue;
+            }
+            let original = match platform::query_process_efficiency_key(process.key) {
+                Ok(original) => original,
+                Err(error) => {
+                    last_error = Some(format!(
+                        "background efficiency unsupported for {} (PID {}): {error}",
+                        process.image_name, process.key.pid
+                    ));
+                    continue;
+                }
+            };
+            let desired = desired_background_state(config, original, low_memory_condition);
+            let desired_ownership = ProcessEfficiencyOwnership::between(original, desired)
+                .intersection(configured_background_ownership(config));
+            if desired_ownership.is_empty() {
+                continue;
+            }
+            let mut record = ManagedBackgroundProcess {
+                key: process.key,
+                original,
+                applied: original,
+                ownership: desired_ownership,
+                pending: Some(desired),
+                pending_ownership: Some(desired_ownership),
+                blocked_by_external_override: ProcessEfficiencyOwnership::default(),
+            };
+            managed.insert(process.key, record);
+            persist_background_state(state_path, managed)?;
+            mutation_budget = mutation_budget.saturating_sub(1);
+            match platform::apply_process_efficiency_key(
+                process.key,
+                original,
+                desired,
+                desired_ownership,
+            ) {
+                Ok(report) => {
+                    record.applied = report.observed;
+                    record.pending = None;
+                    record.pending_ownership = None;
+                    rebase_unowned_efficiency(&mut record, report.observed);
+                    managed.insert(process.key, record);
+                    persist_background_state(state_path, managed)?;
+                    status.last_action = Some(format!(
+                        "Applied background policy to {} (PID {})",
+                        process.image_name, process.key.pid
+                    ));
+                    logger.emit(json!({
+                        "event": "background_efficiency_applied",
+                        "process": process.key,
+                        "low_memory": low_memory_condition,
+                        "report": report,
+                    }));
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    if let Ok(current) = platform::query_process_efficiency_key(process.key) {
+                        if error.efficiency_ownership_changed() {
+                            let changed =
+                                external_override_mask(original, current, desired_ownership);
+                            record.original = current;
+                            record.applied = current;
+                            record.ownership = ProcessEfficiencyOwnership::default();
+                            record.pending = None;
+                            record.pending_ownership = None;
+                            record.blocked_by_external_override = changed;
+                            clear_streaks.remove(&process.key);
+                            managed.insert(process.key, record);
+                            persist_background_state(state_path, managed)?;
+                        } else if desired_ownership.matches(original, current) {
+                            managed.remove(&process.key);
+                            persist_background_state(state_path, managed)?;
+                        }
+                    }
+                }
+            }
+        }
+        status.required_probe_sessions = required_sessions.len();
+        status.interactive_probe_sessions = required_sessions
+            .iter()
+            .filter(|session_id| {
+                sessions.get(session_id).is_some_and(|session| {
+                    (!(config.background_efficiency.protect_foreground
+                        || config.background_efficiency.protect_visible)
+                        || session.window_probe_available)
+                        && (!config.background_efficiency.protect_audio
+                            || session.audio_probe_available)
+                })
+            })
+            .count();
+        status.managed_processes = managed
+            .values()
+            .filter(|record| !record.ownership.is_empty())
+            .count();
+        Ok(BackgroundReconcileReport { status, last_error })
+    }
+
+    fn cleanup_background(
+        logger: &mut EventLogger,
+        managed: &mut ManagedBackground,
+        state_path: Option<&Path>,
+    ) -> Result<CleanupReport, ServiceError> {
+        let entries = managed.values().copied().collect::<Vec<_>>();
+        let mut report = CleanupReport {
+            attempted: entries.len(),
+            ..CleanupReport::default()
+        };
+        for mut record in entries {
+            if record.ownership.is_empty() {
+                managed.remove(&record.key);
+                report.cleared = report.cleared.saturating_add(1);
+                continue;
+            }
+            let result = platform::restore_process_efficiency_key(
+                record.key,
+                record.original,
+                record.applied,
+                record.ownership,
+                record.pending,
+            );
+            let target_gone = result
+                .as_ref()
+                .is_err_and(winsched::platform::PlatformError::process_no_longer_matches);
+            let mut mutation_report = None;
+            let mut error = None;
+            let succeeded = match result {
+                Ok(restored) => {
+                    apply_restore_report_to_record(&mut record, &restored);
+                    let complete = record.ownership.is_empty();
+                    if complete {
+                        managed.remove(&record.key);
+                        report.cleared = report.cleared.saturating_add(1);
+                    } else {
+                        managed.insert(record.key, record);
+                        report.failed = report.failed.saturating_add(1);
+                        error = Some(restored.property_errors.join("; "));
+                    }
+                    mutation_report = Some(restored);
+                    complete
+                }
+                Err(_) if target_gone => {
+                    managed.remove(&record.key);
+                    report.cleared = report.cleared.saturating_add(1);
+                    true
+                }
+                Err(restore_error) => {
+                    report.failed = report.failed.saturating_add(1);
+                    error = Some(restore_error.to_string());
+                    false
+                }
+            };
+            logger.emit(json!({
+                "event": "background_efficiency_cleanup",
+                "process": record.key,
+                "succeeded": succeeded,
+                "target_gone_or_reused": target_gone,
+                "report": mutation_report.as_ref(),
+                "error": error,
+            }));
+        }
+        persist_background_state(state_path, managed)?;
+        Ok(report)
+    }
+
+    fn read_state_with_legacy_backup(path: &Path) -> Result<Option<Vec<u8>>, std::io::Error> {
+        if path.exists() {
+            return fs::read(path).map(Some);
+        }
+        let backup = path.with_extension("bak");
+        if !backup.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&backup)?;
+        // Older builds briefly moved the live file to .bak before committing
+        // the replacement. Restore that durable journal after an interrupted write.
+        match fs::rename(&backup, path) {
+            Ok(()) => {}
+            Err(_) if path.exists() => {}
+            Err(error) => return Err(error),
+        }
+        Ok(Some(bytes))
+    }
+
+    fn load_background_state(path: &Path) -> Result<ManagedBackground, ServiceError> {
+        let Some(bytes) = read_state_with_legacy_backup(path)? else {
+            return Ok(BTreeMap::new());
+        };
+        let header = serde_json::from_slice::<ManagedStateHeader>(&bytes)?;
+        if header.schema_version == 1 {
+            let state = serde_json::from_slice::<LegacyBackgroundStateFile>(&bytes)?;
+            return Ok(state
+                .processes
+                .into_iter()
+                .map(|process| {
+                    let pending = if process.blocked_by_external_override {
+                        None
+                    } else {
+                        process.pending
+                    };
+                    let pending_ownership = pending.map(|pending| {
+                        ProcessEfficiencyOwnership::between(process.original, pending)
+                    });
+                    let ownership = if process.blocked_by_external_override {
+                        ProcessEfficiencyOwnership::default()
+                    } else {
+                        ProcessEfficiencyOwnership::between(process.original, process.applied)
+                            .union(pending_ownership.unwrap_or_default())
+                    };
+                    let blocked_by_external_override = if process.blocked_by_external_override {
+                        ProcessEfficiencyOwnership {
+                            eco_qos: true,
+                            memory_priority: true,
+                        }
+                    } else {
+                        ProcessEfficiencyOwnership::default()
+                    };
+                    let migrated = ManagedBackgroundProcess {
+                        key: process.key,
+                        original: process.original,
+                        applied: process.applied,
+                        ownership,
+                        pending,
+                        pending_ownership,
+                        blocked_by_external_override,
+                    };
+                    (migrated.key, migrated)
+                })
+                .collect());
+        }
+        if header.schema_version != BACKGROUND_STATE_SCHEMA_VERSION {
+            return Err(ServiceError::StateSchema(header.schema_version));
+        }
+        let state = serde_json::from_slice::<BackgroundStateFile>(&bytes)?;
+        for process in &state.processes {
+            if process.pending.is_some() != process.pending_ownership.is_some() {
+                return Err(ServiceError::InvalidBackgroundState(
+                    "pending state and pending ownership must appear together",
+                ));
+            }
+            if process.pending.is_some() && process.ownership.is_empty() {
+                return Err(ServiceError::InvalidBackgroundState(
+                    "pending transaction has an empty ownership mask",
+                ));
+            }
+            if !process
+                .ownership
+                .intersection(process.blocked_by_external_override)
+                .is_empty()
+            {
+                return Err(ServiceError::InvalidBackgroundState(
+                    "owned and externally blocked properties overlap",
+                ));
+            }
+            if process.pending_ownership.is_some_and(|pending| {
+                !pending
+                    .intersection(process.blocked_by_external_override)
+                    .is_empty()
+            }) {
+                return Err(ServiceError::InvalidBackgroundState(
+                    "pending ownership includes an externally blocked property",
+                ));
+            }
+        }
+        Ok(state
+            .processes
+            .into_iter()
+            .map(|process| (process.key, process))
+            .collect())
+    }
+
+    fn persist_background_state(
+        path: Option<&Path>,
+        managed: &ManagedBackground,
+    ) -> Result<(), ServiceError> {
+        let Some(path) = path else {
+            return Ok(());
+        };
+        let state = BackgroundStateFile {
+            schema_version: BACKGROUND_STATE_SCHEMA_VERSION,
+            processes: managed.values().copied().collect(),
+        };
+        atomic_write(path, &serde_json::to_vec_pretty(&state)?)?;
+        Ok(())
+    }
+
+    fn load_managed_state(path: &Path) -> Result<ManagedAssignments, ServiceError> {
+        let Some(bytes) = read_state_with_legacy_backup(path)? else {
+            return Ok(BTreeMap::new());
+        };
         let header = serde_json::from_slice::<ManagedStateHeader>(&bytes)?;
         match header.schema_version {
             LEGACY_STATE_SCHEMA_VERSION => {
@@ -1548,10 +2917,10 @@ mod app {
         path: &Path,
         configured_mode: ControllerMode,
     ) -> Result<RuntimeState, ServiceError> {
-        if !path.exists() {
+        let Some(bytes) = read_state_with_legacy_backup(path)? else {
             return Ok(RuntimeState::for_controller_mode(configured_mode));
-        }
-        let state = serde_json::from_slice::<RuntimeState>(&fs::read(path)?)?;
+        };
+        let state = serde_json::from_slice::<RuntimeState>(&bytes)?;
         if state.schema_version != RUNTIME_SCHEMA_VERSION {
             return Err(ServiceError::RuntimeStateSchema(state.schema_version));
         }
@@ -1600,9 +2969,17 @@ mod app {
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    fn install(config_path: &Path, start_now: bool, allow_auto: bool) -> Result<(), ServiceError> {
+    fn install(
+        config_path: &Path,
+        data_directory: Option<&Path>,
+        start_now: bool,
+        allow_auto: bool,
+    ) -> Result<(), ServiceError> {
         let config = validated_registration_config(config_path, allow_auto)?;
-        let install_dir = program_data_dir().join(INSTALL_DIRECTORY_NAME);
+        let install_dir = data_directory.map_or_else(
+            || program_data_dir().join(INSTALL_DIRECTORY_NAME),
+            Path::to_path_buf,
+        );
         fs::create_dir_all(&install_dir)?;
         let installed_exe = install_dir.join("winsched-service.exe");
         let installed_config = install_dir.join(CONFIG_FILE_NAME);
@@ -1616,7 +2993,7 @@ mod app {
                 toml::to_string_pretty(&config)?.as_bytes(),
             )?;
         }
-        configure_service(&installed_exe, &installed_config, start_now, false)?;
+        configure_service(&installed_exe, &installed_config, start_now, true, false)?;
         println!("installed {SERVICE_NAME}");
         Ok(())
     }
@@ -1637,7 +3014,7 @@ mod app {
         let _ = config;
         let current_exe = std::env::current_exe()?;
         let absolute_config = fs::canonicalize(config_path)?;
-        configure_service(&current_exe, &absolute_config, start_now, false)?;
+        configure_service(&current_exe, &absolute_config, start_now, false, false)?;
         println!("registered {SERVICE_NAME}");
         Ok(())
     }
@@ -1646,12 +3023,19 @@ mod app {
         config_path: &Path,
         start_now: bool,
         allow_auto: bool,
+        test_fail_after_change: bool,
     ) -> Result<(), ServiceError> {
         let config = validated_registration_config(config_path, allow_auto)?;
         let _ = config;
         let current_exe = std::env::current_exe()?;
         let absolute_config = fs::canonicalize(config_path)?;
-        configure_service(&current_exe, &absolute_config, start_now, true)?;
+        configure_service(
+            &current_exe,
+            &absolute_config,
+            start_now,
+            true,
+            test_fail_after_change,
+        )?;
         println!("provisioned {SERVICE_NAME}");
         Ok(())
     }
@@ -1672,6 +3056,7 @@ mod app {
         config_path: &Path,
         start_now: bool,
         allow_existing: bool,
+        test_fail_after_change: bool,
     ) -> Result<(), ServiceError> {
         let manager = ServiceManager::local_computer(
             None::<&str>,
@@ -1725,7 +3110,11 @@ mod app {
             )
         };
 
-        let configure_result = apply_service_settings(&service, start_now);
+        let configure_result = if test_fail_after_change {
+            Err(ServiceError::InjectedProvisionFailure)
+        } else {
+            apply_service_settings(&service, start_now)
+        };
         if let Err(error) = configure_result {
             let recovery = match origin {
                 ServiceOrigin::Created => cleanup_created_service(&manager, service),
@@ -2119,7 +3508,7 @@ mod app {
         args: &[OsString],
         program: &'static str,
     ) -> Result<std::process::Output, ServiceError> {
-        let output = ProcessCommand::new(system_sc_path()).args(args).output()?;
+        let output = ProcessCommand::new(system_sc_path()?).args(args).output()?;
         if output.status.success() {
             return Ok(output);
         }
@@ -2144,12 +3533,21 @@ mod app {
         }
     }
 
-    fn system_sc_path() -> PathBuf {
-        std::env::var_os("SystemRoot")
-            .or_else(|| std::env::var_os("WINDIR"))
-            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
-            .join("System32")
-            .join("sc.exe")
+    #[allow(unsafe_code)] // Read-only Win32 path query avoids inherited environment lookup.
+    fn system_sc_path() -> Result<PathBuf, ServiceError> {
+        // SAFETY: A null buffer asks Windows for the required UTF-16 length.
+        let required = unsafe { GetSystemDirectoryW(None) };
+        if required == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut buffer = vec![0u16; usize::try_from(required).unwrap_or(usize::MAX) + 1];
+        // SAFETY: The buffer is writable and sized from the preceding Windows query.
+        let written = unsafe { GetSystemDirectoryW(Some(buffer.as_mut_slice())) };
+        if written == 0 || usize::try_from(written).unwrap_or(usize::MAX) >= buffer.len() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        buffer.truncate(usize::try_from(written).expect("u32 fits usize"));
+        Ok(PathBuf::from(OsString::from_wide(&buffer)).join("sc.exe"))
     }
 
     fn is_missing_service_error(error: &WindowsServiceError) -> bool {
@@ -2167,17 +3565,14 @@ mod app {
     }
 
     fn grant_interactive_service_control() -> Result<(), ServiceError> {
-        let output = ProcessCommand::new("sc.exe")
-            .args(["sdset", SERVICE_NAME, INTERACTIVE_SERVICE_SDDL])
-            .output()?;
-        if output.status.success() {
-            return Ok(());
-        }
-        Err(ServiceError::CommandFailed {
-            program: "sc.exe sdset",
-            exit_code: output.status.code(),
-            stderr: command_failure_text(&output),
-        })
+        run_system_sc(
+            &[
+                OsString::from("sdset"),
+                OsString::from(SERVICE_NAME),
+                OsString::from(INTERACTIVE_SERVICE_SDDL),
+            ],
+            "sc.exe sdset",
+        )
     }
 
     fn ensure_service_running(service: &Service) -> Result<(), ServiceError> {
@@ -2242,6 +3637,13 @@ mod app {
             return Ok(());
         };
         ensure_service_stopped(&service)?;
+        let stopped = service.query_status()?;
+        if stopped.exit_code != ServiceExitCode::Win32(0) {
+            return Err(ServiceError::ServiceStoppedWithError(format!(
+                "{:?}",
+                stopped.exit_code
+            )));
+        }
         println!("service stopped");
         Ok(())
     }
@@ -2275,18 +3677,94 @@ mod app {
         Ok(())
     }
 
-    fn uninstall() -> Result<(), ServiceError> {
+    fn cleanup_persisted_state(data_dir: &Path) -> Result<(), ServiceError> {
+        let managed_path = data_dir.join(MANAGED_STATE_FILE_NAME);
+        let background_path = data_dir.join(BACKGROUND_STATE_FILE_NAME);
+        let mut logger = EventLogger::console();
+        let managed_result = load_managed_state(&managed_path);
+        let background_result = load_background_state(&background_path);
+        let (mut managed, mut background) = match (managed_result, background_result) {
+            (Ok(managed), Ok(background)) => (managed, background),
+            (Ok(mut managed), Err(error)) => {
+                let cleanup = cleanup_managed(
+                    &mut logger,
+                    &mut managed,
+                    managed_path.exists().then_some(managed_path.as_path()),
+                );
+                return match cleanup {
+                    Ok(report) if report.failed == 0 => Err(error),
+                    cleanup => Err(ServiceError::TransactionRecovery {
+                        operation: Box::new(error),
+                        recovery: format!(
+                            "placement cleanup after background journal load failure: {cleanup:?}"
+                        ),
+                    }),
+                };
+            }
+            (Err(error), Ok(mut background)) => {
+                let cleanup = cleanup_background(
+                    &mut logger,
+                    &mut background,
+                    background_path
+                        .exists()
+                        .then_some(background_path.as_path()),
+                );
+                return match cleanup {
+                    Ok(report) if report.failed == 0 => Err(error),
+                    cleanup => Err(ServiceError::TransactionRecovery {
+                        operation: Box::new(error),
+                        recovery: format!(
+                            "background cleanup after placement journal load failure: {cleanup:?}"
+                        ),
+                    }),
+                };
+            }
+            (Err(error), Err(recovery)) => {
+                return Err(ServiceError::TransactionRecovery {
+                    operation: Box::new(error),
+                    recovery: format!("background journal also failed to load: {recovery}"),
+                });
+            }
+        };
+        let placement = cleanup_managed(
+            &mut logger,
+            &mut managed,
+            managed_path.exists().then_some(managed_path.as_path()),
+        )?;
+        let efficiency = cleanup_background(
+            &mut logger,
+            &mut background,
+            background_path
+                .exists()
+                .then_some(background_path.as_path()),
+        )?;
+        if placement.failed != 0 || efficiency.failed != 0 {
+            Err(ServiceError::CleanupIncomplete(
+                placement.failed.saturating_add(efficiency.failed),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn uninstall(data_directory: Option<&Path>) -> Result<(), ServiceError> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let data_dir = data_directory.map_or_else(
+            || program_data_dir().join(INSTALL_DIRECTORY_NAME),
+            Path::to_path_buf,
+        );
         let Some(service) = open_service_optional(
             &manager,
             SERVICE_NAME,
             ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
         )?
         else {
+            cleanup_persisted_state(&data_dir)?;
             println!("service is not installed");
             return Ok(());
         };
         ensure_service_stopped(&service)?;
+        cleanup_persisted_state(&data_dir)?;
         if let Err(error) = service.delete()
             && !is_service_marked_for_delete_error(&error)
         {
@@ -2358,30 +3836,7 @@ mod app {
     }
 
     fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
-        let temporary = path.with_extension("tmp");
-        let backup = path.with_extension("bak");
-        let mut file = File::create(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-
-        if backup.exists() {
-            fs::remove_file(&backup)?;
-        }
-        let had_original = path.exists();
-        if had_original {
-            fs::rename(path, &backup)?;
-        }
-        if let Err(error) = fs::rename(&temporary, path) {
-            if had_original {
-                let _ = fs::rename(&backup, path);
-            }
-            return Err(error);
-        }
-        if had_original {
-            fs::remove_file(backup)?;
-        }
-        Ok(())
+        platform::atomic_replace_file(path, bytes)
     }
 
     fn emergency_log(message: &str) -> Result<(), std::io::Error> {
@@ -2450,6 +3905,36 @@ mod app {
     mod tests {
         use super::*;
         use windows_service::service::ServiceDependency;
+
+        #[test]
+        fn queued_ticks_are_drained_without_hiding_control_commands() {
+            let (sender, receiver) = mpsc::channel();
+            sender.send(ControllerCommand::Tick).unwrap();
+            sender.send(ControllerCommand::Tick).unwrap();
+            sender.send(ControllerCommand::Disable).unwrap();
+            assert_eq!(
+                wait_for_command(Some(&receiver), Duration::from_secs(1)),
+                ControllerCommand::Disable
+            );
+        }
+
+        #[test]
+        fn interactive_wake_enqueues_at_most_one_outstanding_tick() {
+            let (sender, receiver) = mpsc::channel();
+            let pending = AtomicBool::new(false);
+            for _ in 0..100 {
+                request_interactive_wake(&sender, &pending);
+            }
+            assert_eq!(receiver.try_recv(), Ok(ControllerCommand::Tick));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+
+            pending.store(false, Ordering::Release);
+            request_interactive_wake(&sender, &pending);
+            assert_eq!(receiver.try_recv(), Ok(ControllerCommand::Tick));
+        }
 
         fn prior_service_config() -> ServiceConfig {
             ServiceConfig {
@@ -2768,6 +4253,534 @@ mod app {
                 current_domain: None,
                 exclusion: None,
             }
+        }
+
+        fn interactive_state(
+            session_id: u32,
+            foreground_pid: Option<u32>,
+            visible_pids: Vec<u32>,
+            audible_pids: Vec<u32>,
+        ) -> InteractiveActivityState {
+            InteractiveActivityState {
+                schema_version: winsched_control::INTERACTIVE_STATE_SCHEMA_VERSION,
+                session_id,
+                source_pid: 900,
+                source_creation_time_100ns: 9_000,
+                window_probe_available: true,
+                audio_probe_available: true,
+                foreground_pid,
+                visible_pids,
+                audible_pids,
+                updated_at_unix_ms: unix_time_ms(),
+            }
+        }
+
+        fn background_config() -> ControllerConfig {
+            ControllerConfig::from_toml(
+                r#"
+schema_version = 4
+controller_mode = "auto"
+
+[background_efficiency]
+enabled = true
+eco_qos_enabled = true
+memory_priority_enabled = true
+
+[[rules]]
+image = "worker.exe"
+mode = "auto"
+profile = "background"
+"#,
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn background_guard_wakes_quickly_without_accelerating_cpu_policy() {
+            let mut config = background_config();
+            config.sample_interval_ms = 60_000;
+            let runtime = RuntimeState::for_controller_mode(ControllerMode::Auto);
+            let started = Instant::now();
+
+            let guarded = controller_wait_interval(&config, &runtime, &BTreeMap::new(), started);
+            assert!(guarded <= BACKGROUND_SAFETY_INTERVAL);
+
+            config.background_efficiency.enabled = false;
+            let unguarded = controller_wait_interval(&config, &runtime, &BTreeMap::new(), started);
+            assert!(unguarded > Duration::from_secs(59));
+
+            let key = ProcessKey {
+                pid: 42,
+                creation_time_100ns: 420,
+            };
+            let state = ProcessEfficiencyState {
+                eco_qos: ProcessEcoQosState::Unset,
+                memory_priority: ProcessMemoryPriority::Normal,
+            };
+            let owned = ManagedBackgroundProcess {
+                key,
+                original: state,
+                applied: state,
+                ownership: ProcessEfficiencyOwnership {
+                    eco_qos: false,
+                    memory_priority: true,
+                },
+                pending: None,
+                pending_ownership: None,
+                blocked_by_external_override: ProcessEfficiencyOwnership::default(),
+            };
+            let managed = BTreeMap::from([(key, owned)]);
+            assert!(
+                controller_wait_interval(&config, &runtime, &managed, started)
+                    <= BACKGROUND_SAFETY_INTERVAL
+            );
+        }
+
+        struct ChildGuard(std::process::Child);
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn background_child() -> ChildGuard {
+            ChildGuard(
+                std::process::Command::new("cmd.exe")
+                    .args(["/d", "/c", "ping.exe -n 30 127.0.0.1 >nul"])
+                    .spawn()
+                    .expect("background child must start"),
+            )
+        }
+
+        #[test]
+        fn interactive_guards_fail_closed_and_protect_the_exact_rule_cohort() {
+            let config = background_config();
+            let mut foreground = process(10, "worker.exe", 100);
+            foreground.session_id = Some(2);
+            let mut helper = process(20, "worker.exe", 100);
+            helper.session_id = Some(2);
+            helper.parent_pid = foreground.key.pid;
+            let processes = vec![foreground, helper];
+
+            let missing = interactive_sessions(&[], unix_time_ms());
+            assert_eq!(
+                background_protection(&config, &processes[1], &processes, &missing),
+                Some(BackgroundProtection::ProbeUnavailable)
+            );
+
+            let state = interactive_state(2, Some(10), vec![10], Vec::new());
+            let sessions = interactive_sessions(&[state], unix_time_ms());
+            assert_eq!(
+                background_protection(&config, &processes[1], &processes, &sessions),
+                Some(BackgroundProtection::Foreground)
+            );
+
+            let clear = interactive_state(2, Some(99), vec![99], Vec::new());
+            let sessions = interactive_sessions(&[clear], unix_time_ms());
+            assert_eq!(
+                background_protection(&config, &processes[1], &processes, &sessions),
+                None
+            );
+        }
+
+        #[test]
+        fn incomplete_audio_probe_blocks_background_policy() {
+            let config = background_config();
+            let mut worker = process(10, "worker.exe", 100);
+            worker.session_id = Some(2);
+            let mut state = interactive_state(2, Some(99), vec![99], Vec::new());
+            state.audio_probe_available = false;
+            let sessions = interactive_sessions(&[state], unix_time_ms());
+            let processes = vec![worker];
+            assert_eq!(
+                background_protection(&config, &processes[0], &processes, &sessions),
+                Some(BackgroundProtection::ProbeUnavailable)
+            );
+        }
+
+        #[test]
+        fn sensor_status_counts_only_ready_required_sessions() {
+            let config = background_config();
+            let mut required = process(10, "worker.exe", 100);
+            required.session_id = Some(1);
+            let unrelated = interactive_state(2, Some(99), vec![99], Vec::new());
+            let mut streaks = BTreeMap::new();
+            let mut managed = BTreeMap::new();
+            let mut logger = EventLogger::console();
+
+            let report = reconcile_background_efficiency(
+                &config,
+                true,
+                &[required],
+                &[unrelated],
+                Some(false),
+                true,
+                &mut streaks,
+                &mut managed,
+                None,
+                &mut logger,
+            )
+            .unwrap();
+            assert_eq!(report.status.required_probe_sessions, 1);
+            assert_eq!(report.status.interactive_probe_sessions, 0);
+            assert_eq!(report.status.protected_processes, 1);
+        }
+
+        #[test]
+        fn memory_pressure_only_strengthens_owned_background_memory_priority() {
+            let config = background_config();
+            let original = ProcessEfficiencyState {
+                eco_qos: ProcessEcoQosState::Unset,
+                memory_priority: ProcessMemoryPriority::Normal,
+            };
+            assert_eq!(
+                desired_background_state(&config, original, false),
+                ProcessEfficiencyState {
+                    eco_qos: ProcessEcoQosState::Enabled,
+                    memory_priority: ProcessMemoryPriority::BelowNormal,
+                }
+            );
+            assert_eq!(
+                desired_background_state(&config, original, true).memory_priority,
+                ProcessMemoryPriority::Low
+            );
+        }
+
+        #[test]
+        fn background_memory_priority_never_raises_an_existing_lower_priority() {
+            let config = background_config();
+            let cases = [
+                (
+                    ProcessMemoryPriority::VeryLow,
+                    ProcessMemoryPriority::VeryLow,
+                    ProcessMemoryPriority::VeryLow,
+                ),
+                (
+                    ProcessMemoryPriority::Low,
+                    ProcessMemoryPriority::Low,
+                    ProcessMemoryPriority::Low,
+                ),
+                (
+                    ProcessMemoryPriority::Medium,
+                    ProcessMemoryPriority::Medium,
+                    ProcessMemoryPriority::Low,
+                ),
+                (
+                    ProcessMemoryPriority::BelowNormal,
+                    ProcessMemoryPriority::BelowNormal,
+                    ProcessMemoryPriority::Low,
+                ),
+                (
+                    ProcessMemoryPriority::Normal,
+                    ProcessMemoryPriority::BelowNormal,
+                    ProcessMemoryPriority::Low,
+                ),
+            ];
+            for (original_priority, normal_pressure, low_pressure) in cases {
+                let original = ProcessEfficiencyState {
+                    eco_qos: ProcessEcoQosState::Unset,
+                    memory_priority: original_priority,
+                };
+                assert_eq!(
+                    desired_background_state(&config, original, false).memory_priority,
+                    normal_pressure
+                );
+                assert_eq!(
+                    desired_background_state(&config, original, true).memory_priority,
+                    low_pressure
+                );
+            }
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn background_reconciler_applies_then_restores_a_real_owned_child() {
+            let child = background_child();
+            let pid = child.0.id();
+            let topology = platform::system_topology().unwrap();
+            let observed = platform::observe_processes(&topology)
+                .unwrap()
+                .into_iter()
+                .find(|process| process.key.pid == pid)
+                .expect("child process must be observable");
+            let ambient = platform::query_process_efficiency_key(observed.key).unwrap();
+            let original = ProcessEfficiencyState {
+                memory_priority: ProcessMemoryPriority::Normal,
+                ..ambient
+            };
+            if ambient != original {
+                platform::apply_process_efficiency_key(
+                    observed.key,
+                    ambient,
+                    original,
+                    ProcessEfficiencyOwnership {
+                        eco_qos: false,
+                        memory_priority: true,
+                    },
+                )
+                .unwrap();
+            }
+            let mut config = ControllerConfig {
+                controller_mode: ControllerMode::Auto,
+                rules: vec![winsched_config::ProcessRule {
+                    image: observed.image_name.clone(),
+                    mode: winsched_config::RuleMode::Auto,
+                    profile: WorkloadProfile::Background,
+                    group: None,
+                    llc: None,
+                }],
+                ..background_config()
+            };
+            config.policy.max_mutations_per_evaluation = 1;
+            let state_path = std::env::temp_dir().join(format!(
+                "winsched-background-reconcile-{}-{}.json",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            let clear = interactive_state(
+                observed.session_id.unwrap(),
+                Some(u32::MAX),
+                Vec::new(),
+                Vec::new(),
+            );
+            let processes = vec![observed.clone()];
+            let mut streaks = BTreeMap::new();
+            let mut managed = BTreeMap::new();
+            let mut logger = EventLogger::console();
+
+            reconcile_background_efficiency(
+                &config,
+                true,
+                &processes,
+                std::slice::from_ref(&clear),
+                Some(false),
+                true,
+                &mut streaks,
+                &mut managed,
+                Some(&state_path),
+                &mut logger,
+            )
+            .unwrap();
+            assert!(managed.is_empty());
+            let applied = reconcile_background_efficiency(
+                &config,
+                true,
+                &processes,
+                std::slice::from_ref(&clear),
+                Some(false),
+                true,
+                &mut streaks,
+                &mut managed,
+                Some(&state_path),
+                &mut logger,
+            )
+            .unwrap();
+            assert_eq!(applied.status.managed_processes, 1);
+            assert_eq!(
+                platform::query_process_efficiency_key(observed.key)
+                    .unwrap()
+                    .eco_qos,
+                ProcessEcoQosState::Enabled
+            );
+
+            let visible = interactive_state(
+                observed.session_id.unwrap(),
+                Some(pid),
+                vec![pid],
+                Vec::new(),
+            );
+            let restored = reconcile_background_efficiency(
+                &config,
+                true,
+                &processes,
+                &[visible],
+                Some(false),
+                true,
+                &mut streaks,
+                &mut managed,
+                Some(&state_path),
+                &mut logger,
+            )
+            .unwrap();
+            assert_eq!(restored.status.protected_processes, 1);
+            assert!(managed.is_empty());
+            assert_eq!(
+                platform::query_process_efficiency_key(observed.key).unwrap(),
+                original
+            );
+            if ambient != original {
+                platform::apply_process_efficiency_key(
+                    observed.key,
+                    original,
+                    ambient,
+                    ProcessEfficiencyOwnership {
+                        eco_qos: false,
+                        memory_priority: true,
+                    },
+                )
+                .unwrap();
+            }
+            fs::remove_file(state_path).unwrap();
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn external_memory_override_survives_visible_veto_and_eco_reapply() {
+            let child = background_child();
+            let pid = child.0.id();
+            let topology = platform::system_topology().unwrap();
+            let observed = platform::observe_processes(&topology)
+                .unwrap()
+                .into_iter()
+                .find(|process| process.key.pid == pid)
+                .expect("child process must be observable");
+            let ambient = platform::query_process_efficiency_key(observed.key).unwrap();
+            let original = ProcessEfficiencyState {
+                memory_priority: ProcessMemoryPriority::Normal,
+                ..ambient
+            };
+            if ambient != original {
+                platform::apply_process_efficiency_key(
+                    observed.key,
+                    ambient,
+                    original,
+                    ProcessEfficiencyOwnership {
+                        eco_qos: false,
+                        memory_priority: true,
+                    },
+                )
+                .unwrap();
+            }
+            let config = ControllerConfig {
+                controller_mode: ControllerMode::Auto,
+                rules: vec![winsched_config::ProcessRule {
+                    image: observed.image_name.clone(),
+                    mode: winsched_config::RuleMode::Auto,
+                    profile: WorkloadProfile::Background,
+                    group: None,
+                    llc: None,
+                }],
+                ..background_config()
+            };
+            let state_path = std::env::temp_dir().join(format!(
+                "winsched-background-external-veto-{}-{}.json",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            let clear = interactive_state(
+                observed.session_id.unwrap(),
+                Some(u32::MAX),
+                Vec::new(),
+                Vec::new(),
+            );
+            let processes = vec![observed.clone()];
+            let mut streaks = BTreeMap::new();
+            let mut managed = BTreeMap::new();
+            let mut logger = EventLogger::console();
+            for _ in 0..2 {
+                reconcile_background_efficiency(
+                    &config,
+                    true,
+                    &processes,
+                    std::slice::from_ref(&clear),
+                    Some(false),
+                    true,
+                    &mut streaks,
+                    &mut managed,
+                    Some(&state_path),
+                    &mut logger,
+                )
+                .unwrap();
+            }
+            let applied = platform::query_process_efficiency_key(observed.key).unwrap();
+            let external = ProcessEfficiencyState {
+                memory_priority: ProcessMemoryPriority::Medium,
+                ..applied
+            };
+            platform::apply_process_efficiency_key(
+                observed.key,
+                applied,
+                external,
+                ProcessEfficiencyOwnership {
+                    eco_qos: false,
+                    memory_priority: true,
+                },
+            )
+            .unwrap();
+            reconcile_background_efficiency(
+                &config,
+                true,
+                &processes,
+                std::slice::from_ref(&clear),
+                Some(false),
+                true,
+                &mut streaks,
+                &mut managed,
+                Some(&state_path),
+                &mut logger,
+            )
+            .unwrap();
+            let visible = interactive_state(
+                observed.session_id.unwrap(),
+                Some(pid),
+                vec![pid],
+                Vec::new(),
+            );
+            reconcile_background_efficiency(
+                &config,
+                true,
+                &processes,
+                &[visible],
+                Some(false),
+                true,
+                &mut streaks,
+                &mut managed,
+                Some(&state_path),
+                &mut logger,
+            )
+            .unwrap();
+            let blocked = managed.get(&observed.key).unwrap();
+            assert!(blocked.ownership.is_empty());
+            assert!(blocked.blocked_by_external_override.memory_priority);
+            let restored = platform::query_process_efficiency_key(observed.key).unwrap();
+            assert_eq!(restored.eco_qos, original.eco_qos);
+            assert_eq!(restored.memory_priority, ProcessMemoryPriority::Medium);
+
+            for expected_eco in [original.eco_qos, ProcessEcoQosState::Enabled] {
+                reconcile_background_efficiency(
+                    &config,
+                    true,
+                    &processes,
+                    std::slice::from_ref(&clear),
+                    Some(false),
+                    true,
+                    &mut streaks,
+                    &mut managed,
+                    Some(&state_path),
+                    &mut logger,
+                )
+                .unwrap();
+                let state = platform::query_process_efficiency_key(observed.key).unwrap();
+                assert_eq!(state.eco_qos, expected_eco);
+                assert_eq!(state.memory_priority, ProcessMemoryPriority::Medium);
+            }
+            cleanup_background(&mut logger, &mut managed, Some(&state_path)).unwrap();
+            let current = platform::query_process_efficiency_key(observed.key).unwrap();
+            if current != ambient {
+                platform::apply_process_efficiency_key(
+                    observed.key,
+                    current,
+                    ambient,
+                    ProcessEfficiencyOwnership {
+                        eco_qos: false,
+                        memory_priority: true,
+                    },
+                )
+                .unwrap();
+            }
+            fs::remove_file(state_path).unwrap();
         }
 
         fn observation_topology() -> Topology {
@@ -3181,6 +5194,198 @@ profile = "compute"
             assert!(load_managed_state(&path).unwrap().is_empty());
 
             fs::remove_file(&path).unwrap();
+        }
+
+        #[test]
+        fn background_journal_round_trips_pending_and_external_block_state() {
+            let path = std::env::temp_dir().join(format!(
+                "winsched-background-state-{}-{}.json",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            let key = ProcessKey {
+                pid: 91,
+                creation_time_100ns: 910,
+            };
+            let original = ProcessEfficiencyState {
+                eco_qos: ProcessEcoQosState::Unset,
+                memory_priority: ProcessMemoryPriority::Normal,
+            };
+            let desired = ProcessEfficiencyState {
+                eco_qos: ProcessEcoQosState::Enabled,
+                memory_priority: ProcessMemoryPriority::Normal,
+            };
+            let record = ManagedBackgroundProcess {
+                key,
+                original,
+                applied: original,
+                ownership: ProcessEfficiencyOwnership::between(original, desired),
+                pending: Some(desired),
+                pending_ownership: Some(ProcessEfficiencyOwnership::between(original, desired)),
+                blocked_by_external_override: ProcessEfficiencyOwnership {
+                    eco_qos: false,
+                    memory_priority: true,
+                },
+            };
+            let managed = BTreeMap::from([(key, record)]);
+
+            persist_background_state(Some(&path), &managed).unwrap();
+            assert_eq!(load_background_state(&path).unwrap(), managed);
+            persist_background_state(Some(&path), &BTreeMap::new()).unwrap();
+            assert!(load_background_state(&path).unwrap().is_empty());
+            fs::remove_file(path).unwrap();
+        }
+
+        #[test]
+        fn partial_restore_releases_the_successful_property_only() {
+            let key = ProcessKey {
+                pid: 93,
+                creation_time_100ns: 930,
+            };
+            let original = ProcessEfficiencyState {
+                eco_qos: ProcessEcoQosState::Unset,
+                memory_priority: ProcessMemoryPriority::Normal,
+            };
+            let applied = ProcessEfficiencyState {
+                eco_qos: ProcessEcoQosState::Enabled,
+                memory_priority: ProcessMemoryPriority::Low,
+            };
+            let mut record = ManagedBackgroundProcess {
+                key,
+                original,
+                applied,
+                ownership: ProcessEfficiencyOwnership {
+                    eco_qos: true,
+                    memory_priority: true,
+                },
+                pending: None,
+                pending_ownership: None,
+                blocked_by_external_override: ProcessEfficiencyOwnership::default(),
+            };
+            let report = platform::EfficiencyMutationReport {
+                operation: "restore_background_efficiency".to_owned(),
+                pid: key.pid,
+                committed: false,
+                previous: applied,
+                requested: ProcessEfficiencyState {
+                    eco_qos: original.eco_qos,
+                    memory_priority: applied.memory_priority,
+                },
+                observed: ProcessEfficiencyState {
+                    eco_qos: original.eco_qos,
+                    memory_priority: applied.memory_priority,
+                },
+                eco_qos_changed: true,
+                memory_priority_changed: false,
+                external_eco_qos_preserved: false,
+                external_memory_priority_preserved: false,
+                unrestored_ownership: ProcessEfficiencyOwnership {
+                    eco_qos: false,
+                    memory_priority: true,
+                },
+                property_errors: vec!["memory-priority restore failed".to_owned()],
+            };
+
+            apply_restore_report_to_record(&mut record, &report);
+            assert_eq!(
+                record.ownership,
+                ProcessEfficiencyOwnership {
+                    eco_qos: false,
+                    memory_priority: true,
+                }
+            );
+            assert_eq!(record.original.eco_qos, ProcessEcoQosState::Unset);
+            assert_eq!(
+                record.original.memory_priority,
+                ProcessMemoryPriority::Normal
+            );
+            assert_eq!(record.applied.memory_priority, ProcessMemoryPriority::Low);
+        }
+
+        #[test]
+        fn interrupted_legacy_atomic_write_recovers_the_backup_file() {
+            let path = std::env::temp_dir().join(format!(
+                "winsched-legacy-backup-{}-{}.json",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            let backup = path.with_extension("bak");
+            fs::write(&backup, b"durable journal").unwrap();
+
+            assert_eq!(
+                read_state_with_legacy_backup(&path).unwrap(),
+                Some(b"durable journal".to_vec())
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"durable journal");
+            assert!(!backup.exists());
+            fs::remove_file(path).unwrap();
+        }
+
+        #[test]
+        fn schema_one_background_journal_migrates_to_property_ownership() {
+            let path = std::env::temp_dir().join(format!(
+                "winsched-background-v1-{}-{}.json",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&json!({
+                    "schema_version": 1,
+                    "processes": [
+                        {
+                            "key": { "pid": 91, "creation_time_100ns": 910 },
+                            "original": { "eco_qos": "unset", "memory_priority": "normal" },
+                            "applied": { "eco_qos": "enabled", "memory_priority": "below_normal" },
+                            "pending": { "eco_qos": "enabled", "memory_priority": "low" },
+                            "blocked_by_external_override": false
+                        },
+                        {
+                            "key": { "pid": 92, "creation_time_100ns": 920 },
+                            "original": { "eco_qos": "unset", "memory_priority": "normal" },
+                            "applied": { "eco_qos": "enabled", "memory_priority": "below_normal" },
+                            "pending": { "eco_qos": "enabled", "memory_priority": "low" },
+                            "blocked_by_external_override": true
+                        }
+                    ]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let migrated = load_background_state(&path).unwrap();
+            let record = migrated
+                .get(&ProcessKey {
+                    pid: 91,
+                    creation_time_100ns: 910,
+                })
+                .unwrap();
+            assert_eq!(
+                record.ownership,
+                ProcessEfficiencyOwnership {
+                    eco_qos: true,
+                    memory_priority: true,
+                }
+            );
+            assert_eq!(record.pending_ownership, Some(record.ownership));
+            assert!(record.blocked_by_external_override.is_empty());
+            let blocked = migrated
+                .get(&ProcessKey {
+                    pid: 92,
+                    creation_time_100ns: 920,
+                })
+                .unwrap();
+            assert!(blocked.ownership.is_empty());
+            assert!(blocked.pending.is_none());
+            assert!(blocked.pending_ownership.is_none());
+            assert_eq!(
+                blocked.blocked_by_external_override,
+                ProcessEfficiencyOwnership {
+                    eco_qos: true,
+                    memory_priority: true,
+                }
+            );
+            fs::remove_file(path).unwrap();
         }
 
         #[test]

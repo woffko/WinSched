@@ -3,7 +3,10 @@
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
-use winsched_config::{ControllerConfig, ControllerMode, LoggingConfig, ResponsivenessConfig};
+use winsched_config::{
+    BackgroundEfficiencyConfig, ControllerConfig, ControllerMode, LoggingConfig,
+    ResponsivenessConfig,
+};
 use winsched_core::SystemReservePlan;
 use winsched_core::latency::SchedulerLatencyStatus;
 use winsched_core::responsiveness::ResponsivenessPressure;
@@ -13,12 +16,59 @@ pub const INSTALL_DIRECTORY_NAME: &str = "WinSched";
 pub const CONFIG_FILE_NAME: &str = "winsched.toml";
 pub const LOG_FILE_NAME: &str = "winsched.log";
 pub const MANAGED_STATE_FILE_NAME: &str = "managed-state.json";
+pub const BACKGROUND_STATE_FILE_NAME: &str = "background-state.json";
+pub const INTERACTIVE_PIPE_NAME: &str = r"\\.\pipe\WinSchedInteractive-v1";
 pub const RUNTIME_STATE_FILE_NAME: &str = "runtime-state.json";
 pub const STATUS_FILE_NAME: &str = "status.json";
 pub const CONTROL_ENABLE: u32 = 128;
 pub const CONTROL_DISABLE: u32 = 129;
 pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
-pub const STATUS_SCHEMA_VERSION: u32 = 3;
+pub const STATUS_SCHEMA_VERSION: u32 = 4;
+pub const INTERACTIVE_STATE_SCHEMA_VERSION: u32 = 1;
+pub const INTERACTIVE_STATE_HEARTBEAT_MS: u64 = 5_000;
+pub const INTERACTIVE_STATE_STALE_AFTER_MS: u64 = 15_000;
+
+/// Untrusted, per-session veto signals published by the unelevated tray.
+///
+/// The service may use this document only to avoid or undo a mutation. It must
+/// never use it to select a mutation target.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractiveActivityState {
+    pub schema_version: u32,
+    pub session_id: u32,
+    pub source_pid: u32,
+    pub source_creation_time_100ns: u64,
+    pub window_probe_available: bool,
+    pub audio_probe_available: bool,
+    pub foreground_pid: Option<u32>,
+    pub visible_pids: Vec<u32>,
+    pub audible_pids: Vec<u32>,
+    pub updated_at_unix_ms: u64,
+}
+
+impl InteractiveActivityState {
+    #[must_use]
+    pub fn is_fresh_at(&self, now_unix_ms: u64) -> bool {
+        self.schema_version == INTERACTIVE_STATE_SCHEMA_VERSION
+            && self.updated_at_unix_ms <= now_unix_ms
+            && now_unix_ms.saturating_sub(self.updated_at_unix_ms)
+                <= INTERACTIVE_STATE_STALE_AFTER_MS
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundEfficiencyStatus {
+    pub eligible_processes: usize,
+    pub managed_processes: usize,
+    pub protected_processes: usize,
+    pub required_probe_sessions: usize,
+    pub interactive_probe_sessions: usize,
+    pub memory_pressure_monitor_available: bool,
+    pub low_memory_condition: bool,
+    pub last_action: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,7 +126,9 @@ pub struct ControllerStatus {
     pub config_reload_error: Option<String>,
     pub applied_config_fingerprint: u64,
     pub applied_logging: LoggingConfig,
+    pub applied_background_efficiency: BackgroundEfficiencyConfig,
     pub applied_responsiveness: ResponsivenessConfig,
+    pub background_efficiency: BackgroundEfficiencyStatus,
     pub system_reserve: SystemReservePlan,
     pub scheduler_latency: SchedulerLatencyStatus,
     pub maximum_dpc_time_bps: u16,
@@ -113,7 +165,9 @@ impl ControllerStatus {
             config_reload_error: None,
             applied_config_fingerprint: config.fingerprint(),
             applied_logging: config.logging,
+            applied_background_efficiency: config.background_efficiency,
             applied_responsiveness: config.responsiveness,
+            background_efficiency: BackgroundEfficiencyStatus::default(),
             system_reserve,
             scheduler_latency: SchedulerLatencyStatus::default(),
             maximum_dpc_time_bps: 0,
@@ -200,5 +254,26 @@ mod tests {
         status.config_reload_sequence = 1;
         assert!(status.is_reload_receipt_after(Some((42, 99)), 1_000));
         assert!(!status.is_reload_receipt_after(Some((42, 99)), 1_001));
+    }
+
+    #[test]
+    fn interactive_activity_rejects_stale_future_and_wrong_schema() {
+        let mut state = InteractiveActivityState {
+            schema_version: INTERACTIVE_STATE_SCHEMA_VERSION,
+            session_id: 2,
+            source_pid: 42,
+            source_creation_time_100ns: 100,
+            window_probe_available: true,
+            audio_probe_available: true,
+            foreground_pid: Some(77),
+            visible_pids: vec![77],
+            audible_pids: Vec::new(),
+            updated_at_unix_ms: 1_000,
+        };
+        assert!(state.is_fresh_at(1_000 + INTERACTIVE_STATE_STALE_AFTER_MS));
+        assert!(!state.is_fresh_at(1_001 + INTERACTIVE_STATE_STALE_AFTER_MS));
+        assert!(!state.is_fresh_at(999));
+        state.schema_version += 1;
+        assert!(!state.is_fresh_at(1_000));
     }
 }

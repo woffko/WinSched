@@ -18,6 +18,7 @@ winsched-control = { path = "../../crates/winsched-control" }
 winsched-core = { path = "../../crates/winsched-core" }
 
 [target.'cfg(windows)'.dependencies]
+windows.workspace = true
 windows-service.workspace = true
 
 [lints]

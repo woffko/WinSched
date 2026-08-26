@@ -3,9 +3,11 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
+#[cfg(not(windows))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(windows))]
 use atomic_write_file::AtomicWriteFile;
 use thiserror::Error;
 use winsched_config::ControllerConfig;
@@ -93,6 +95,19 @@ pub fn render_config(config: &ControllerConfig) -> Result<String, SettingsError>
     Ok(toml::to_string_pretty(&validated)?)
 }
 
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    #[cfg(windows)]
+    {
+        winsched::platform::atomic_replace_file(path, bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut output = AtomicWriteFile::options().open(path)?;
+        output.write_all(bytes)?;
+        output.commit()
+    }
+}
+
 /// Atomically replaces a configuration file after validating its complete value.
 ///
 /// # Errors
@@ -108,9 +123,7 @@ pub fn save_config_atomic(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut output = AtomicWriteFile::options().open(path)?;
-    output.write_all(encoded.as_bytes())?;
-    output.commit()?;
+    write_atomic(path, encoded.as_bytes())?;
     Ok(validated)
 }
 
@@ -146,9 +159,7 @@ pub fn set_tray_autostart(
     if let Some(parent) = startup_shortcut.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut output = AtomicWriteFile::options().open(startup_shortcut)?;
-    output.write_all(&shortcut)?;
-    output.commit()?;
+    write_atomic(startup_shortcut, &shortcut)?;
     Ok(())
 }
 
@@ -238,17 +249,17 @@ mod tests {
 
         assert_ne!(edited, restore_defaults().unwrap());
         edited = restore_defaults().unwrap();
-        let shipped = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/winsched.default.toml"),
-        )
-        .unwrap();
-        let shipped = ControllerConfig::from_toml(&shipped).unwrap();
+        let shipped = ControllerConfig::from_toml(PRODUCT_DEFAULT_CONFIG).unwrap();
         assert_eq!(edited, shipped);
         assert_eq!(edited.controller_mode, ControllerMode::Auto);
         assert!(edited.all_user_processes);
         assert!(edited.logging.enabled);
         assert_eq!(edited.logging.max_file_size_mib, 10);
         assert_eq!(edited.logging.retained_archives, 1);
+        assert!(!edited.background_efficiency.enabled);
+        assert!(!edited.background_efficiency.eco_qos_enabled);
+        assert!(!edited.background_efficiency.memory_priority_enabled);
+        assert!(edited.background_efficiency.protect_visible);
         assert!(edited.responsiveness.enabled);
         assert_eq!(edited.responsiveness.system_reserve_percent, 10);
         assert!(!edited.responsiveness.memory.use_smt);
@@ -296,20 +307,22 @@ mod tests {
         .unwrap();
 
         let loaded = load_config(&path).unwrap();
-        assert_eq!(loaded.schema_version, 3);
+        assert_eq!(loaded.schema_version, 4);
         assert_eq!(loaded.sample_interval_ms, 2_500);
         assert_eq!(loaded.minimum_process_utilization_bps, 777);
         assert!(loaded.logging.enabled);
         assert_eq!(loaded.logging.max_file_size_mib, 10);
         assert_eq!(loaded.logging.retained_archives, 1);
         assert!(!loaded.responsiveness.enabled);
+        assert!(!loaded.background_efficiency.enabled);
 
         save_config_atomic(&path, &loaded).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("schema_version = 3"));
+        assert!(saved.contains("schema_version = 4"));
         assert!(saved.contains("minimum_process_utilization_bps = 777"));
         assert!(saved.contains("[logging]"));
         assert!(saved.contains("[responsiveness]"));
+        assert!(saved.contains("[background_efficiency]"));
         assert_eq!(load_config(&path).unwrap(), loaded);
     }
 

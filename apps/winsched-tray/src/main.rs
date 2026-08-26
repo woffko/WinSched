@@ -17,18 +17,28 @@ fn main() {
 
 #[cfg(windows)]
 mod app {
+    #![allow(unsafe_code)] // Narrow ShellExecuteW calls are documented at each use.
+
     use std::error::Error;
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::fs::{self, OpenOptions};
     use std::io::Write;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::process::CommandExt;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use tray_icon::menu::{AboutMetadataBuilder, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
     use windows_service::Error as WindowsServiceError;
     use windows_service::service::{ServiceAccess, ServiceState, UserEventCode};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -38,8 +48,9 @@ mod app {
     use winit::window::WindowId;
     use winsched_control::{
         CONFIG_FILE_NAME, CONTROL_DISABLE, CONTROL_ENABLE, ControllerStatus,
-        INSTALL_DIRECTORY_NAME, LOG_FILE_NAME, SERVICE_NAME, STATUS_FILE_NAME,
-        STATUS_SCHEMA_VERSION,
+        INSTALL_DIRECTORY_NAME, INTERACTIVE_PIPE_NAME, INTERACTIVE_STATE_HEARTBEAT_MS,
+        INTERACTIVE_STATE_SCHEMA_VERSION, InteractiveActivityState, LOG_FILE_NAME, SERVICE_NAME,
+        STATUS_FILE_NAME, STATUS_SCHEMA_VERSION,
     };
     use winsched_tray::{GITHUB_URL, MenuModel, ServiceViewState, about_details, build_menu_model};
 
@@ -52,8 +63,8 @@ mod app {
     const MENU_GITHUB: &str = "github";
     const MENU_EXIT: &str = "exit";
     const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+    const INTERACTIVE_PROBE_INTERVAL: Duration = Duration::from_millis(250);
     const STATUS_STALE_AFTER_MS: u64 = 75_000;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     #[derive(Debug, Clone)]
     enum UserEvent {
@@ -92,6 +103,119 @@ mod app {
         }
     }
 
+    struct InteractivePublisher {
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl InteractivePublisher {
+        fn start() -> Result<Self, String> {
+            let source = winsched::platform::current_process_key()
+                .map_err(|error| format!("interactive source identity failed: {error}"))?;
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker = std::thread::Builder::new()
+                .name("winsched-interactive-probe".to_owned())
+                .spawn(move || {
+                    let mut last_error = None::<String>;
+                    let mut last_published = None::<InteractiveActivityState>;
+                    let mut last_heartbeat = Instant::now()
+                        .checked_sub(Duration::from_millis(INTERACTIVE_STATE_HEARTBEAT_MS))
+                        .unwrap_or_else(Instant::now);
+                    while !worker_stop.load(Ordering::Acquire) {
+                        let result = winsched::platform::capture_interactive_activity()
+                            .map_err(|error| error.to_string())
+                            .and_then(|activity| {
+                                let state = interactive_state(activity, source);
+                                let changed = last_published.as_ref().is_none_or(|previous| {
+                                    !same_interactive_state_content(previous, &state)
+                                });
+                                let heartbeat_due = last_heartbeat.elapsed()
+                                    >= Duration::from_millis(INTERACTIVE_STATE_HEARTBEAT_MS);
+                                if changed || heartbeat_due {
+                                    publish_interactive_state(&state)
+                                        .map_err(|error| error.to_string())?;
+                                    last_published = Some(state);
+                                    last_heartbeat = Instant::now();
+                                }
+                                Ok(())
+                            });
+                        match result {
+                            Ok(()) => last_error = None,
+                            Err(error) if last_error.as_deref() == Some(error.as_str()) => {}
+                            Err(error) => {
+                                record_error(&format!("interactive probe failed: {error}"));
+                                last_error = Some(error);
+                            }
+                        }
+                        std::thread::sleep(INTERACTIVE_PROBE_INTERVAL);
+                    }
+                })
+                .map_err(|error| format!("cannot start interactive probe thread: {error}"))?;
+            Ok(Self {
+                stop,
+                worker: Some(worker),
+            })
+        }
+    }
+
+    impl Drop for InteractivePublisher {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn interactive_state(
+        activity: winsched::platform::InteractiveActivity,
+        source: winsched_core::adaptive::ProcessKey,
+    ) -> InteractiveActivityState {
+        let mut visible_pids = activity.visible_pids;
+        visible_pids.sort_unstable();
+        visible_pids.dedup();
+        let mut audible_pids = activity.audible_pids;
+        audible_pids.sort_unstable();
+        audible_pids.dedup();
+        InteractiveActivityState {
+            schema_version: INTERACTIVE_STATE_SCHEMA_VERSION,
+            session_id: activity.session_id,
+            source_pid: source.pid,
+            source_creation_time_100ns: source.creation_time_100ns,
+            window_probe_available: activity.window_probe_available,
+            audio_probe_available: activity.audio_probe_available,
+            foreground_pid: activity.foreground_pid,
+            visible_pids,
+            audible_pids,
+            updated_at_unix_ms: unix_time_ms(),
+        }
+    }
+
+    fn same_interactive_state_content(
+        left: &InteractiveActivityState,
+        right: &InteractiveActivityState,
+    ) -> bool {
+        left.session_id == right.session_id
+            && left.source_pid == right.source_pid
+            && left.source_creation_time_100ns == right.source_creation_time_100ns
+            && left.window_probe_available == right.window_probe_available
+            && left.audio_probe_available == right.audio_probe_available
+            && left.foreground_pid == right.foreground_pid
+            && left.visible_pids == right.visible_pids
+            && left.audible_pids == right.audible_pids
+    }
+
+    fn publish_interactive_state(
+        state: &InteractiveActivityState,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let encoded = serde_json::to_vec(state)?;
+        let mut output = OpenOptions::new().write(true).open(INTERACTIVE_PIPE_NAME)?;
+        output.write_all(&encoded)?;
+        Ok(())
+    }
+
     struct TrayUi {
         tray: TrayIcon,
         header: MenuItem,
@@ -101,6 +225,7 @@ mod app {
         managed: MenuItem,
         reserve: MenuItem,
         latency: MenuItem,
+        background: MenuItem,
         activity: MenuItem,
         error: MenuItem,
         settings: MenuItem,
@@ -118,6 +243,7 @@ mod app {
             let managed = MenuItem::new("Managed processes: 0", false, None);
             let reserve = MenuItem::new("System reserve: unavailable", false, None);
             let latency = MenuItem::new("Latency guard: unavailable", false, None);
+            let background = MenuItem::new("Background QoS: unavailable", false, None);
             let activity = MenuItem::new("Last activity: none", false, None);
             let error = MenuItem::new("Last error: none", false, None);
             let settings = MenuItem::with_id(MENU_SETTINGS, "Settings...", true, None);
@@ -155,6 +281,7 @@ mod app {
                 &managed,
                 &reserve,
                 &latency,
+                &background,
                 &activity,
                 &error,
                 &separator_2,
@@ -188,6 +315,7 @@ mod app {
                 managed,
                 reserve,
                 latency,
+                background,
                 activity,
                 error,
                 settings,
@@ -206,6 +334,7 @@ mod app {
             self.managed.set_text(&model.managed);
             self.reserve.set_text(&model.reserve);
             self.latency.set_text(&model.latency);
+            self.background.set_text(&model.background);
             self.activity.set_text(&model.activity);
             self.error.set_text(&model.error);
             self.settings.set_enabled(settings_present);
@@ -275,9 +404,9 @@ mod app {
             } else if event.id == MENU_SETTINGS {
                 launch_settings(&self.paths.settings)
             } else if event.id == MENU_OPEN_CONFIG {
-                open_file_or_directory(&self.paths.config, &self.paths.install_dir, "notepad.exe")
+                open_file_or_directory(&self.paths.config, &self.paths.install_dir)
             } else if event.id == MENU_OPEN_LOGS {
-                open_file_or_directory(&self.paths.log, &self.paths.install_dir, "notepad.exe")
+                open_file_or_directory(&self.paths.log, &self.paths.install_dir)
             } else if event.id == MENU_REFRESH {
                 Ok(())
             } else if event.id == MENU_GITHUB {
@@ -346,13 +475,23 @@ mod app {
             return Ok(());
         };
 
+        let paths = Paths::discover();
+        let interactive_publisher = match InteractivePublisher::start() {
+            Ok(publisher) => Some(publisher),
+            Err(error) => {
+                record_error(&error);
+                None
+            }
+        };
+
         let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
         let proxy = event_loop.create_proxy();
         MenuEvent::set_event_handler(Some(move |event| {
             let _ = proxy.send_event(UserEvent::Menu(event));
         }));
-        let mut application = TrayApplication::new(Paths::discover());
+        let mut application = TrayApplication::new(paths);
         event_loop.run_app(&mut application)?;
+        drop(interactive_publisher);
         drop(instance_lock);
         Ok(())
     }
@@ -360,17 +499,8 @@ mod app {
     fn acquire_instance_lock() -> Result<Option<InstanceLock>, std::io::Error> {
         let directory = tray_state_directory();
         fs::create_dir_all(&directory)?;
-        let session = std::env::var("SESSIONNAME").unwrap_or_else(|_| "default".to_owned());
-        let session = session
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                    character
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
+        let session = winsched::platform::current_session_id()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let path = directory.join(format!("tray-{session}.lock"));
         acquire_lock_at(&path)
     }
@@ -495,25 +625,24 @@ mod app {
         Ok(())
     }
 
-    fn open_file_or_directory(file: &Path, directory: &Path, editor: &str) -> Result<(), String> {
-        let (program, argument) = if file.exists() {
-            (editor, file)
-        } else {
-            ("explorer.exe", directory)
-        };
-        Command::new(program)
-            .arg(argument)
-            .spawn()
-            .map_err(|error| format!("Cannot open {}: {error}", argument.display()))?;
-        Ok(())
+    fn open_file_or_directory(file: &Path, directory: &Path) -> Result<(), String> {
+        if !file.exists() {
+            return shell_execute("open", directory, None);
+        }
+        let notepad = system_notepad_path()?;
+        let mut parameters = OsString::from("\"");
+        parameters.push(file.as_os_str());
+        parameters.push("\"");
+        shell_execute_with_parameters(
+            "open",
+            &notepad,
+            Some(parameters.as_os_str()),
+            notepad.parent(),
+        )
     }
 
     fn open_url(url: &str) -> Result<(), String> {
-        Command::new("explorer.exe")
-            .arg(url)
-            .spawn()
-            .map_err(|error| format!("Cannot open {url}: {error}"))?;
-        Ok(())
+        shell_execute("open", Path::new(url), None)
     }
 
     fn launch_settings(path: &Path) -> Result<(), String> {
@@ -523,26 +652,85 @@ mod app {
                 path.display()
             ));
         }
-        let escaped_path = path.to_string_lossy().replace('\'', "''");
-        let script = format!("Start-Process -FilePath '{escaped_path}' -Verb RunAs");
-        let status = Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                &script,
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .map_err(|error| format!("Cannot launch Settings: {error}"))?;
-        if !status.success() {
+        shell_execute("runas", path, path.parent())
+    }
+
+    fn shell_execute(
+        operation: &str,
+        target: &Path,
+        directory: Option<&Path>,
+    ) -> Result<(), String> {
+        shell_execute_with_parameters(operation, target, None, directory)
+    }
+
+    fn shell_execute_with_parameters(
+        operation: &str,
+        target: &Path,
+        parameters: Option<&OsStr>,
+        directory: Option<&Path>,
+    ) -> Result<(), String> {
+        let operation = operation.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let target_wide = target
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let directory_wide = directory.map(|directory| {
+            directory
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>()
+        });
+        let parameters_wide = parameters
+            .map(|parameters| parameters.encode_wide().chain(Some(0)).collect::<Vec<_>>());
+        // SAFETY: All UTF-16 buffers are NUL-terminated and remain live for the call.
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR(operation.as_ptr()),
+                PCWSTR(target_wide.as_ptr()),
+                parameters_wide
+                    .as_ref()
+                    .map_or(PCWSTR::null(), |value| PCWSTR(value.as_ptr())),
+                directory_wide
+                    .as_ref()
+                    .map_or(PCWSTR::null(), |value| PCWSTR(value.as_ptr())),
+                SW_SHOWNORMAL,
+            )
+        };
+        let code = result.0 as isize;
+        if code > 32 {
+            Ok(())
+        } else {
+            Err(format!(
+                "ShellExecuteW failed for {} with code {code}",
+                target.display()
+            ))
+        }
+    }
+
+    fn system_notepad_path() -> Result<PathBuf, String> {
+        // SAFETY: A null output buffer asks Windows for the required UTF-16 length.
+        let required = unsafe { GetSystemDirectoryW(None) };
+        if required == 0 {
             return Err(format!(
-                "Settings launch was cancelled or failed with {status}"
+                "GetSystemDirectoryW failed: {}",
+                std::io::Error::last_os_error()
             ));
         }
-        Ok(())
+        let mut buffer = vec![0u16; usize::try_from(required).expect("u32 fits usize") + 1];
+        // SAFETY: The buffer was sized from the preceding Win32 query.
+        let written = unsafe { GetSystemDirectoryW(Some(buffer.as_mut_slice())) };
+        let written = usize::try_from(written).expect("u32 fits usize");
+        if written == 0 || written >= buffer.len() {
+            return Err(format!(
+                "GetSystemDirectoryW failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        buffer.truncate(written);
+        Ok(PathBuf::from(OsString::from_wide(&buffer)).join("notepad.exe"))
     }
 
     fn is_service_missing(error: &WindowsServiceError) -> bool {

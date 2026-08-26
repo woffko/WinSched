@@ -34,6 +34,15 @@ $script:ui = @{
     RuResponsiveness = Expand-UnicodeEscapes "\u041e\u0442\u0437\u044b\u0432\u0447\u0438\u0432\u043e\u0441\u0442\u044c"
     RuResponsivenessHeading = Expand-UnicodeEscapes "\u0421\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 \u0440\u0435\u0437\u0435\u0440\u0432 \u043e\u0442\u0437\u044b\u0432\u0447\u0438\u0432\u043e\u0441\u0442\u0438"
     RuResponsivenessEnabled = Expand-UnicodeEscapes "\u0412\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0442\u043e\u043f\u043e\u043b\u043e\u0433\u0438\u0447\u0435\u0441\u043a\u0438\u0439 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 \u0440\u0435\u0437\u0435\u0440\u0432"
+    RuBackground = Expand-UnicodeEscapes "\u0424\u043e\u043d\u043e\u0432\u044b\u0435 \u0437\u0430\u0434\u0430\u0447\u0438"
+    RuBackgroundHeading = Expand-UnicodeEscapes "\u042d\u0444\u0444\u0435\u043a\u0442\u0438\u0432\u043d\u043e\u0441\u0442\u044c \u0444\u043e\u043d\u043e\u0432\u044b\u0445 \u0437\u0430\u0434\u0430\u0447"
+    RuBackgroundEnabled = Expand-UnicodeEscapes "\u0412\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u044d\u0444\u0444\u0435\u043a\u0442\u0438\u0432\u043d\u043e\u0441\u0442\u044c \u0444\u043e\u043d\u043e\u0432\u044b\u0445 \u0437\u0430\u0434\u0430\u0447"
+    RuEcoQos = Expand-UnicodeEscapes "\u041f\u0440\u0438\u043c\u0435\u043d\u044f\u0442\u044c EcoQoS"
+    RuBackgroundMemory = Expand-UnicodeEscapes "\u041f\u043e\u043d\u0438\u0436\u0430\u0442\u044c \u043f\u0440\u0438\u043e\u0440\u0438\u0442\u0435\u0442 \u043f\u0430\u043c\u044f\u0442\u0438 \u0444\u043e\u043d\u043e\u0432\u044b\u0445 \u0437\u0430\u0434\u0430\u0447"
+    RuMemoryGuard = Expand-UnicodeEscapes "\u0420\u0435\u0430\u0433\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043d\u0430 \u0443\u0432\u0435\u0434\u043e\u043c\u043b\u0435\u043d\u0438\u044f Windows \u043e \u043d\u0435\u0445\u0432\u0430\u0442\u043a\u0435 \u043f\u0430\u043c\u044f\u0442\u0438"
+    RuProtectForeground = Expand-UnicodeEscapes "\u0417\u0430\u0449\u0438\u0449\u0430\u0442\u044c \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435 foreground"
+    RuProtectVisible = Expand-UnicodeEscapes "\u0417\u0430\u0449\u0438\u0449\u0430\u0442\u044c \u0432\u0438\u0434\u0438\u043c\u044b\u0435 \u0438 \u0441\u0432\u0451\u0440\u043d\u0443\u0442\u044b\u0435 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u044f"
+    RuProtectAudio = Expand-UnicodeEscapes "\u0417\u0430\u0449\u0438\u0449\u0430\u0442\u044c \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u044f \u0441 \u0430\u043a\u0442\u0438\u0432\u043d\u044b\u043c \u0430\u0443\u0434\u0438\u043e"
     RuRules = Expand-UnicodeEscapes "\u041f\u0440\u0430\u0432\u0438\u043b\u0430 \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u043e\u0432"
     RuAddRule = Expand-UnicodeEscapes "\u0414\u043e\u0431\u0430\u0432\u0438\u0442\u044c \u043f\u0440\u0430\u0432\u0438\u043b\u043e \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u0430"
     RuNoRules = Expand-UnicodeEscapes "\u042f\u0432\u043d\u044b\u0435 \u043f\u0440\u0430\u0432\u0438\u043b\u0430 \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u043e\u0432 \u043d\u0435 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d\u044b."
@@ -147,7 +156,7 @@ function Wait-ServiceReload(
     Wait-Condition $Description {
         $status = Read-ServiceStatus
         $null -ne $status -and
-            [int]$status.schema_version -eq 3 -and
+            [int]$status.schema_version -eq 4 -and
             (Test-NewReloadReceipt $status $AfterBaseline) -and
             $status.config_reload_result -eq "reloaded" -and
             $status.configured_mode -eq $ExpectedMode -and
@@ -170,7 +179,7 @@ function Wait-RestoreReload(
     Wait-Condition "service reload after restoring original configuration" {
         $status = Read-ServiceStatus
         $null -ne $status -and
-            [int]$status.schema_version -eq 3 -and
+            [int]$status.schema_version -eq 4 -and
             (Test-NewReloadReceipt $status $AfterBaseline) -and
             $status.config_reload_result -eq "reloaded" -and
             $status.configured_mode -eq $ExpectedMode -and
@@ -563,7 +572,7 @@ function Get-ConfigSectionScalar([string]$Text, [string]$Section, [string]$Name)
 
 function Assert-ProductDefaults([string]$Text) {
     $expected = [ordered]@{
-        schema_version = "3"
+        schema_version = "4"
         controller_mode = "auto"
         sample_interval_ms = "1000"
         minimum_process_utilization_bps = "500"
@@ -594,6 +603,21 @@ function Assert-ProductDefaults([string]$Text) {
         $actual = Get-ConfigSectionScalar $Text "responsiveness" $field
         Assert-True ($actual -eq $responsivenessExpected[$field]) (
             "Product responsiveness default '$field' is '$actual', expected '$($responsivenessExpected[$field])'"
+        )
+    }
+    $backgroundExpected = [ordered]@{
+        enabled = "false"
+        eco_qos_enabled = "false"
+        memory_priority_enabled = "false"
+        memory_pressure_guard_enabled = "true"
+        protect_foreground = "true"
+        protect_visible = "true"
+        protect_audio = "true"
+    }
+    foreach ($field in $backgroundExpected.Keys) {
+        $actual = Get-ConfigSectionScalar $Text "background_efficiency" $field
+        Assert-True ($actual -eq $backgroundExpected[$field]) (
+            "Product background-efficiency default '$field' is '$actual', expected '$($backgroundExpected[$field])'"
         )
     }
     $memoryExpected = [ordered]@{
@@ -843,7 +867,7 @@ max_mutations_per_evaluation = 1
     Assert-HoverTooltip `
         $primaryWindow `
         @("Default workload profile") `
-        "Interactive stays on one LLC, Memory spreads one thread per physical core by default, Compute uses both SMT siblings, and Background/Balanced retain LLC-aware adaptive behavior."
+        "Interactive stays on one LLC, Memory spreads one thread per physical core by default, Compute uses both SMT siblings, and Background can opt an exact rule into reversible EcoQoS/memory handling. Balanced retains standard LLC-aware adaptive behavior."
     [void](Wait-AccessibleElement $primaryWindow @(
         "Start the WinSched tray automatically when a user signs in"
     ) $true)
@@ -889,6 +913,38 @@ max_mutations_per_evaluation = 1
         $true `
         300000
     $path = Join-Path $OutputDirectory "settings-responsiveness-en.png"
+    Capture-Window $primaryWindow $path
+    [void]$screenshots.Add((Split-Path -Leaf $path))
+
+    Invoke-NamedAccessibleElement $primaryWindow @("Background")
+    [void](Wait-AccessibleElement $primaryWindow @("Background efficiency") $false)
+    $backgroundToggle = Wait-AccessibleElement `
+        $primaryWindow `
+        @("Enable background efficiency") `
+        $true
+    Assert-True ((Get-ToggleState $backgroundToggle) -eq "Off") `
+        "Schema-3 working configuration unexpectedly enabled background efficiency"
+    Assert-HoverTooltip `
+        $primaryWindow `
+        @("Enable background efficiency") `
+        "Enables journaled process-level EcoQoS and memory-priority handling for explicitly marked background processes. Both mutations are off by default: native acceptance confirmed that a parent's memory priority propagates to children created later, and parent rollback does not restore those live children. Enable a property only for a known leaf workload."
+    Set-NamedToggleState $primaryWindow @("Enable background efficiency") "On"
+    Set-NamedToggleState $primaryWindow @("Apply EcoQoS") "Off"
+    Set-NamedToggleState $primaryWindow @("Lower background memory priority") "On"
+    Set-NamedToggleState `
+        $primaryWindow `
+        @("React to Windows low-memory notifications") `
+        "On"
+    Set-NamedToggleState $primaryWindow @("Protect the foreground application") "On"
+    Set-NamedToggleState `
+        $primaryWindow `
+        @("Protect visible and minimized applications") `
+        "On"
+    Set-NamedToggleState `
+        $primaryWindow `
+        @("Protect applications with active audio") `
+        "On"
+    $path = Join-Path $OutputDirectory "settings-background-en.png"
     Capture-Window $primaryWindow $path
     [void]$screenshots.Add((Split-Path -Leaf $path))
 
@@ -941,6 +997,26 @@ max_mutations_per_evaluation = 1
     Assert-True ((Get-ToggleState $responsivenessToggle) -eq "On") `
         "Russian Responsiveness tab did not preserve the enabled reserve"
     $path = Join-Path $OutputDirectory "settings-responsiveness-ru.png"
+    Capture-Window $primaryWindow $path
+    [void]$screenshots.Add((Split-Path -Leaf $path))
+
+    [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuBackground) $true)
+    Invoke-NamedAccessibleElement $primaryWindow @($script:ui.RuBackground)
+    [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuBackgroundHeading) $false)
+    foreach ($toggle in @(
+        [pscustomobject]@{ Name = $script:ui.RuBackgroundEnabled; State = "On" },
+        [pscustomobject]@{ Name = $script:ui.RuEcoQos; State = "Off" },
+        [pscustomobject]@{ Name = $script:ui.RuBackgroundMemory; State = "On" },
+        [pscustomobject]@{ Name = $script:ui.RuMemoryGuard; State = "On" },
+        [pscustomobject]@{ Name = $script:ui.RuProtectForeground; State = "On" },
+        [pscustomobject]@{ Name = $script:ui.RuProtectVisible; State = "On" },
+        [pscustomobject]@{ Name = $script:ui.RuProtectAudio; State = "On" }
+    )) {
+        $control = Wait-AccessibleElement $primaryWindow @($toggle.Name) $true
+        Assert-True ((Get-ToggleState $control) -eq $toggle.State) `
+            "Russian Background control '$($toggle.Name)' did not preserve state $($toggle.State)"
+    }
+    $path = Join-Path $OutputDirectory "settings-background-ru.png"
     Capture-Window $primaryWindow $path
     [void]$screenshots.Add((Split-Path -Leaf $path))
 
@@ -1013,6 +1089,25 @@ max_mutations_per_evaluation = 1
         2 `
         2 `
         "service receipt after enabling logging in the GUI"
+    Wait-Condition "background switches persisted by GUI Apply" {
+        try {
+            $text = Get-Content -LiteralPath $script:configPath -Raw
+            (Get-ConfigSectionScalar $text "background_efficiency" "enabled") -eq "true" -and
+                (Get-ConfigSectionScalar $text "background_efficiency" "eco_qos_enabled") -eq "false" -and
+                (Get-ConfigSectionScalar $text "background_efficiency" "memory_priority_enabled") -eq "true" -and
+                (Get-ConfigSectionScalar $text "background_efficiency" "memory_pressure_guard_enabled") -eq "true" -and
+                (Get-ConfigSectionScalar $text "background_efficiency" "protect_foreground") -eq "true" -and
+                (Get-ConfigSectionScalar $text "background_efficiency" "protect_visible") -eq "true" -and
+                (Get-ConfigSectionScalar $text "background_efficiency" "protect_audio") -eq "true"
+        } catch {
+            $false
+        }
+    }
+    $backgroundStatus = Read-ServiceStatus
+    Assert-True ([bool]$backgroundStatus.applied_background_efficiency.enabled) `
+        "service did not apply the GUI background master switch"
+    Assert-True (-not [bool]$backgroundStatus.applied_background_efficiency.eco_qos_enabled) `
+        "service unexpectedly enabled EcoQoS after GUI Apply"
 
     Set-NamedToggleState $primaryWindow @("Enable detailed service logging") "Off"
     Assert-NumericControl $primaryWindow @("Maximum active log size (MiB)") $false 2
@@ -1050,6 +1145,21 @@ max_mutations_per_evaluation = 1
         "Reload from disk did not preserve disabled logging"
     Assert-NumericControl $primaryWindow @("Maximum active log size (MiB)") $false 2
     Assert-NumericControl $primaryWindow @("Retained circular archives") $false 2
+
+    Invoke-NamedAccessibleElement $primaryWindow @("Background")
+    foreach ($toggle in @(
+        [pscustomobject]@{ Name = "Enable background efficiency"; State = "On" },
+        [pscustomobject]@{ Name = "Apply EcoQoS"; State = "Off" },
+        [pscustomobject]@{ Name = "Lower background memory priority"; State = "On" },
+        [pscustomobject]@{ Name = "React to Windows low-memory notifications"; State = "On" },
+        [pscustomobject]@{ Name = "Protect the foreground application"; State = "On" },
+        [pscustomobject]@{ Name = "Protect visible and minimized applications"; State = "On" },
+        [pscustomobject]@{ Name = "Protect applications with active audio"; State = "On" }
+    )) {
+        $control = Wait-AccessibleElement $primaryWindow @($toggle.Name) $true
+        Assert-True ((Get-ToggleState $control) -eq $toggle.State) `
+            "Reload from disk did not preserve Background control '$($toggle.Name)'"
+    }
 
     [void](Wait-AccessibleElement $primaryWindow @("General") $true)
     Invoke-NamedAccessibleElement $primaryWindow @("General")
@@ -1123,7 +1233,7 @@ max_mutations_per_evaluation = 1
         single_instance_notice_dismissed = $singleInstanceNoticeDismissed
         single_instance_verified = $true
         languages = @("EN", "RU")
-        pages = @("General", "Adaptive", "Responsiveness", "Process rules", "Logging")
+        pages = @("General", "Adaptive", "Responsiveness", "Background", "Process rules", "Logging")
         controls = @(
             "Tray autostart",
             "Enable topology-aware system reserve",
@@ -1137,6 +1247,13 @@ max_mutations_per_evaluation = 1
             "Minimum memory-profile cores",
             "Maximum memory-profile cores",
             "Memory resize cooldown (milliseconds)",
+            "Enable background efficiency",
+            "Apply EcoQoS",
+            "Lower background memory priority",
+            "React to Windows low-memory notifications",
+            "Protect the foreground application",
+            "Protect visible and minimized applications",
+            "Protect applications with active audio",
             "Enable detailed service logging",
             "Maximum active log size (MiB)",
             "Retained circular archives",
@@ -1149,10 +1266,12 @@ max_mutations_per_evaluation = 1
         controller_defaults_applied = $true
         responsiveness_defaults_applied = $true
         responsiveness_en_ru_ui = $true
+        background_en_ru_ui = $true
+        background_switch_persistence = $true
         logging_enabled_disabled_persistence = $true
         logging_defaults_applied = $true
-        tooltip_pages_verified = @("General", "Responsiveness", "Logging")
-        tooltips_verified = 4
+        tooltip_pages_verified = @("General", "Responsiveness", "Background", "Logging")
+        tooltips_verified = 5
         service_reload_observed = $true
         original_config_sha256 = $originalHash
         screenshots = @($screenshots)
