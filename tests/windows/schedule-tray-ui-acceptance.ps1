@@ -8,7 +8,7 @@ param(
     [string]$InteractiveUser,
     [string]$InstallDirectory = (Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "WinSched"),
     [string]$DataDirectory = (Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "WinSched"),
-    [string]$ExpectedVersion = "0.5.0"
+    [string]$ExpectedVersion = "0.5.1"
 )
 
 $ErrorActionPreference = "Stop"

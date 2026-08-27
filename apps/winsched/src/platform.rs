@@ -275,6 +275,14 @@ pub struct SystemPressureSample {
     pub available_physical_memory_bytes: u64,
 }
 
+/// Privacy-safe cumulative CPU and instantaneous memory usage for one process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ProcessResourceUsage {
+    pub uptime_ms: u64,
+    pub cpu_time_100ns: u64,
+    pub working_set_bytes: u64,
+}
+
 pub struct SystemPressureSampler {
     #[cfg(windows)]
     inner: windows::SystemPressureSampler,
@@ -592,12 +600,22 @@ pub fn current_process_key() -> Result<ProcessKey, PlatformError> {
 }
 
 #[cfg(windows)]
+pub fn current_process_resource_usage() -> Result<ProcessResourceUsage, PlatformError> {
+    windows::current_process_resource_usage().map_err(Into::into)
+}
+
+#[cfg(windows)]
 pub fn atomic_replace_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     windows::atomic_replace_file(path, bytes)
 }
 
 #[cfg(not(windows))]
 pub fn current_process_key() -> Result<ProcessKey, PlatformError> {
+    Err(PlatformError::UnsupportedPlatform)
+}
+
+#[cfg(not(windows))]
+pub fn current_process_resource_usage() -> Result<ProcessResourceUsage, PlatformError> {
     Err(PlatformError::UnsupportedPlatform)
 }
 
@@ -632,6 +650,15 @@ pub fn run_assigned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn current_process_resource_usage_requires_windows() {
+        assert!(matches!(
+            current_process_resource_usage(),
+            Err(PlatformError::UnsupportedPlatform)
+        ));
+    }
 
     #[test]
     fn efficiency_ownership_masks_compare_only_owned_properties() {

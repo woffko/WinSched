@@ -1,0 +1,9 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "version": "0.5.1",
+  "tray_controls": "PASS",
+  "tray_about_and_status": "PASS",
+  "settings_controls_and_tooltips": "PASS",
+  "diagnostics_and_self_observability": "PASS"
+}

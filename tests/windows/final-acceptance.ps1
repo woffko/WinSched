@@ -27,7 +27,8 @@ Write-Host "final stage: service and adaptive acceptance"
     -InteractiveUser $InteractiveUser
 
 Write-Host "final stage: bounded logging acceptance"
-& (Join-Path $TestDirectory "logging-acceptance.ps1")
+& (Join-Path $TestDirectory "logging-acceptance.ps1") `
+    -InteractiveUser $InteractiveUser
 
 Write-Host "final stage: tray UI acceptance"
 & powershell.exe `
@@ -40,12 +41,12 @@ Write-Host "final stage: tray UI acceptance"
     -InteractiveUser $InteractiveUser `
     -InstallDirectory $installDirectory `
     -DataDirectory $dataDirectory `
-    -ExpectedVersion "0.5.0"
+    -ExpectedVersion "0.5.1"
 if ($LASTEXITCODE -ne 0) {
     throw "tray UI acceptance failed with exit code $LASTEXITCODE"
 }
 
-Write-Host "final stage: v0.5 tray About and background status smoke"
+Write-Host "final stage: v0.5.1 tray About and background status smoke"
 & powershell.exe `
     -NoProfile `
     -NonInteractive `
@@ -56,12 +57,12 @@ Write-Host "final stage: v0.5 tray About and background status smoke"
     -InteractiveUser $InteractiveUser `
     -InstallDirectory $installDirectory `
     -DataDirectory $dataDirectory `
-    -ExpectedVersion "0.5.0"
+    -ExpectedVersion "0.5.1"
 if ($LASTEXITCODE -ne 0) {
-    throw "v0.5 tray smoke failed with exit code $LASTEXITCODE"
+    throw "v0.5.1 tray smoke failed with exit code $LASTEXITCODE"
 }
 
-Write-Host "final stage: v0.5 settings UI acceptance"
+Write-Host "final stage: v0.5.1 settings UI acceptance"
 & powershell.exe `
     -NoProfile `
     -NonInteractive `

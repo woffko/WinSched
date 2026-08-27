@@ -1,4 +1,8 @@
 #[cfg(any(windows, test))]
+mod controller_telemetry;
+#[cfg(any(windows, test))]
+mod decision_log;
+#[cfg(any(windows, test))]
 mod event_logger;
 #[cfg(any(windows, test))]
 mod responsiveness_log;
@@ -24,9 +28,11 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(windows)]
 mod app {
-    use crate::event_logger::EventSink;
+    use crate::controller_telemetry::EvaluationAccumulator;
+    use crate::decision_log::{DecisionLogSummary, DecisionSummaryGate};
+    use crate::event_logger::{EventSink, EventSinkStats};
     use crate::responsiveness_log::{ResponsivenessLogGate, ResponsivenessSignature};
-    use crate::status_publisher::StatusPublishGate;
+    use crate::status_publisher::{DEFAULT_STATUS_HEARTBEAT_INTERVAL_MS, StatusPublishGate};
     use std::cmp::Reverse;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::{OsStr, OsString};
@@ -63,13 +69,16 @@ mod app {
         self, MutationReport, ProcessEcoQosState, ProcessEfficiencyOwnership,
         ProcessEfficiencyState, ProcessMemoryPriority,
     };
-    use winsched_config::{ControllerConfig, ControllerMode, LoggingConfig, WorkloadProfile};
+    use winsched_config::{
+        ControllerConfig, ControllerMode, LoggingConfig, LoggingLevel, WorkloadProfile,
+    };
     use winsched_control::{
         BACKGROUND_STATE_FILE_NAME, BackgroundEfficiencyStatus, CONFIG_FILE_NAME, CONTROL_DISABLE,
-        CONTROL_ENABLE, ConfigReloadResult, ControllerPhase, ControllerStatus,
-        INSTALL_DIRECTORY_NAME, InteractiveActivityState, LOG_FILE_NAME, MANAGED_STATE_FILE_NAME,
-        RUNTIME_SCHEMA_VERSION, RUNTIME_STATE_FILE_NAME, RuntimeState, SERVICE_NAME,
-        STATUS_FILE_NAME,
+        CONTROL_ENABLE, ConfigReloadResult, ControllerPhase, ControllerStatus, ControllerTelemetry,
+        INSTALL_DIRECTORY_NAME, InteractiveActivityState, LOG_FILE_NAME, LoggingTelemetry,
+        MANAGED_STATE_FILE_NAME, MutationTelemetry, RUNTIME_SCHEMA_VERSION,
+        RUNTIME_STATE_FILE_NAME, RuntimeState, SERVICE_NAME, STATUS_FILE_NAME,
+        ServiceProcessTelemetry,
     };
     use winsched_core::adaptive::{
         AssignmentOrigin, DecisionReason, PlacementMode, PolicyAction, PolicyDecision,
@@ -721,6 +730,7 @@ mod app {
         let mut iteration = 0u64;
         let mut status_publish_gate = StatusPublishGate::default();
         let mut responsiveness_log_gate = ResponsivenessLogGate::default();
+        let mut evaluation_accumulator = EvaluationAccumulator::default();
         // Re-read once on the first tick. This closes the narrow startup race where Settings
         // can replace the file after the service loaded it but before its first metadata read.
         let mut config_modified = files.config.map(|_| SystemTime::UNIX_EPOCH);
@@ -740,6 +750,7 @@ mod app {
         status.scheduler_latency = latency_probe.status();
         status.memory_profile_physical_cores = width_controller.current_physical_cores();
         status.responsiveness_pressure = width_controller.pressure();
+        status.telemetry = Some(ControllerTelemetry::default());
         let loop_result: Result<(), ServiceError> = (|| {
             if !controller_mutations_active(&config, &runtime) {
                 let cleanup = cleanup_managed(logger, &mut managed, files.managed_state)?;
@@ -757,6 +768,7 @@ mod app {
                 &mut status,
                 0,
                 true,
+                logger,
             )?;
             sampler.prime()?;
             logger.emit(json!({
@@ -789,6 +801,7 @@ mod app {
                     interactive_wake_pending.store(false, Ordering::Release);
                 }
                 let evaluation_time_ms = controller_elapsed_ms(started);
+                logger.flush_due_decision_summary(evaluation_time_ms);
                 match command {
                     ControllerCommand::Stop => {
                         status.phase = ControllerPhase::Stopping;
@@ -799,10 +812,14 @@ mod app {
                             &mut status,
                             evaluation_time_ms,
                             true,
+                            logger,
                         )?;
                         break Ok(());
                     }
                     ControllerCommand::Enable => {
+                        if !runtime.scheduling_enabled {
+                            logger.flush_decision_summary(evaluation_time_ms, "scheduling_changed");
+                        }
                         set_runtime_enabled(
                             true,
                             &mut runtime,
@@ -824,10 +841,14 @@ mod app {
                             &mut status,
                             evaluation_time_ms,
                             true,
+                            logger,
                         )?;
                         continue;
                     }
                     ControllerCommand::Disable => {
+                        if runtime.scheduling_enabled {
+                            logger.flush_decision_summary(evaluation_time_ms, "scheduling_changed");
+                        }
                         set_runtime_enabled(
                             false,
                             &mut runtime,
@@ -867,6 +888,7 @@ mod app {
                             &mut status,
                             evaluation_time_ms,
                             true,
+                            logger,
                         )?;
                         continue;
                     }
@@ -880,6 +902,7 @@ mod app {
                     &mut managed,
                     files.managed_state,
                     logger,
+                    evaluation_time_ms,
                 )?;
                 if !matches!(&reload, ConfigReload::Unchanged) {
                     reserve_plan = system_reserve_plan(&topology, &config);
@@ -905,6 +928,7 @@ mod app {
                         &mut status,
                         evaluation_time_ms,
                         true,
+                        logger,
                     )?;
                     logger.emit(event);
                 }
@@ -930,6 +954,7 @@ mod app {
                         &mut status,
                         evaluation_time_ms,
                         important_status_change,
+                        logger,
                     )?;
                     if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
                         break Ok(());
@@ -939,6 +964,22 @@ mod app {
                 let policy_elapsed = last_policy_evaluation.elapsed();
                 let configured_policy_interval = Duration::from_millis(config.sample_interval_ms);
                 if policy_elapsed < configured_policy_interval {
+                    if !background_safety_active(&config, &runtime, &managed_background) {
+                        // A heartbeat-only wake must not turn a long policy interval into an
+                        // extra full process scan. Publish the bounded status heartbeat and wait
+                        // for the original policy deadline.
+                        status.phase = ControllerPhase::Running;
+                        status.scheduler_latency = latency_probe.status();
+                        publish_controller_status(
+                            &mut status_publish_gate,
+                            files.status,
+                            &mut status,
+                            evaluation_time_ms,
+                            false,
+                            logger,
+                        )?;
+                        continue;
+                    }
                     let status_error_before_guard = status.last_error.clone();
                     let tick = run_background_safety_tick(
                         &config,
@@ -967,12 +1008,14 @@ mod app {
                         &mut status,
                         evaluation_time_ms,
                         important_status_change,
+                        logger,
                     )?;
                     continue;
                 }
                 last_policy_evaluation = Instant::now();
                 let effective_sample_interval_ms =
                     u64::try_from(policy_elapsed.as_millis()).unwrap_or(u64::MAX);
+                let evaluation_started = Instant::now();
                 let loads = match sampler.sample() {
                     Ok(loads) => loads,
                     Err(error) => {
@@ -1013,6 +1056,7 @@ mod app {
                             &mut status,
                             evaluation_time_ms,
                             true,
+                            logger,
                         )?;
                         if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
                             break Ok(());
@@ -1117,9 +1161,22 @@ mod app {
                     Ok(decisions) => decisions,
                     Err(error) => break Err(error.into()),
                 };
+                let decision_count = decisions.len();
                 for decision in decisions {
-                    log_decision(logger, &processes, &decision);
-                    status.last_activity = Some(decision_summary(&processes, &decision));
+                    let image = if logger.wants_raw_decision(&decision) {
+                        processes
+                            .iter()
+                            .find(|process| process.key == decision.process)
+                            .map(|process| process.image_name.as_str())
+                    } else {
+                        None
+                    };
+                    logger.decision(evaluation_time_ms, image, &decision);
+                    if decision.action.is_mutation()
+                        || matches!(decision.reason, DecisionReason::RateLimited)
+                    {
+                        status.last_activity = Some(decision_summary(&processes, &decision));
+                    }
                     if decision.enforce && decision.action.is_mutation() {
                         if let Some(error) = enforce_decision(
                             logger,
@@ -1138,6 +1195,15 @@ mod app {
                 if let Some(error) = background_error {
                     status.last_error = Some(format!("Background efficiency: {error}"));
                 }
+                evaluation_accumulator.record(
+                    u64::try_from(evaluation_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    processes.len(),
+                    observations.len(),
+                    decision_count,
+                );
+                if let Some(telemetry) = &mut status.telemetry {
+                    telemetry.evaluation = evaluation_accumulator.status();
+                }
 
                 iteration = iteration.saturating_add(1);
                 status.iteration = iteration;
@@ -1153,6 +1219,7 @@ mod app {
                     &mut status,
                     evaluation_time_ms,
                     important_status_change,
+                    logger,
                 )?;
                 if max_iterations.is_some_and(|limit| iteration >= u64::from(limit)) {
                     break Ok(());
@@ -1187,17 +1254,20 @@ mod app {
         } else if let Err(error) = &cleanup_result {
             status.last_error = Some(error.to_string());
         }
-        let status_result = publish_controller_status(
-            &mut status_publish_gate,
-            files.status,
-            &mut status,
-            controller_elapsed_ms(started),
-            true,
-        );
+        let stopped_at_ms = controller_elapsed_ms(started);
+        logger.flush_decision_summary(stopped_at_ms, "shutdown");
         logger.emit(json!({
             "event": "controller_stopped",
             "success": loop_result.is_ok(),
         }));
+        let status_result = publish_controller_status(
+            &mut status_publish_gate,
+            files.status,
+            &mut status,
+            stopped_at_ms,
+            true,
+            logger,
+        );
         match (loop_result, cleanup_result, status_result) {
             (Err(error), _, _) | (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => {
                 Err(error)
@@ -1224,17 +1294,34 @@ mod app {
         last_policy_evaluation: Instant,
     ) -> Duration {
         let configured = Duration::from_millis(config.sample_interval_ms);
-        let until_policy = configured.saturating_sub(last_policy_evaluation.elapsed());
-        let background_rule_active = controller_mutations_active(config, runtime)
-            && config
-                .rules
-                .iter()
-                .any(|rule| config.background_efficiency_applies(&rule.image));
-        if background_rule_active || !managed_background.is_empty() {
-            until_policy.min(BACKGROUND_SAFETY_INTERVAL)
+        let until_policy = if controller_evaluation_active(config, runtime) {
+            configured.saturating_sub(last_policy_evaluation.elapsed())
         } else {
-            until_policy
+            // An inactive controller has no overdue policy evaluation to catch up with. Reusing
+            // an old evaluation timestamp here turns the wait into zero and spins the disabled
+            // cleanup/status loop continuously.
+            configured
+        };
+        let until_status_heartbeat = Duration::from_millis(DEFAULT_STATUS_HEARTBEAT_INTERVAL_MS);
+        let until_routine_wake = until_policy.min(until_status_heartbeat);
+        if background_safety_active(config, runtime, managed_background) {
+            until_routine_wake.min(BACKGROUND_SAFETY_INTERVAL)
+        } else {
+            until_routine_wake
         }
+    }
+
+    fn background_safety_active(
+        config: &ControllerConfig,
+        runtime: &RuntimeState,
+        managed_background: &ManagedBackground,
+    ) -> bool {
+        !managed_background.is_empty()
+            || (controller_mutations_active(config, runtime)
+                && config
+                    .rules
+                    .iter()
+                    .any(|rule| config.background_efficiency_applies(&rule.image)))
     }
 
     const fn controller_evaluation_active(
@@ -1449,11 +1536,23 @@ mod app {
                         changed = true;
                     }
                 } else {
+                    logger.emit(json!({
+                        "event": "managed_assignment_external_override",
+                        "process": key,
+                        "expected_cpu_sets": 0,
+                        "observed_cpu_sets": process.default_cpu_set_ids.len(),
+                    }));
                     managed.remove(&key);
                     changed = true;
                     continue;
                 }
             } else if process.default_cpu_set_ids != placement.cpu_set_ids {
+                logger.emit(json!({
+                    "event": "managed_assignment_external_override",
+                    "process": key,
+                    "expected_cpu_sets": placement.cpu_set_ids.len(),
+                    "observed_cpu_sets": process.default_cpu_set_ids.len(),
+                }));
                 managed.remove(&key);
                 changed = true;
                 continue;
@@ -1465,6 +1564,7 @@ mod app {
             let target_gone = result
                 .as_ref()
                 .is_err_and(winsched::platform::PlatformError::process_no_longer_matches);
+            logger.record_placement_mutation(result.is_ok() || target_gone);
             logger.emit(json!({
                 "event": "cleanup_excluded",
                 "process": key,
@@ -1553,6 +1653,7 @@ mod app {
         managed: &mut ManagedAssignments,
         state_path: Option<&Path>,
         logger: &mut EventLogger,
+        monotonic_ms: u64,
     ) -> Result<ConfigReload, ServiceError> {
         let Some(path) = config_path else {
             return Ok(ConfigReload::Unchanged);
@@ -1569,7 +1670,7 @@ mod app {
                     fail_closed: false,
                 },
                 Ok(updated_engine) => {
-                    if let Err(error) = logger.reconfigure(updated.logging) {
+                    if let Err(error) = logger.reconfigure(updated.logging, monotonic_ms) {
                         ConfigReload::Rejected {
                             error: format!(
                                 "failed to apply logging configuration; prior configuration retained: {error}"
@@ -1584,6 +1685,7 @@ mod app {
                 }
             },
             Err(error) => {
+                logger.flush_decision_summary(monotonic_ms, "config_rejected_fail_closed");
                 let prior_logging = config.logging;
                 let cleanup = cleanup_managed(logger, managed, state_path);
                 *config = ControllerConfig {
@@ -1672,25 +1774,6 @@ mod app {
             "scheduling_enabled": enabled,
         }));
         Ok(())
-    }
-
-    fn log_decision(
-        logger: &mut EventLogger,
-        processes: &[platform::ObservedProcess],
-        decision: &PolicyDecision,
-    ) {
-        let image = processes
-            .iter()
-            .find(|process| process.key == decision.process)
-            .map(|process| process.image_name.as_str());
-        logger.emit(json!({
-            "event": "decision",
-            "process": decision.process,
-            "image": image,
-            "enforce": decision.enforce,
-            "action": decision.action,
-            "reason": decision.reason,
-        }));
     }
 
     fn decision_summary(
@@ -1788,6 +1871,7 @@ mod app {
                 ..
             } => {
                 let result = platform::apply_process_key(decision.process, cpu_set_ids);
+                logger.record_placement_mutation(result.is_ok());
                 finish_enforcement(
                     logger,
                     engine,
@@ -1804,6 +1888,7 @@ mod app {
             PolicyAction::Ignore | PolicyAction::Keep { .. } => return Ok(None),
         };
         let result = platform::clear_process_key(decision.process);
+        logger.record_placement_mutation(result.is_ok());
         finish_enforcement(
             logger,
             engine,
@@ -1848,7 +1933,8 @@ mod app {
             }
             if let Err(error) = persist_managed_state(state_path, managed) {
                 if target.is_some() {
-                    let _ = platform::clear_process_key(decision.process);
+                    let rollback = platform::clear_process_key(decision.process);
+                    logger.record_placement_mutation(rollback.is_ok());
                     managed.remove(&decision.process);
                 }
                 return Err(error);
@@ -1894,9 +1980,13 @@ mod app {
             attempted: entries.len(),
             ..CleanupReport::default()
         };
+        if entries.is_empty() {
+            return Ok(report);
+        }
         let mut events = Vec::with_capacity(entries.len());
         for process in entries {
             let result = clear(process);
+            logger.record_placement_mutation(result.is_ok());
             if result.is_ok() {
                 managed.remove(&process);
                 report.cleared += 1;
@@ -2375,13 +2465,19 @@ mod app {
                         managed.insert(process.key, record);
                         persist_background_state(state_path, managed)?;
                     } else {
-                        match platform::restore_process_efficiency_key(
+                        let recovery = platform::restore_process_efficiency_key(
                             process.key,
                             record.original,
                             record.applied,
                             transaction_ownership,
                             record.pending,
-                        ) {
+                        );
+                        logger.record_background_mutation(
+                            recovery
+                                .as_ref()
+                                .is_ok_and(|report| report.property_errors.is_empty()),
+                        );
+                        match recovery {
                             Ok(report) => {
                                 let changed = apply_restore_report_to_record(&mut record, &report);
                                 if !report.property_errors.is_empty() {
@@ -2397,6 +2493,11 @@ mod app {
                                 }));
                             }
                             Err(error) => {
+                                logger.emit(json!({
+                                    "event": "background_efficiency_pending_recovery_failed",
+                                    "process": process.key,
+                                    "error": error.to_string(),
+                                }));
                                 last_error = Some(error.to_string());
                             }
                         }
@@ -2438,13 +2539,19 @@ mod app {
                         persist_background_state(state_path, managed)?;
                         continue;
                     }
-                    match platform::restore_process_efficiency_key(
+                    let restoration = platform::restore_process_efficiency_key(
                         process.key,
                         record.original,
                         record.applied,
                         record.ownership,
                         None,
-                    ) {
+                    );
+                    logger.record_background_mutation(
+                        restoration
+                            .as_ref()
+                            .is_ok_and(|report| report.property_errors.is_empty()),
+                    );
+                    match restoration {
                         Ok(report) => {
                             let externally_overridden =
                                 apply_restore_report_to_record(&mut record, &report);
@@ -2481,7 +2588,14 @@ mod app {
                                 "report": report,
                             }));
                         }
-                        Err(error) => last_error = Some(error.to_string()),
+                        Err(error) => {
+                            logger.emit(json!({
+                                "event": "background_efficiency_restore_failed",
+                                "process": process.key,
+                                "error": error.to_string(),
+                            }));
+                            last_error = Some(error.to_string());
+                        }
                     }
                     continue;
                 }
@@ -2519,12 +2633,14 @@ mod app {
                 managed.insert(process.key, record);
                 persist_background_state(state_path, managed)?;
                 mutation_budget = mutation_budget.saturating_sub(1);
-                match platform::apply_process_efficiency_key(
+                let application = platform::apply_process_efficiency_key(
                     process.key,
                     record.applied,
                     desired,
                     transaction_ownership,
-                ) {
+                );
+                logger.record_background_mutation(application.is_ok());
+                match application {
                     Ok(report) => {
                         record.applied = report.observed;
                         record.ownership = desired_ownership;
@@ -2545,6 +2661,11 @@ mod app {
                         }));
                     }
                     Err(error) => {
+                        logger.emit(json!({
+                            "event": "background_efficiency_update_failed",
+                            "process": process.key,
+                            "error": error.to_string(),
+                        }));
                         last_error = Some(error.to_string());
                         if error.efficiency_ownership_changed()
                             && let Ok(current) = platform::query_process_efficiency_key(process.key)
@@ -2603,12 +2724,14 @@ mod app {
             managed.insert(process.key, record);
             persist_background_state(state_path, managed)?;
             mutation_budget = mutation_budget.saturating_sub(1);
-            match platform::apply_process_efficiency_key(
+            let application = platform::apply_process_efficiency_key(
                 process.key,
                 original,
                 desired,
                 desired_ownership,
-            ) {
+            );
+            logger.record_background_mutation(application.is_ok());
+            match application {
                 Ok(report) => {
                     record.applied = report.observed;
                     record.pending = None;
@@ -2628,6 +2751,11 @@ mod app {
                     }));
                 }
                 Err(error) => {
+                    logger.emit(json!({
+                        "event": "background_efficiency_apply_failed",
+                        "process": process.key,
+                        "error": error.to_string(),
+                    }));
                     last_error = Some(error.to_string());
                     if let Ok(current) = platform::query_process_efficiency_key(process.key) {
                         if error.efficiency_ownership_changed() {
@@ -2680,6 +2808,9 @@ mod app {
             attempted: entries.len(),
             ..CleanupReport::default()
         };
+        if entries.is_empty() {
+            return Ok(report);
+        }
         for mut record in entries {
             if record.ownership.is_empty() {
                 managed.remove(&record.key);
@@ -2724,6 +2855,7 @@ mod app {
                     false
                 }
             };
+            logger.record_background_mutation(succeeded);
             logger.emit(json!({
                 "event": "background_efficiency_cleanup",
                 "process": record.key,
@@ -2956,11 +3088,46 @@ mod app {
         status: &mut ControllerStatus,
         monotonic_ms: u64,
         force: bool,
+        logger: &EventLogger,
     ) -> Result<(), ServiceError> {
         if !gate.should_publish(monotonic_ms, force) {
             return Ok(());
         }
-        persist_controller_status(path, status)?;
+        let prior_status_writes = status
+            .telemetry
+            .as_ref()
+            .map_or(0, |telemetry| telemetry.logging.status_writes);
+        if let Some(telemetry) = &mut status.telemetry {
+            let logger_stats = logger.stats();
+            let status_writes = if path.is_some() {
+                prior_status_writes.saturating_add(1)
+            } else {
+                prior_status_writes
+            };
+            telemetry.logging = LoggingTelemetry {
+                records_written: logger_stats.records_written,
+                bytes_written: logger_stats.bytes_written,
+                write_errors: logger_stats.write_errors,
+                status_writes,
+            };
+            telemetry.mutations = logger_stats.mutations;
+            telemetry.service_process =
+                platform::current_process_resource_usage()
+                    .ok()
+                    .map(|usage| ServiceProcessTelemetry {
+                        // The controller clock is monotonic; wall-clock changes cannot skew the
+                        // lifetime CPU average shown by Settings.
+                        uptime_ms: monotonic_ms,
+                        cpu_time_100ns: usage.cpu_time_100ns,
+                        working_set_bytes: usage.working_set_bytes,
+                    });
+        }
+        if let Err(error) = persist_controller_status(path, status) {
+            if let Some(telemetry) = &mut status.telemetry {
+                telemetry.logging.status_writes = prior_status_writes;
+            }
+            return Err(error);
+        }
         gate.mark_published(monotonic_ms);
         Ok(())
     }
@@ -3859,31 +4026,170 @@ mod app {
 
     struct EventLogger {
         sink: EventSink,
+        file_level: Option<LoggingLevel>,
+        decision_summary: DecisionSummaryGate,
         last_write_error: Option<String>,
+        write_errors_total: u64,
+        mutations: MutationTelemetry,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct EventLoggerStats {
+        records_written: u64,
+        bytes_written: u64,
+        write_errors: u64,
+        mutations: MutationTelemetry,
     }
 
     impl EventLogger {
-        const fn console() -> Self {
+        fn console() -> Self {
             Self {
                 sink: EventSink::console(),
+                file_level: None,
+                decision_summary: DecisionSummaryGate::default(),
                 last_write_error: None,
+                write_errors_total: 0,
+                mutations: MutationTelemetry::default(),
             }
         }
 
         fn service(path: PathBuf, config: LoggingConfig) -> Result<Self, std::io::Error> {
             Ok(Self {
                 sink: EventSink::service(path, config)?,
+                file_level: Some(config.level),
+                decision_summary: DecisionSummaryGate::default(),
                 last_write_error: None,
+                write_errors_total: 0,
+                mutations: MutationTelemetry::default(),
             })
         }
 
-        fn reconfigure(&mut self, config: LoggingConfig) -> Result<(), std::io::Error> {
+        fn reconfigure(
+            &mut self,
+            config: LoggingConfig,
+            monotonic_ms: u64,
+        ) -> Result<(), std::io::Error> {
+            let prior_level = self.effective_level();
+            let next_level = if self.file_level.is_some() {
+                config.level
+            } else {
+                LoggingLevel::Trace
+            };
+            if prior_level == LoggingLevel::Normal {
+                self.flush_decision_summary(monotonic_ms, "reconfigured");
+            }
             self.sink.reconfigure(config)?;
+            if self.file_level.is_some() {
+                self.file_level = Some(config.level);
+            }
+            if prior_level != next_level {
+                self.decision_summary.reset();
+            }
             self.last_write_error = None;
             Ok(())
         }
 
+        const fn effective_level(&self) -> LoggingLevel {
+            match self.file_level {
+                Some(level) => level,
+                None => LoggingLevel::Trace,
+            }
+        }
+
+        fn wants_raw_decision(&self, decision: &PolicyDecision) -> bool {
+            match self.effective_level() {
+                LoggingLevel::Off => false,
+                LoggingLevel::Normal => decision.action.is_mutation(),
+                LoggingLevel::Trace => true,
+            }
+        }
+
+        fn decision(&mut self, monotonic_ms: u64, image: Option<&str>, decision: &PolicyDecision) {
+            match self.effective_level() {
+                LoggingLevel::Off => {}
+                LoggingLevel::Trace => self.emit(decision_event(image, decision)),
+                LoggingLevel::Normal => {
+                    if let Some(summary) = self.decision_summary.observe(monotonic_ms, decision) {
+                        self.emit_decision_summary("periodic", summary);
+                    }
+                    if decision.action.is_mutation() {
+                        self.emit(decision_event(image, decision));
+                    }
+                }
+            }
+        }
+
+        fn flush_decision_summary(&mut self, monotonic_ms: u64, reason: &'static str) {
+            if self.effective_level() != LoggingLevel::Normal {
+                self.decision_summary.reset();
+                return;
+            }
+            if let Some(summary) = self.decision_summary.flush(monotonic_ms) {
+                self.emit_decision_summary(reason, summary);
+            }
+        }
+
+        fn flush_due_decision_summary(&mut self, monotonic_ms: u64) {
+            if self.effective_level() != LoggingLevel::Normal {
+                return;
+            }
+            if let Some(summary) = self.decision_summary.flush_if_due(monotonic_ms) {
+                self.emit_decision_summary("periodic", summary);
+            }
+        }
+
+        fn emit_decision_summary(&mut self, reason: &'static str, summary: DecisionLogSummary) {
+            let mut value = serde_json::to_value(summary)
+                .expect("DecisionLogSummary serialization cannot fail");
+            if let Some(object) = value.as_object_mut() {
+                object.insert("event".to_owned(), json!("decision_summary"));
+                object.insert("flush_reason".to_owned(), json!(reason));
+            }
+            self.emit(value);
+        }
+
+        fn stats(&self) -> EventLoggerStats {
+            let EventSinkStats {
+                records_written,
+                bytes_written,
+            } = self.sink.stats();
+            EventLoggerStats {
+                records_written,
+                bytes_written,
+                write_errors: self.write_errors_total,
+                mutations: self.mutations,
+            }
+        }
+
+        fn record_placement_mutation(&mut self, succeeded: bool) {
+            self.mutations.placement_attempted =
+                self.mutations.placement_attempted.saturating_add(1);
+            if succeeded {
+                self.mutations.placement_succeeded =
+                    self.mutations.placement_succeeded.saturating_add(1);
+            } else {
+                self.mutations.placement_failed = self.mutations.placement_failed.saturating_add(1);
+            }
+        }
+
+        fn record_background_mutation(&mut self, succeeded: bool) {
+            self.mutations.background_attempted =
+                self.mutations.background_attempted.saturating_add(1);
+            if succeeded {
+                self.mutations.background_succeeded =
+                    self.mutations.background_succeeded.saturating_add(1);
+            } else {
+                self.mutations.background_failed =
+                    self.mutations.background_failed.saturating_add(1);
+            }
+        }
+
         fn emit(&mut self, mut value: Value) {
+            // File logging Off is a CPU as well as an I/O policy: do not add timestamps or
+            // serialize events that the disabled sink cannot consume. Console mode remains Trace.
+            if self.file_level == Some(LoggingLevel::Off) {
+                return;
+            }
             if let Some(object) = value.as_object_mut() {
                 object.insert("timestamp_ms".to_owned(), json!(unix_time_ms()));
             }
@@ -3891,6 +4197,7 @@ mod app {
             match self.sink.write_line(&line) {
                 Ok(()) => self.last_write_error = None,
                 Err(error) => {
+                    self.write_errors_total = self.write_errors_total.saturating_add(1);
                     let error = error.to_string();
                     if self.last_write_error.as_deref() != Some(error.as_str()) {
                         let _ = emergency_log(&format!("event log write failed: {error}"));
@@ -3901,10 +4208,117 @@ mod app {
         }
     }
 
+    fn decision_event(image: Option<&str>, decision: &PolicyDecision) -> Value {
+        json!({
+            "event": "decision",
+            "process": decision.process,
+            "image": image,
+            "enforce": decision.enforce,
+            "action": decision.action,
+            "reason": decision.reason,
+        })
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use windows_service::service::ServiceDependency;
+
+        fn logging_test_decision(action: PolicyAction, enforce: bool) -> PolicyDecision {
+            PolicyDecision {
+                process: ProcessKey {
+                    pid: 42,
+                    creation_time_100ns: 420,
+                },
+                action,
+                reason: DecisionReason::BelowOverloadThreshold,
+                enforce,
+            }
+        }
+
+        #[test]
+        fn normal_trace_and_off_levels_have_distinct_decision_output() {
+            let directory = std::env::temp_dir().join(format!(
+                "winsched-decision-levels-{}-{}",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("winsched.log");
+            let mut config = LoggingConfig {
+                level: LoggingLevel::Normal,
+                max_file_size_mib: 1,
+                retained_archives: 0,
+            };
+            let mut logger = EventLogger::service(path.clone(), config).unwrap();
+            let keep = logging_test_decision(PolicyAction::Keep { domain: None }, false);
+            let assign = logging_test_decision(
+                PolicyAction::Assign {
+                    target: winsched_core::LlcDomainKey {
+                        group: 0,
+                        last_level_cache_index: 8,
+                    },
+                    cpu_set_ids: vec![1, 2],
+                },
+                true,
+            );
+
+            logger.decision(0, Some("worker.exe"), &keep);
+            assert_eq!(fs::read_to_string(&path).unwrap(), "");
+            logger.decision(60_000, Some("worker.exe"), &keep);
+            logger.decision(60_001, Some("worker.exe"), &assign);
+            logger.flush_decision_summary(60_002, "test");
+            let normal = fs::read_to_string(&path).unwrap();
+            let normal_events = normal
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(normal_events.len(), 3);
+            assert_eq!(normal_events[0]["event"], "decision_summary");
+            assert_eq!(normal_events[0]["decisions"], 1);
+            assert_eq!(normal_events[1]["event"], "decision");
+            assert_eq!(normal_events[2]["event"], "decision_summary");
+            assert_eq!(normal_events[2]["decisions"], 2);
+
+            logger.decision(61_000, Some("worker.exe"), &keep);
+            logger.reconfigure(config, 62_000).unwrap();
+            let same_level_reload = fs::read_to_string(&path).unwrap();
+            let reconfigure_summary =
+                serde_json::from_str::<Value>(same_level_reload.lines().last().unwrap()).unwrap();
+            assert_eq!(same_level_reload.lines().count(), 4);
+            assert_eq!(reconfigure_summary["event"], "decision_summary");
+            assert_eq!(reconfigure_summary["flush_reason"], "reconfigured");
+            assert_eq!(reconfigure_summary["decisions"], 1);
+
+            config.level = LoggingLevel::Trace;
+            logger.reconfigure(config, 70_000).unwrap();
+            logger.decision(70_001, Some("worker.exe"), &keep);
+            let trace = fs::read_to_string(&path).unwrap();
+            assert_eq!(trace.lines().count(), 5);
+            assert_eq!(
+                serde_json::from_str::<Value>(trace.lines().last().unwrap()).unwrap()["event"],
+                "decision"
+            );
+
+            config.level = LoggingLevel::Off;
+            logger.reconfigure(config, 80_000).unwrap();
+            let before = fs::read(&path).unwrap();
+            logger.decision(80_001, Some("worker.exe"), &assign);
+            logger.emit(json!({"event": "ignored_while_off"}));
+            assert_eq!(fs::read(&path).unwrap(), before);
+            logger.record_placement_mutation(true);
+            logger.record_placement_mutation(false);
+            logger.record_background_mutation(true);
+            let stats = logger.stats();
+            assert_eq!(stats.mutations.placement_attempted, 2);
+            assert_eq!(stats.mutations.placement_succeeded, 1);
+            assert_eq!(stats.mutations.placement_failed, 1);
+            assert_eq!(stats.mutations.background_attempted, 1);
+            assert_eq!(stats.mutations.background_succeeded, 1);
+            assert_eq!(stats.mutations.background_failed, 0);
+            drop(logger);
+            fs::remove_dir_all(directory).unwrap();
+        }
 
         #[test]
         fn queued_ticks_are_drained_without_hiding_control_commands() {
@@ -4043,7 +4457,7 @@ mod app {
             fs::create_dir_all(&directory).unwrap();
             let path = directory.join("status.json");
             let logging = LoggingConfig {
-                enabled: false,
+                level: LoggingLevel::Off,
                 max_file_size_mib: 2,
                 retained_archives: 0,
             };
@@ -4119,7 +4533,7 @@ mod app {
             )
             .unwrap();
             let logging = LoggingConfig {
-                enabled: false,
+                level: LoggingLevel::Off,
                 max_file_size_mib: 3,
                 retained_archives: 0,
             };
@@ -4141,6 +4555,7 @@ mod app {
                 &mut managed,
                 None,
                 &mut logger,
+                1_000,
             )
             .unwrap();
 
@@ -4171,7 +4586,7 @@ mod app {
             fs::write(&blocking_file, "blocking file").unwrap();
             let log_path = blocking_file.join("winsched.log");
             let prior_logging = LoggingConfig {
-                enabled: false,
+                level: LoggingLevel::Off,
                 max_file_size_mib: 2,
                 retained_archives: 0,
             };
@@ -4182,7 +4597,7 @@ mod app {
             };
             let updated = ControllerConfig {
                 logging: LoggingConfig {
-                    enabled: true,
+                    level: LoggingLevel::Normal,
                     max_file_size_mib: 1,
                     retained_archives: 1,
                 },
@@ -4202,6 +4617,7 @@ mod app {
                 &mut managed,
                 None,
                 &mut logger,
+                1_000,
             )
             .unwrap();
             assert!(matches!(
@@ -4304,10 +4720,33 @@ profile = "background"
 
             let guarded = controller_wait_interval(&config, &runtime, &BTreeMap::new(), started);
             assert!(guarded <= BACKGROUND_SAFETY_INTERVAL);
+            assert!(background_safety_active(
+                &config,
+                &runtime,
+                &BTreeMap::new()
+            ));
 
             config.background_efficiency.enabled = false;
             let unguarded = controller_wait_interval(&config, &runtime, &BTreeMap::new(), started);
-            assert!(unguarded > Duration::from_secs(59));
+            assert!(unguarded <= Duration::from_secs(10));
+            assert!(unguarded > Duration::from_secs(9));
+            assert!(!background_safety_active(
+                &config,
+                &runtime,
+                &BTreeMap::new()
+            ));
+
+            let mut disabled_runtime = RuntimeState::for_controller_mode(ControllerMode::Auto);
+            disabled_runtime.scheduling_enabled = false;
+            let stale_policy_deadline = Instant::now().checked_sub(Duration::from_mins(2)).unwrap();
+            let disabled_wait = controller_wait_interval(
+                &config,
+                &disabled_runtime,
+                &BTreeMap::new(),
+                stale_policy_deadline,
+            );
+            assert!(disabled_wait <= Duration::from_secs(10));
+            assert!(disabled_wait > Duration::from_secs(9));
 
             let key = ProcessKey {
                 pid: 42,
@@ -4334,6 +4773,7 @@ profile = "background"
                 controller_wait_interval(&config, &runtime, &managed, started)
                     <= BACKGROUND_SAFETY_INTERVAL
             );
+            assert!(background_safety_active(&config, &runtime, &managed));
         }
 
         struct ChildGuard(std::process::Child);
@@ -5517,6 +5957,32 @@ profile = "compute"
             });
             assert!(matches!(result, Err(ServiceError::Io(_))));
             assert_eq!(managed, BTreeMap::from([(key, placement)]));
+        }
+
+        #[test]
+        fn empty_cleanup_is_side_effect_free_even_when_the_state_parent_is_missing() {
+            let missing_parent = std::env::temp_dir().join(format!(
+                "winsched-empty-cleanup-missing-parent-{}-{}",
+                std::process::id(),
+                unix_time_ms()
+            ));
+            let managed_path = missing_parent.join("managed-state.json");
+            let background_path = missing_parent.join("background-state.json");
+            let mut managed = ManagedAssignments::new();
+            let mut background = ManagedBackground::new();
+            let mut logger = EventLogger::console();
+
+            let placement =
+                cleanup_managed_with(&mut logger, &mut managed, Some(&managed_path), |_| {
+                    panic!("empty cleanup must not call the platform")
+                })
+                .unwrap();
+            let efficiency =
+                cleanup_background(&mut logger, &mut background, Some(&background_path)).unwrap();
+
+            assert_eq!(placement, CleanupReport::default());
+            assert_eq!(efficiency, CleanupReport::default());
+            assert!(!missing_parent.exists());
         }
 
         #[test]

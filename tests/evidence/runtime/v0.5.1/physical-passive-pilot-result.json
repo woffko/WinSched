@@ -1,0 +1,18 @@
+{
+  "result": "PASS",
+  "schema_version": 3,
+  "capture_mode": "passive_taskbar_restore",
+  "valid_attempts": 1,
+  "physical_left_clicks_observed": 3,
+  "taskbar_clicks_observed": 3,
+  "confirmed_minimize_clicks": 1,
+  "priming_activations": 1,
+  "click_to_foreground_ms": 156,
+  "foreground_to_responsive_ms": 31,
+  "click_to_responsive_ms": 187,
+  "input_generated": false,
+  "per_monitor_dpi_aware": true,
+  "dedicated_probe_thread": true,
+  "minimize_state_required": true,
+  "windows_state_changed": false
+}

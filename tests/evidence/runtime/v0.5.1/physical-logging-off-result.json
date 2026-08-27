@@ -1,0 +1,30 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified physical-host receipt",
+  "duration_seconds": 30.0078197,
+  "logical_processors": 64,
+  "service_pid_unchanged": true,
+  "cpu": {
+    "one_core_percent": 3.3845344651947507,
+    "machine_capacity_percent": 0.052883351018667979
+  },
+  "process_io": {
+    "write_operations": 5,
+    "write_bytes": 26774
+  },
+  "controller": {
+    "rolling_mean_us": 30923,
+    "rolling_p95_us": 42365,
+    "rolling_max_us": 43498,
+    "last_scanned_processes": 383,
+    "last_eligible_processes": 21,
+    "last_decisions": 21
+  },
+  "logging": {
+    "level": "off",
+    "records_written": 0,
+    "bytes_written": 0,
+    "write_errors": 0,
+    "existing_files_byte_stable": true
+  }
+}

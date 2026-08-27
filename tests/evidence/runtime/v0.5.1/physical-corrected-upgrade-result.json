@@ -1,0 +1,16 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified physical-host receipt",
+  "setup_sha256": "4c92f9ef2d4c10662bc86c042a0f9df09cc9553c3b94b738be6383325c760d3d",
+  "previous_version": "0.5.1",
+  "installed_version": "0.5.1",
+  "config_sha256_before": "cbe33a966d8e0138d429210749a809511d7fa6135f09bf3d0efd05982c05518a",
+  "config_sha256_after": "cbe33a966d8e0138d429210749a809511d7fa6135f09bf3d0efd05982c05518a",
+  "config_byte_identical": true,
+  "installed_service_sha256": "77edceaa7af7faba00ff9590c571e012e92ce98ca94c1493f2b249dedff1af60",
+  "status_schema": 5,
+  "logging_level": "off",
+  "scheduling_preserved": true,
+  "service_running": true,
+  "last_error": null
+}

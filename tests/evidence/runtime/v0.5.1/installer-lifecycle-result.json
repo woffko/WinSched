@@ -1,0 +1,23 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "setup_sha256": "4c92f9ef2d4c10662bc86c042a0f9df09cc9553c3b94b738be6383325c760d3d",
+  "stages": {
+    "provision rollback": "PASS",
+    "Setup error receipt": "PASS",
+    "silent preserve uninstall": "PASS",
+    "silent purge uninstall": "PASS",
+    "clean GUI install": "PASS",
+    "GUI preserve uninstall": "PASS",
+    "GUI preserved reinstall": "PASS",
+    "GUI purge uninstall": "PASS",
+    "final silent install": "PASS"
+  },
+  "original_config_sha256": "20d98408bef9cf98a4efa5455d786f997e8e47053b5fca2d209a984f8a9fb813",
+  "original_config_restored": true,
+  "original_scheduling_restored": true,
+  "service_running": true,
+  "recovery_backup_retained": false,
+  "cleanup_errors": [],
+  "error": null
+}

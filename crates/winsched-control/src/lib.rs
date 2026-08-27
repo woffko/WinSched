@@ -23,7 +23,7 @@ pub const STATUS_FILE_NAME: &str = "status.json";
 pub const CONTROL_ENABLE: u32 = 128;
 pub const CONTROL_DISABLE: u32 = 129;
 pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
-pub const STATUS_SCHEMA_VERSION: u32 = 4;
+pub const STATUS_SCHEMA_VERSION: u32 = 5;
 pub const INTERACTIVE_STATE_SCHEMA_VERSION: u32 = 1;
 pub const INTERACTIVE_STATE_HEARTBEAT_MS: u64 = 5_000;
 pub const INTERACTIVE_STATE_STALE_AFTER_MS: u64 = 15_000;
@@ -68,6 +68,62 @@ pub struct BackgroundEfficiencyStatus {
     pub memory_pressure_monitor_available: bool,
     pub low_memory_condition: bool,
     pub last_action: Option<String>,
+}
+
+/// Bounded timing and population metrics for completed controller evaluations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvaluationTelemetry {
+    pub completed_total: u64,
+    pub last_duration_us: u64,
+    pub rolling_mean_us: u64,
+    pub rolling_p95_us: u64,
+    pub rolling_max_us: u64,
+    pub window_samples: usize,
+    pub last_scanned_processes: usize,
+    pub last_eligible_processes: usize,
+    pub last_decisions: usize,
+}
+
+/// Cumulative platform mutation operation outcomes for the current service instance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MutationTelemetry {
+    pub placement_attempted: u64,
+    pub placement_succeeded: u64,
+    pub placement_failed: u64,
+    pub background_attempted: u64,
+    pub background_succeeded: u64,
+    pub background_failed: u64,
+}
+
+/// Logical file-sink traffic for the current service instance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggingTelemetry {
+    pub records_written: u64,
+    pub bytes_written: u64,
+    pub write_errors: u64,
+    pub status_writes: u64,
+}
+
+/// Privacy-safe resource snapshot for the service process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServiceProcessTelemetry {
+    pub uptime_ms: u64,
+    pub cpu_time_100ns: u64,
+    pub working_set_bytes: u64,
+}
+
+/// Optional self-observability payload introduced by status schema 5.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControllerTelemetry {
+    pub evaluation: EvaluationTelemetry,
+    pub mutations: MutationTelemetry,
+    pub logging: LoggingTelemetry,
+    pub service_process: Option<ServiceProcessTelemetry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +197,8 @@ pub struct ControllerStatus {
     pub llc_domains: usize,
     pub last_activity: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<ControllerTelemetry>,
     pub updated_at_unix_ms: u64,
 }
 
@@ -180,6 +238,7 @@ impl ControllerStatus {
             llc_domains,
             last_activity: None,
             last_error: None,
+            telemetry: None,
             updated_at_unix_ms,
         }
     }
@@ -229,6 +288,94 @@ mod tests {
         assert_eq!(status.config_reload_sequence, 0);
         assert_eq!(status.config_reload_result, ConfigReloadResult::Initial);
         assert_eq!(status.config_reload_error, None);
+        assert_eq!(status.telemetry, None);
+    }
+
+    #[test]
+    fn status_telemetry_round_trips_with_schema_five() {
+        let mut status = ControllerStatus::starting(
+            42,
+            true,
+            &ControllerConfig::default(),
+            SystemReservePlan::default(),
+            4,
+            1_000,
+        );
+        status.telemetry = Some(ControllerTelemetry {
+            evaluation: EvaluationTelemetry {
+                completed_total: 10,
+                last_duration_us: 101,
+                rolling_mean_us: 91,
+                rolling_p95_us: 120,
+                rolling_max_us: 140,
+                window_samples: 10,
+                last_scanned_processes: 82,
+                last_eligible_processes: 16,
+                last_decisions: 16,
+            },
+            mutations: MutationTelemetry {
+                placement_attempted: 3,
+                placement_succeeded: 2,
+                placement_failed: 1,
+                background_attempted: 1,
+                background_succeeded: 1,
+                background_failed: 0,
+            },
+            logging: LoggingTelemetry {
+                records_written: 7,
+                bytes_written: 700,
+                write_errors: 0,
+                status_writes: 3,
+            },
+            service_process: Some(ServiceProcessTelemetry {
+                uptime_ms: 60_000,
+                cpu_time_100ns: 123_456,
+                working_set_bytes: 8 * 1024 * 1024,
+            }),
+        });
+
+        let serialized = serde_json::to_vec(&status).unwrap();
+        let decoded = serde_json::from_slice::<ControllerStatus>(&serialized).unwrap();
+        assert_eq!(decoded.schema_version, STATUS_SCHEMA_VERSION);
+        assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn status_without_telemetry_defaults_to_unavailable() {
+        let status = ControllerStatus::starting(
+            42,
+            false,
+            &ControllerConfig::default(),
+            SystemReservePlan::default(),
+            2,
+            1_000,
+        );
+        let mut serialized = serde_json::to_value(status).unwrap();
+        assert!(serialized.get("telemetry").is_none());
+        serialized.as_object_mut().unwrap().remove("telemetry");
+
+        let decoded = serde_json::from_value::<ControllerStatus>(serialized).unwrap();
+        assert_eq!(decoded.telemetry, None);
+    }
+
+    #[test]
+    fn telemetry_substructures_tolerate_future_additive_metrics() {
+        let decoded = serde_json::from_value::<ControllerTelemetry>(serde_json::json!({
+            "evaluation": {
+                "completed_total": 1,
+                "future_duration_stat": 99
+            },
+            "future_category": {
+                "value": 1
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(decoded.evaluation.completed_total, 1);
+        assert_eq!(decoded.evaluation.last_duration_us, 0);
+        assert_eq!(decoded.mutations, MutationTelemetry::default());
+        assert_eq!(decoded.logging, LoggingTelemetry::default());
+        assert_eq!(decoded.service_process, None);
     }
 
     #[test]

@@ -1,0 +1,29 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "service_state_restored": true,
+  "service_was_running": true,
+  "worker": {
+    "interactive_session": 1,
+    "result": "PASS",
+    "total_failed": 0,
+    "total_passed": 175,
+    "executables": [
+      { "name": "winsched_config-a85455ca7bddefd9.exe", "result": "PASS", "exit_code": 0, "passed": 24, "failed": 0 },
+      { "name": "winsched_control-c5fc7abdc52d43e7.exe", "result": "PASS", "exit_code": 0, "passed": 7, "failed": 0 },
+      { "name": "winsched_core-1f48f9370c95f284.exe", "result": "PASS", "exit_code": 0, "passed": 36, "failed": 0 },
+      { "name": "winsched_service-95c009f54da9a30f.exe", "result": "PASS", "exit_code": 0, "passed": 64, "failed": 0 },
+      { "name": "winsched_settings-cadb97d87865a741.exe", "result": "PASS", "exit_code": 0, "passed": 10, "failed": 0 },
+      { "name": "winsched_tray-2ac7a46c5e2ac843.exe", "result": "PASS", "exit_code": 0, "passed": 1, "failed": 0 },
+      { "name": "winsched_tray-738906af0df544ca.exe", "result": "PASS", "exit_code": 0, "passed": 5, "failed": 0 },
+      { "name": "winsched-9ab50ab87ed12574.exe", "result": "PASS", "exit_code": 0, "passed": 4, "failed": 0 },
+      { "name": "winsched-ef937ed05a6dc80b.exe", "result": "PASS", "exit_code": 0, "passed": 20, "failed": 0 },
+      { "name": "xtask-0dce1bdc1f75d431.exe", "result": "PASS", "exit_code": 0, "passed": 4, "failed": 0 }
+    ]
+  },
+  "zero_test_executables_skipped": [
+    "winsched_settings-039b36b8f9841ea6.exe"
+  ],
+  "cleanup_errors": [],
+  "error": null
+}

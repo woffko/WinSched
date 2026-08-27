@@ -5,6 +5,46 @@ source-level checks, Windows VM acceptance, physical Threadripper acceptance,
 and artifact verification so that a passing narrow test is not presented as
 proof of a broader behavior.
 
+## 0.5.1 development validation
+
+Version 0.5.1 is not yet released. Its first phase addresses the measured
+0.5.0 decision-log write amplification and adds anonymous self-observability;
+placement scope changes remain gated on a physical-host ABBA result.
+
+| Area | Environment | Current result |
+|---|---|---:|
+| Schema-5 Off/Normal/Trace migration | Native Rust tests | PASS |
+| Normal decision aggregation | Native Rust tests | PASS |
+| Status-schema-5 telemetry contract | Native Rust tests | PASS |
+| Current-process resource probe | Windows-target compile | PASS |
+| Workspace unit tests | WSL/Linux | PASS, 123 tests |
+| Native and Windows-target Clippy | WSL/xwin | PASS, `-D warnings` |
+| PowerShell acceptance syntax | Windows PowerShell 5.1 | PASS, 31 scripts |
+| Physical logging-off baseline | Threadripper host | PASS |
+| Windows-native execution | Windows VM | PASS, 175 tests in 10 executables |
+| Disabled idle after zero-wait fix | Windows VM | PASS, 0% one core, 0.10 writes/s, 3 heartbeats / 30 seconds |
+| Normal/Trace/Off hot reload and rotation | Windows VM | PASS |
+| 0.5.0 to 0.5.1 Setup upgrade | Windows VM | PASS on current Setup hash, byte-identical schema-4 fixture |
+| Current GUI Setup build | Inno Setup 7.1.0 on Windows VM | PASS, SHA-256 `4c92f9ef2d4c10662bc86c042a0f9df09cc9553c3b94b738be6383325c760d3d` |
+| 75-second quiet-I/O | Windows VM | PASS, 7 status writes; service/tray logs byte-stable |
+| Tray, About, Settings, tooltip, and Diagnostics UI | Windows VM | PASS |
+| Installer preserve/purge lifecycle | Windows VM | PASS on current Setup hash, nine stages with final state restoration |
+| Physical 0.5.0 to 0.5.1 upgrade | Threadripper host | PASS, exact TOML and payload hashes |
+| Physical corrected 0.5.1 reinstall | Threadripper host | PASS, current Setup/service hash and byte-identical TOML |
+| Physical corrected Disabled idle | Threadripper host | PASS, 0.208% one core, 0.10 writes/s, 3 heartbeats / 30 seconds |
+| Physical Logging Off efficiency | Threadripper host | PASS, 0 log records/bytes and byte-stable files |
+| Physical Normal aggregation | Threadripper host | PASS, 9 records / 4.6 KiB in 75 seconds |
+| Earlier manual-marker Auto/Disabled ABBA | Threadripper host | INVALID for policy |
+| Passive Firefox marker pilot | Threadripper host | PASS, 3/3 taskbar clicks, confirmed minimize, 187 ms restore |
+| Passive Firefox taskbar Auto/Disabled ABBA | Threadripper host | PASS, 40/40; `no_clear_effect` |
+
+See [Efficiency and observability design](efficiency-observability-v0.5.1.md)
+and `tests/evidence/2026-08-26-host-efficiency-baseline.md`.
+Privacy-minimized structured VM receipts are under
+`tests/evidence/runtime/v0.5.1/`.
+The consolidated VM report is
+`tests/evidence/2026-08-27-v0.5.1-vm-acceptance.md`.
+
 ## Schema-4 final validation
 
 | Area | Environment | Current result |
@@ -174,6 +214,22 @@ RC_PATH=/usr/lib/llvm-18/bin/llvm-rc cargo xwin clippy \
 RC_PATH=/usr/lib/llvm-18/bin/llvm-rc cargo xwin build \
   --workspace --release --target x86_64-pc-windows-msvc
 ```
+
+Run the cross-built native test executables from an elevated VM shell through
+the interactive-session controller. It stops an existing WinSched service to
+avoid named-pipe collisions, runs every selected executable serially as the
+active elevated user, and restores the original service state in `finally`.
+Limited-user tray and Settings behavior remains a separate UI acceptance gate:
+
+```powershell
+.\tests\windows\native-test-runner.ps1 `
+  -TestDirectory C:\Users\Public\WinSchedNativeTests `
+  -OutputDirectory C:\Users\Public\WinSchedNativeResults
+```
+
+This distinction is required: SSH service sessions are Session 0, and the
+native safety tests intentionally reject process-policy targets outside an
+interactive session.
 
 ### Read-only topology and plan preview
 

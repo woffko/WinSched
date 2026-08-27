@@ -88,6 +88,32 @@ function Wait-Element($Root, [string]$Name, [bool]$Actionable = $false, [int]$Ti
     $script:elementCandidate
 }
 
+function Find-ElementLike($Root, [string]$Pattern) {
+    foreach ($element in @(Get-AllElements $Root)) {
+        try {
+            if (-not $element.Current.IsOffscreen -and $element.Current.Name -like $Pattern) {
+                return $element
+            }
+        } catch {
+            continue
+        }
+    }
+    return $null
+}
+
+function Wait-ElementLike($Root, [string]$Pattern, [int]$TimeoutSeconds = 30) {
+    $script:elementLikeCandidate = $null
+    Wait-Condition "element matching '$Pattern'" {
+        $candidate = Find-ElementLike $Root $Pattern
+        if ($null -ne $candidate) {
+            $script:elementLikeCandidate = $candidate
+            return $true
+        }
+        return $false
+    } $TimeoutSeconds
+    $script:elementLikeCandidate
+}
+
 function Invoke-Element($Element) {
     foreach ($patternId in @(
         [System.Windows.Automation.InvokePattern]::Pattern,
@@ -139,15 +165,37 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $resultPath = Join-Path $OutputDirectory $ResultFileName
 $settingsPath = Join-Path $InstallDirectory "winsched-settings.exe"
 $configPath = Join-Path $DataDirectory "winsched.toml"
+$statusPath = Join-Path $DataDirectory "status.json"
 $process = $null
 $savedReport = $null
 
 try {
     Assert-True (Test-Path -LiteralPath $settingsPath -PathType Leaf) `
         "Settings executable is missing"
+    Assert-True (Test-Path -LiteralPath $statusPath -PathType Leaf) `
+        "Controller status is missing"
     Assert-True (@(Get-Process winsched-settings -ErrorAction SilentlyContinue).Count -eq 0) `
         "A Settings process is already running"
     $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+    $controllerStatus = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+    Assert-True ([int]$controllerStatus.schema_version -eq 5) `
+        "Controller status schema 5 is required"
+    Assert-True ($null -ne $controllerStatus.telemetry) `
+        "Controller telemetry is missing"
+    Assert-True ([uint64]$controllerStatus.telemetry.evaluation.completed_total -gt 0) `
+        "Controller telemetry has no completed evaluations"
+    Assert-True ([uint64]$controllerStatus.telemetry.evaluation.rolling_max_us -gt 0) `
+        "Controller evaluation timing was not measured"
+    Assert-True ([uint64]$controllerStatus.telemetry.logging.status_writes -gt 0) `
+        "Controller telemetry did not count status writes"
+    Assert-True ([uint64]$controllerStatus.telemetry.logging.write_errors -eq 0) `
+        "Controller telemetry reports log write errors"
+    Assert-True ($null -ne $controllerStatus.telemetry.service_process) `
+        "Service process telemetry is unavailable"
+    Assert-True ([uint64]$controllerStatus.telemetry.service_process.uptime_ms -gt 0) `
+        "Service process uptime was not measured"
+    Assert-True ([uint64]$controllerStatus.telemetry.service_process.working_set_bytes -gt 0) `
+        "Service process working set was not measured"
     $downloads = Join-Path $env:USERPROFILE "Downloads"
     $beforeReports = @(
         Get-ChildItem -LiteralPath $downloads -Filter "WinSched-diagnostic-*.json" `
@@ -169,6 +217,11 @@ try {
     Invoke-Element (Wait-Element $window "EN" $true)
     Invoke-Element (Wait-Element $window "Diagnostics" $true)
     [void](Wait-Element $window "Passive diagnostics" $false)
+    [void](Wait-Element $window "Controller efficiency" $false)
+    [void](Wait-ElementLike $window "Evaluations: *")
+    [void](Wait-ElementLike $window "File log since service start: *")
+    [void](Wait-ElementLike $window "Mutations: *")
+    [void](Wait-ElementLike $window "Service process: *")
     Invoke-Element (Wait-Element $window "Run passive 10-second diagnostic" $true)
     [void](Wait-Element $window "Copy JSON" $true 35)
     [void](Wait-Element $window "Measurements" $false)
@@ -222,6 +275,10 @@ try {
         taskbar_available = [bool]$report.shell.taskbar.available
         taskbar_timeouts = [int]$report.shell.taskbar.timeout_samples
         finding_codes = @($report.findings | ForEach-Object { $_.code })
+        controller_status_schema = [int]$controllerStatus.schema_version
+        controller_completed_evaluations = [uint64]$controllerStatus.telemetry.evaluation.completed_total
+        controller_status_writes = [uint64]$controllerStatus.telemetry.logging.status_writes
+        controller_self_observability_visible = $true
         privacy_safe = $true
         configuration_changed = $false
         cleanup_completed = $true

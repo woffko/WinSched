@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$InstallDirectory = (Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "WinSched"),
-    [string]$DataDirectory = (Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "WinSched")
+    [string]$DataDirectory = (Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "WinSched"),
+    [string]$InteractiveUser
 )
 
 $ErrorActionPreference = "Stop"
@@ -105,23 +106,23 @@ function Set-Utf8FileAtomically([string]$Path, [string]$Text) {
 
 function New-LoggingConfigText(
     [string]$Base,
-    [bool]$Enabled,
+    [ValidateSet("off", "normal", "trace")]
+    [string]$Level,
     [ValidateRange(1, 100)]
     [int]$MaxFileSizeMiB,
     [ValidateRange(0, 10)]
     [int]$RetainedArchives
 ) {
-    $enabledText = $Enabled.ToString().ToLowerInvariant()
     $loggingBlock = @"
 [logging]
-enabled = $enabledText
+level = "$Level"
 max_file_size_mib = $MaxFileSizeMiB
 retained_archives = $RetainedArchives
 "@
     $result = [regex]::Replace(
         $Base,
         "(?m)^\s*schema_version\s*=\s*\d+\s*$",
-        "schema_version = 3",
+        "schema_version = 5",
         1
     )
     $result = [regex]::Replace(
@@ -144,23 +145,36 @@ retained_archives = $RetainedArchives
     )
     $loggingPattern = "(?ms)^\s*\[logging\]\s*.*?(?=^\s*\[|\z)"
     if ([regex]::IsMatch($result, $loggingPattern)) {
-        return [regex]::Replace($result, $loggingPattern, "$loggingBlock`r`n", 1)
+        $result = [regex]::Replace($result, $loggingPattern, "$loggingBlock`r`n", 1)
+    } else {
+        $policyPattern = "(?m)^\s*\[policy\]\s*$"
+        if ([regex]::IsMatch($result, $policyPattern)) {
+            $result = [regex]::Replace(
+                $result,
+                $policyPattern,
+                "$loggingBlock`r`n`r`n[policy]",
+                1
+            )
+        } else {
+            $result = "$result`r`n`r`n$loggingBlock`r`n"
+        }
     }
-    $policyPattern = "(?m)^\s*\[policy\]\s*$"
-    if ([regex]::IsMatch($result, $policyPattern)) {
-        return [regex]::Replace(
-            $result,
-            $policyPattern,
-            "$loggingBlock`r`n`r`n[policy]",
-            1
-        )
+    if (-not [string]::IsNullOrWhiteSpace($script:workerImage)) {
+        $result = $result.TrimEnd([char[]]"`r`n") + @"
+
+
+[[rules]]
+image = "$($script:workerImage)"
+mode = "sticky"
+profile = "balanced"
+"@
     }
-    return "$result`r`n`r`n$loggingBlock`r`n"
+    return $result
 }
 
 function Wait-AppliedLogging(
     [uint64]$AfterSequence,
-    [bool]$Enabled,
+    [string]$Level,
     [int]$MaxFileSizeMiB,
     [int]$RetainedArchives,
     [int]$ExpectedPid,
@@ -170,10 +184,10 @@ function Wait-AppliedLogging(
     Wait-Condition $Description {
         $status = Read-Status
         $null -ne $status -and
-            [int]$status.schema_version -eq 4 -and
+            [int]$status.schema_version -eq 5 -and
             [uint64]$status.config_reload_sequence -gt $AfterSequence -and
             $status.config_reload_result -eq "reloaded" -and
-            [bool]$status.applied_logging.enabled -eq $Enabled -and
+            [string]$status.applied_logging.level -eq $Level -and
             [int]$status.applied_logging.max_file_size_mib -eq $MaxFileSizeMiB -and
             [int]$status.applied_logging.retained_archives -eq $RetainedArchives -and
             ($ExpectedPid -eq 0 -or [int]$status.service_pid -eq $ExpectedPid)
@@ -182,7 +196,8 @@ function Wait-AppliedLogging(
 }
 
 function Set-LoggingConfiguration(
-    [bool]$Enabled,
+    [ValidateSet("off", "normal", "trace")]
+    [string]$Level,
     [int]$MaxFileSizeMiB,
     [int]$RetainedArchives,
     [int]$ExpectedPid
@@ -192,13 +207,13 @@ function Set-LoggingConfiguration(
     $baselineSequence = [uint64]$status.config_reload_sequence
     $text = New-LoggingConfigText `
         $script:baseConfigText `
-        $Enabled `
+        $Level `
         $MaxFileSizeMiB `
         $RetainedArchives
     Set-Utf8FileAtomically $script:configPath $text
     return Wait-AppliedLogging `
         $baselineSequence `
-        $Enabled `
+        $Level `
         $MaxFileSizeMiB `
         $RetainedArchives `
         $ExpectedPid `
@@ -328,8 +343,23 @@ function Assert-ValidJsonLines([string]$Path) {
     Assert-True ($lineCount -gt 0) "log file contains no complete JSONL records: $Path"
 }
 
+function Read-TestLogEvents {
+    $events = New-Object System.Collections.ArrayList
+    foreach ($file in @(Get-LogFiles)) {
+        foreach ($line in @(Read-SharedUtf8Lines $file.FullName)) {
+            if (-not [string]::IsNullOrWhiteSpace($line)) {
+                try {
+                    [void]$events.Add(($line | ConvertFrom-Json))
+                } catch {
+                }
+            }
+        }
+    }
+    return @($events)
+}
+
 function Wait-InitialStatus(
-    [bool]$Enabled,
+    [string]$Level,
     [int]$MaxFileSizeMiB,
     [int]$RetainedArchives
 ) {
@@ -339,10 +369,10 @@ function Wait-InitialStatus(
         $null -ne $status -and
             $null -ne $service -and
             $service.State -eq "Running" -and
-            [int]$status.schema_version -eq 4 -and
+            [int]$status.schema_version -eq 5 -and
             [int]$status.service_pid -eq [int]$service.ProcessId -and
             @("initial", "reloaded") -contains [string]$status.config_reload_result -and
-            [bool]$status.applied_logging.enabled -eq $Enabled -and
+            [string]$status.applied_logging.level -eq $Level -and
             [int]$status.applied_logging.max_file_size_mib -eq $MaxFileSizeMiB -and
             [int]$status.applied_logging.retained_archives -eq $RetainedArchives
     } 30
@@ -362,6 +392,16 @@ $originalServiceRunning = $false
 $serviceStateCaptured = $false
 $backupCaptured = $false
 $originalConfigBytes = $null
+$script:workerImage = "winsched-log-worker-{0}.exe" -f `
+    [Guid]::NewGuid().ToString("N").Substring(0, 10)
+$workerRoot = Join-Path $env:PUBLIC (
+    "WinSchedLoggingWorker-{0}" -f [Guid]::NewGuid().ToString("N")
+)
+$workerBinary = Join-Path $workerRoot $script:workerImage
+$workerProcess = $null
+$workerTaskName = "WinSchedLoggingWorker-{0}" -f [Guid]::NewGuid().ToString("N").Substring(0, 10)
+$workerTaskRegistered = $false
+$traceRawNoopVerified = $false
 $script:baseConfigText = $null
 $mainError = $null
 $cleanupErrors = New-Object System.Collections.ArrayList
@@ -372,12 +412,19 @@ try {
         "winsched-service.exe is missing"
     Assert-True (Test-Path -LiteralPath $script:configPath -PathType Leaf) `
         "winsched.toml is missing"
+    if ([string]::IsNullOrWhiteSpace($InteractiveUser)) {
+        $InteractiveUser = (Get-CimInstance Win32_ComputerSystem).UserName
+    }
+    Assert-True (-not [string]::IsNullOrWhiteSpace($InteractiveUser)) `
+        "an interactive user is required for Trace decision acceptance"
     $service = Get-Service -Name "WinSched" -ErrorAction SilentlyContinue
     Assert-True ($null -ne $service) "WinSched service is not installed"
     $originalServiceRunning = $service.Status -ne "Stopped"
     $serviceStateCaptured = $true
 
     New-Item -ItemType Directory -Path $logBackupDirectory -Force | Out-Null
+    New-Item -ItemType Directory -Path $workerRoot -Force | Out-Null
+    Copy-Item -LiteralPath "$env:SystemRoot\System32\ping.exe" -Destination $workerBinary
     Stop-ServiceUnderTest
     $originalConfigBytes = [System.IO.File]::ReadAllBytes($script:configPath)
     [System.IO.File]::WriteAllBytes($configBackupPath, $originalConfigBytes)
@@ -389,10 +436,10 @@ try {
 
     Write-Host "logging stage: disabled startup creates no normal log"
     Remove-TestLogs
-    $disabledText = New-LoggingConfigText $script:baseConfigText $false 1 2
+    $disabledText = New-LoggingConfigText $script:baseConfigText "off" 1 2
     Set-Utf8FileAtomically $script:configPath $disabledText
     Start-ServiceUnderTest
-    $disabledInitial = Wait-InitialStatus $false 1 2
+    $disabledInitial = Wait-InitialStatus "off" 1 2
     $disabledLogFiles = @(Get-LogFiles)
     $disabledLogDescription = @(
         $disabledLogFiles | ForEach-Object { "$($_.Name):$($_.Length)" }
@@ -402,13 +449,66 @@ try {
 
     Write-Host "logging stage: hot enable and hot disable"
     $servicePid = [int]$disabledInitial.service_pid
-    $enabledStatus = Set-LoggingConfiguration $true 1 2 $servicePid
+    $enabledStatus = Set-LoggingConfiguration "normal" 1 2 $servicePid
     Assert-True ([int]$enabledStatus.service_pid -eq $servicePid) `
         "hot enable restarted the service"
     Wait-Condition "hot-enabled logger created its active log" {
         Test-Path -LiteralPath $script:activeLogPath -PathType Leaf
     }
-    $disabledStatus = Set-LoggingConfiguration $false 1 2 $servicePid
+    [void](Set-LoggingConfiguration "trace" 1 2 $servicePid)
+    $traceStartedUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $workerAction = New-ScheduledTaskAction `
+        -Execute $workerBinary `
+        -Argument "-n 30 127.0.0.1" `
+        -WorkingDirectory $workerRoot
+    $workerPrincipal = New-ScheduledTaskPrincipal `
+        -UserId $InteractiveUser `
+        -LogonType Interactive `
+        -RunLevel Limited
+    $workerSettings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit ([TimeSpan]::FromMinutes(2))
+    Register-ScheduledTask `
+        -TaskName $workerTaskName `
+        -Action $workerAction `
+        -Principal $workerPrincipal `
+        -Settings $workerSettings | Out-Null
+    $workerTaskRegistered = $true
+    Start-ScheduledTask -TaskName $workerTaskName
+    Wait-Condition "interactive Trace worker process" {
+        $candidate = @(Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($script:workerImage)) `
+            -ErrorAction SilentlyContinue | Where-Object {
+                try {
+                    [string]::Equals($_.Path, $workerBinary, [StringComparison]::OrdinalIgnoreCase) -and
+                        $_.SessionId -gt 0
+                } catch { $false }
+            } | Select-Object -First 1)
+        if ($candidate.Count -eq 1) {
+            $script:traceWorkerCandidate = $candidate[0]
+            return $true
+        }
+        return $false
+    } 15
+    $workerProcess = $script:traceWorkerCandidate
+    Wait-Condition "Trace raw no-op decision for exact test worker" {
+        $matches = @(Read-TestLogEvents | Where-Object {
+            $_.event -eq "decision" -and
+                [uint64]$_.timestamp_ms -ge [uint64]$traceStartedUnixMs -and
+                [string]$_.image -eq $script:workerImage -and
+                (($_.action | ConvertTo-Json -Compress) -match '^\{"Keep"')
+        })
+        $matches.Count -gt 0
+    } 20
+    $traceRawNoopVerified = $true
+    if ($null -ne $workerProcess -and -not $workerProcess.HasExited) {
+        Stop-Process -Id $workerProcess.Id -Force
+    }
+    $workerProcess = $null
+    Unregister-ScheduledTask -TaskName $workerTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    $workerTaskRegistered = $false
+    [void](Set-LoggingConfiguration "normal" 1 2 $servicePid)
+    $disabledStatus = Set-LoggingConfiguration "off" 1 2 $servicePid
     Assert-True ([int]$disabledStatus.service_pid -eq $servicePid) `
         "hot disable restarted the service"
     Start-Sleep -Milliseconds 750
@@ -418,7 +518,7 @@ try {
 
     Invoke-SchedulingChange
     Invoke-SchedulingChange
-    [void](Set-LoggingConfiguration $false 2 1 $servicePid)
+    [void](Set-LoggingConfiguration "off" 2 1 $servicePid)
     Start-Sleep -Milliseconds 750
     Assert-SnapshotsEqual `
         $disabledSnapshot `
@@ -427,7 +527,7 @@ try {
 
     Stop-ServiceUnderTest
     Start-ServiceUnderTest
-    $disabledRestart = Wait-InitialStatus $false 2 1
+    $disabledRestart = Wait-InitialStatus "off" 2 1
     Assert-SnapshotsEqual `
         $disabledSnapshot `
         (Get-LogSnapshot) `
@@ -435,7 +535,7 @@ try {
 
     Write-Host "logging stage: retained two-file circular archive ring"
     $restartPid = [int]$disabledRestart.service_pid
-    [void](Set-LoggingConfiguration $true 1 2 $restartPid)
+    [void](Set-LoggingConfiguration "trace" 1 2 $restartPid)
     for ($cycle = 1; $cycle -le 3; $cycle++) {
         Stop-ServiceUnderTest
         if ($cycle -eq 1) {
@@ -445,7 +545,7 @@ try {
         }
         Write-NearLimitSeed $cycle
         Start-ServiceUnderTest
-        [void](Wait-InitialStatus $true 1 2)
+        [void](Wait-InitialStatus "trace" 1 2)
         Wait-Condition "cycle $cycle startup rotation" {
             Test-Path -LiteralPath "$($script:activeLogPath).1" -PathType Leaf
         }
@@ -468,7 +568,7 @@ try {
 
     Write-Host "logging stage: retained_archives zero truncates active"
     $currentPid = [int](Read-Status).service_pid
-    [void](Set-LoggingConfiguration $true 1 0 $currentPid)
+    [void](Set-LoggingConfiguration "trace" 1 0 $currentPid)
     Wait-Condition "archive pruning after retained_archives=0" {
         -not (Test-Path -LiteralPath "$($script:activeLogPath).1") -and
             -not (Test-Path -LiteralPath "$($script:activeLogPath).2")
@@ -479,7 +579,7 @@ try {
     }
     Write-NearLimitSeed 99
     Start-ServiceUnderTest
-    [void](Wait-InitialStatus $true 1 0)
+    [void](Wait-InitialStatus "trace" 1 0)
     Assert-True ($null -eq (Get-SeedCycle $script:activeLogPath)) `
         "retained_archives=0 did not truncate the oversized active log"
     Assert-True (-not (Test-Path -LiteralPath "$($script:activeLogPath).1")) `
@@ -490,11 +590,13 @@ try {
 
     $result = [ordered]@{
         result = "PASS"
-        status_schema = 4
+        status_schema = 5
+        levels_tested = @("off", "normal", "trace")
         disabled_absent_file = $true
         disabled_hot_reload_byte_stable = $true
         disabled_restart_byte_stable = $true
         hot_reload_same_pid = $true
+        trace_raw_noop_decision = $traceRawNoopVerified
         max_file_size_mib = 1
         retained_archives_tested = @(2, 0)
         circular_rotation = $true
@@ -503,6 +605,22 @@ try {
 } catch {
     $mainError = $_.Exception.ToString()
 } finally {
+    if ($null -ne $workerProcess -and -not $workerProcess.HasExited) {
+        Stop-Process -Id $workerProcess.Id -Force -ErrorAction SilentlyContinue
+    }
+    if ($workerTaskRegistered) {
+        Unregister-ScheduledTask `
+            -TaskName $workerTaskName `
+            -Confirm:$false `
+            -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $workerRoot -PathType Container) {
+        try {
+            Remove-Item -LiteralPath $workerRoot -Recurse -Force
+        } catch {
+            [void]$cleanupErrors.Add("Could not remove Trace worker directory: $($_.Exception.Message)")
+        }
+    }
     if ($backupCaptured) {
         $safeToRestore = $true
         try {

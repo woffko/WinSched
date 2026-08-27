@@ -107,7 +107,7 @@ exit 1
     [IO.File]::WriteAllText($watcherPath, $watcherSource, [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText(
         $configPath,
-        "schema_version = 4`nunknown_field = true`n",
+        "schema_version = 5`nunknown_field = true`n",
         [Text.UTF8Encoding]::new($false)
     )
 
@@ -148,7 +148,7 @@ exit 1
         try {
             $status = Get-Content -LiteralPath (Join-Path $DataDirectory "status.json") -Raw |
                 ConvertFrom-Json
-            [int]$status.schema_version -eq 4 -and $null -eq $status.last_error
+            [int]$status.schema_version -eq 5 -and $null -eq $status.last_error
         } catch { $false }
     } 120
 

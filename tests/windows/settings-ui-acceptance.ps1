@@ -48,10 +48,13 @@ $script:ui = @{
     RuNoRules = Expand-UnicodeEscapes "\u042f\u0432\u043d\u044b\u0435 \u043f\u0440\u0430\u0432\u0438\u043b\u0430 \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u043e\u0432 \u043d\u0435 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d\u044b."
     RuLogging = Expand-UnicodeEscapes "\u0416\u0443\u0440\u043d\u0430\u043b"
     RuLoggingHeading = Expand-UnicodeEscapes "\u0414\u0438\u0430\u0433\u043d\u043e\u0441\u0442\u0438\u0447\u0435\u0441\u043a\u0438\u0439 \u0436\u0443\u0440\u043d\u0430\u043b"
-    RuLoggingEnabled = Expand-UnicodeEscapes "\u0412\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043f\u043e\u0434\u0440\u043e\u0431\u043d\u044b\u0439 \u0436\u0443\u0440\u043d\u0430\u043b \u0441\u043b\u0443\u0436\u0431\u044b"
+    RuLoggingLevel = Expand-UnicodeEscapes "\u0423\u0440\u043e\u0432\u0435\u043d\u044c \u0434\u0435\u0442\u0430\u043b\u0438\u0437\u0430\u0446\u0438\u0438 \u0436\u0443\u0440\u043d\u0430\u043b\u0430"
+    RuLoggingOff = Expand-UnicodeEscapes "\u0412\u044b\u043a\u043b\u044e\u0447\u0435\u043d"
+    RuLoggingNormal = Expand-UnicodeEscapes "\u041e\u0431\u044b\u0447\u043d\u044b\u0439 (\u0440\u0435\u043a\u043e\u043c\u0435\u043d\u0434\u0443\u0435\u0442\u0441\u044f)"
+    RuLoggingTrace = Expand-UnicodeEscapes "\u0422\u0440\u0430\u0441\u0441\u0438\u0440\u043e\u0432\u043a\u0430"
     RuLogSize = Expand-UnicodeEscapes "\u041c\u0430\u043a\u0441\u0438\u043c\u0430\u043b\u044c\u043d\u044b\u0439 \u0440\u0430\u0437\u043c\u0435\u0440 \u0430\u043a\u0442\u0438\u0432\u043d\u043e\u0433\u043e \u0436\u0443\u0440\u043d\u0430\u043b\u0430 (\u041c\u0438\u0411)"
     RuLogArchives = Expand-UnicodeEscapes "\u0421\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u043c\u044b\u0435 \u0446\u0438\u043a\u043b\u0438\u0447\u0435\u0441\u043a\u0438\u0435 \u0430\u0440\u0445\u0438\u0432\u044b"
-    RuLoggingOff = Expand-UnicodeEscapes "\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u044b\u0439 \u0436\u0443\u0440\u043d\u0430\u043b \u0432\u044b\u043a\u043b\u044e\u0447\u0435\u043d. \u0421\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u044e\u0449\u0438\u0435 \u0444\u0430\u0439\u043b\u044b \u0436\u0443\u0440\u043d\u0430\u043b\u0430 \u0438 \u0430\u0440\u0445\u0438\u0432\u044b \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u044e\u0442\u0441\u044f, \u043d\u043e\u0432\u044b\u0435 \u0434\u0438\u0430\u0433\u043d\u043e\u0441\u0442\u0438\u0447\u0435\u0441\u043a\u0438\u0435 \u0441\u043e\u0431\u044b\u0442\u0438\u044f \u043d\u0435 \u0437\u0430\u043f\u0438\u0441\u044b\u0432\u0430\u044e\u0442\u0441\u044f."
+    RuLoggingOffDescription = Expand-UnicodeEscapes "\u041e\u0431\u044b\u0447\u043d\u044b\u0439 \u0436\u0443\u0440\u043d\u0430\u043b \u0432\u044b\u043a\u043b\u044e\u0447\u0435\u043d. \u0421\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u044e\u0449\u0438\u0435 \u0444\u0430\u0439\u043b\u044b \u0436\u0443\u0440\u043d\u0430\u043b\u0430 \u0438 \u0430\u0440\u0445\u0438\u0432\u044b \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u044e\u0442\u0441\u044f."
 }
 
 function Assert-True([bool]$Condition, [string]$Message) {
@@ -147,7 +150,7 @@ function Set-Utf8FileAtomically([string]$Path, [string]$Text) {
 function Wait-ServiceReload(
     $AfterBaseline,
     [string]$ExpectedMode,
-    [bool]$ExpectedLoggingEnabled,
+    [string]$ExpectedLoggingLevel,
     [int]$ExpectedLogSizeMiB,
     [int]$ExpectedLogArchives,
     [string]$Description,
@@ -156,11 +159,11 @@ function Wait-ServiceReload(
     Wait-Condition $Description {
         $status = Read-ServiceStatus
         $null -ne $status -and
-            [int]$status.schema_version -eq 4 -and
+            [int]$status.schema_version -eq 5 -and
             (Test-NewReloadReceipt $status $AfterBaseline) -and
             $status.config_reload_result -eq "reloaded" -and
             $status.configured_mode -eq $ExpectedMode -and
-            [bool]$status.applied_logging.enabled -eq $ExpectedLoggingEnabled -and
+            [string]$status.applied_logging.level -eq $ExpectedLoggingLevel -and
             [int]$status.applied_logging.max_file_size_mib -eq $ExpectedLogSizeMiB -and
             [int]$status.applied_logging.retained_archives -eq $ExpectedLogArchives -and
             [bool]$status.applied_responsiveness.enabled -and
@@ -171,7 +174,7 @@ function Wait-ServiceReload(
 function Wait-RestoreReload(
     $AfterBaseline,
     [string]$ExpectedMode,
-    [bool]$ExpectedLoggingEnabled,
+    [string]$ExpectedLoggingLevel,
     [int]$ExpectedLogSizeMiB,
     [int]$ExpectedLogArchives,
     [int]$TimeoutSeconds = 25
@@ -179,11 +182,11 @@ function Wait-RestoreReload(
     Wait-Condition "service reload after restoring original configuration" {
         $status = Read-ServiceStatus
         $null -ne $status -and
-            [int]$status.schema_version -eq 4 -and
+            [int]$status.schema_version -eq 5 -and
             (Test-NewReloadReceipt $status $AfterBaseline) -and
             $status.config_reload_result -eq "reloaded" -and
             $status.configured_mode -eq $ExpectedMode -and
-            [bool]$status.applied_logging.enabled -eq $ExpectedLoggingEnabled -and
+            [string]$status.applied_logging.level -eq $ExpectedLoggingLevel -and
             [int]$status.applied_logging.max_file_size_mib -eq $ExpectedLogSizeMiB -and
             [int]$status.applied_logging.retained_archives -eq $ExpectedLogArchives
     } $TimeoutSeconds
@@ -408,6 +411,34 @@ function Set-NamedToggleState(
     }
 }
 
+function Test-SelectionState($Element) {
+    $pattern = $null
+    if ($Element.TryGetCurrentPattern(
+        [System.Windows.Automation.SelectionItemPattern]::Pattern,
+        [ref]$pattern
+    )) {
+        return [bool]$pattern.Current.IsSelected
+    }
+    if ($Element.TryGetCurrentPattern(
+        [System.Windows.Automation.TogglePattern]::Pattern,
+        [ref]$pattern
+    )) {
+        return $pattern.Current.ToggleState.ToString() -eq "On"
+    }
+    throw "Accessible element '$($Element.Current.Name)' exposes no selection state"
+}
+
+function Set-NamedSelection($Root, [string[]]$Names) {
+    $element = Wait-AccessibleElement $Root $Names $true
+    if (-not (Test-SelectionState $element)) {
+        Invoke-AccessibleElement $element
+    }
+    Wait-Condition ("selection '{0}'" -f ($Names -join "' or '")) {
+        $current = Find-AccessibleElement $Root $Names $true
+        $null -ne $current -and (Test-SelectionState $current)
+    }
+}
+
 function Find-NamedNumericControl($Root, [string[]]$Names) {
     foreach ($element in @(Get-NamedAccessibleElements $Root $Names)) {
         $pattern = $null
@@ -545,15 +576,31 @@ function Get-ConfigScalar([string]$Text, [string]$Name) {
 }
 
 function Get-ConfigLogging([string]$Text) {
-    if (-not [regex]::IsMatch($Text, "(?m)^\s*\[logging\]\s*$")) {
+    $section = [regex]::Match(
+        $Text,
+        "(?ms)^\s*\[logging\]\s*(?<body>.*?)(?=^\s*\[|\z)"
+    )
+    if (-not $section.Success) {
         return [pscustomobject]@{
-            enabled = $true
+            level = "normal"
             max_file_size_mib = 10
             retained_archives = 1
         }
     }
+    $body = $section.Groups["body"].Value
+    $level = [regex]::Match($body, '(?m)^\s*level\s*=\s*"(?<value>[^\"]+)"\s*$')
+    if ($level.Success) {
+        $loggingLevel = $level.Groups["value"].Value
+    } else {
+        $enabled = [regex]::Match($body, '(?m)^\s*enabled\s*=\s*(?<value>true|false)\s*$')
+        $loggingLevel = if ($enabled.Success -and $enabled.Groups["value"].Value -eq "false") {
+            "off"
+        } else {
+            "normal"
+        }
+    }
     return [pscustomobject]@{
-        enabled = (Get-ConfigScalar $Text "enabled") -eq "true"
+        level = $loggingLevel
         max_file_size_mib = [int](Get-ConfigScalar $Text "max_file_size_mib")
         retained_archives = [int](Get-ConfigScalar $Text "retained_archives")
     }
@@ -572,22 +619,30 @@ function Get-ConfigSectionScalar([string]$Text, [string]$Section, [string]$Name)
 
 function Assert-ProductDefaults([string]$Text) {
     $expected = [ordered]@{
-        schema_version = "4"
+        schema_version = "5"
         controller_mode = "auto"
         sample_interval_ms = "1000"
         minimum_process_utilization_bps = "500"
         all_user_processes = "true"
         default_rule_mode = "auto"
         default_workload_profile = "balanced"
-        enabled = "true"
-        max_file_size_mib = "10"
-        retained_archives = "1"
         overload_threshold_bps = "8500"
         minimum_improvement_bps = "2000"
         stability_samples = "3"
         minimum_residency_ms = "10000"
         cooldown_ms = "30000"
         max_mutations_per_evaluation = "1"
+    }
+    $loggingExpected = [ordered]@{
+        level = "normal"
+        max_file_size_mib = "10"
+        retained_archives = "1"
+    }
+    foreach ($field in $loggingExpected.Keys) {
+        $actual = Get-ConfigSectionScalar $Text "logging" $field
+        Assert-True ($actual -eq $loggingExpected[$field]) (
+            "Product logging default '$field' is '$actual', expected '$($loggingExpected[$field])'"
+        )
     }
     $responsivenessExpected = [ordered]@{
         enabled = "true"
@@ -718,7 +773,12 @@ $backupPath = Join-Path $env:TEMP ("winsched-settings-ui-{0}.bak" -f [Guid]::New
 $screenshots = New-Object System.Collections.ArrayList
 $originalBytes = $null
 $originalHash = $null
+$originalMode = $null
+$originalLoggingLevel = $null
+$originalLogSizeMiB = 0
+$originalLogArchives = 0
 $workingConfigInstalled = $false
+$configurationRestored = $true
 $primaryProcessId = 0
 $launcherProcessId = 0
 $secondProcessId = 0
@@ -752,10 +812,17 @@ try {
     $originalBytes = [System.IO.File]::ReadAllBytes($script:configPath)
     [System.IO.File]::WriteAllBytes($backupPath, $originalBytes)
     $originalHash = (Get-FileHash -LiteralPath $backupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $originalStatus = Read-ServiceStatus
+    Assert-True ($null -ne $originalStatus -and [int]$originalStatus.schema_version -eq 5) `
+        "WinSched status schema 5 is required before Settings acceptance"
+    $originalMode = [string]$originalStatus.configured_mode
+    $originalLoggingLevel = [string]$originalStatus.applied_logging.level
+    $originalLogSizeMiB = [int]$originalStatus.applied_logging.max_file_size_mib
+    $originalLogArchives = [int]$originalStatus.applied_logging.retained_archives
 
     $workingConfig = @"
 # External backup marker: $($script:marker)
-schema_version = 3
+schema_version = 5
 controller_mode = "observe"
 sample_interval_ms = 2500
 minimum_process_utilization_bps = 500
@@ -764,7 +831,7 @@ default_rule_mode = "auto"
 default_workload_profile = "balanced"
 
 [logging]
-enabled = false
+level = "off"
 max_file_size_mib = 2
 retained_archives = 2
 
@@ -795,10 +862,11 @@ max_mutations_per_evaluation = 1
     $workingBaseline = Get-StatusBaseline
     Set-Utf8FileAtomically $script:configPath $workingConfig
     $workingConfigInstalled = $true
+    $configurationRestored = $false
     Wait-ServiceReload `
         $workingBaseline `
         "observe" `
-        $false `
+        "off" `
         2 `
         2 `
         "service reload of non-default acceptance configuration"
@@ -923,7 +991,7 @@ max_mutations_per_evaluation = 1
         @("Enable background efficiency") `
         $true
     Assert-True ((Get-ToggleState $backgroundToggle) -eq "Off") `
-        "Schema-3 working configuration unexpectedly enabled background efficiency"
+        "Schema-5 working configuration unexpectedly enabled background efficiency"
     Assert-HoverTooltip `
         $primaryWindow `
         @("Enable background efficiency") `
@@ -959,16 +1027,14 @@ max_mutations_per_evaluation = 1
 
     Invoke-NamedAccessibleElement $primaryWindow @("Logging")
     [void](Wait-AccessibleElement $primaryWindow @("Diagnostic logging") $false)
-    $loggingToggle = Wait-AccessibleElement `
-        $primaryWindow `
-        @("Enable detailed service logging") `
-        $true
-    Assert-True ((Get-ToggleState $loggingToggle) -eq "Off") `
-        "Working configuration did not load logging as disabled"
+    [void](Wait-AccessibleElement $primaryWindow @("Log detail level") $false)
+    $loggingOff = Wait-AccessibleElement $primaryWindow @("Off") $true
+    Assert-True (Test-SelectionState $loggingOff) `
+        "Working configuration did not load logging level Off"
     Assert-HoverTooltip `
         $primaryWindow `
-        @("Enable detailed service logging") `
-        "Writes detailed service events as JSONL. Disable it to stop routine disk writes; existing logs remain until removed manually or by uninstall purge."
+        @("Log detail level") `
+        "Off performs no routine log writes. Normal records changes, failures, and one aggregated decision summary per minute. Trace additionally writes every per-process policy decision and can generate substantial disk I/O."
     Assert-NumericControl `
         $primaryWindow `
         @("Maximum active log size (MiB)") `
@@ -980,7 +1046,7 @@ max_mutations_per_evaluation = 1
         $false `
         2
     [void](Wait-AccessibleElement $primaryWindow @(
-        "Detailed logging is off. Existing log and archive files are preserved, and no new diagnostic events are written."
+        "Routine logging is off. Existing log and archive files are preserved."
     ) $false)
     $path = Join-Path $OutputDirectory "settings-logging-disabled-en.png"
     Capture-Window $primaryWindow $path
@@ -1023,15 +1089,13 @@ max_mutations_per_evaluation = 1
     [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuLogging) $true)
     Invoke-NamedAccessibleElement $primaryWindow @($script:ui.RuLogging)
     [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuLoggingHeading) $false)
-    $loggingToggle = Wait-AccessibleElement `
-        $primaryWindow `
-        @($script:ui.RuLoggingEnabled) `
-        $true
-    Assert-True ((Get-ToggleState $loggingToggle) -eq "Off") `
-        "Russian Logging tab did not preserve the disabled toggle"
+    [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuLoggingLevel) $false)
+    $loggingOff = Wait-AccessibleElement $primaryWindow @($script:ui.RuLoggingOff) $true
+    Assert-True (Test-SelectionState $loggingOff) `
+        "Russian Logging tab did not preserve logging level Off"
     Assert-NumericControl $primaryWindow @($script:ui.RuLogSize) $false 2
     Assert-NumericControl $primaryWindow @($script:ui.RuLogArchives) $false 2
-    [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuLoggingOff) $false)
+    [void](Wait-AccessibleElement $primaryWindow @($script:ui.RuLoggingOffDescription) $false)
     $path = Join-Path $OutputDirectory "settings-logging-disabled-ru.png"
     Capture-Window $primaryWindow $path
     [void]$screenshots.Add((Split-Path -Leaf $path))
@@ -1061,7 +1125,7 @@ max_mutations_per_evaluation = 1
     [void](Wait-AccessibleElement $primaryWindow @("Logging") $true)
     Invoke-NamedAccessibleElement $primaryWindow @("Logging")
     [void](Wait-AccessibleElement $primaryWindow @("Diagnostic logging") $false)
-    Set-NamedToggleState $primaryWindow @("Enable detailed service logging") "On"
+    Set-NamedSelection $primaryWindow @("Normal (recommended)")
     Assert-NumericControl $primaryWindow @("Maximum active log size (MiB)") $true 2
     Assert-NumericControl $primaryWindow @("Retained circular archives") $true 2
     $path = Join-Path $OutputDirectory "settings-logging-enabled-en.png"
@@ -1070,12 +1134,12 @@ max_mutations_per_evaluation = 1
 
     $loggingOnBaseline = Get-StatusBaseline
     $apply = Wait-AccessibleElement $primaryWindow @("Apply") $true
-    Assert-True $apply.Current.IsEnabled "Apply is disabled after enabling detailed logging"
+    Assert-True $apply.Current.IsEnabled "Apply is disabled after selecting normal logging"
     Invoke-AccessibleElement $apply
     Wait-Condition "enabled logging persisted by GUI Apply" {
         try {
             $text = Get-Content -LiteralPath $script:configPath -Raw
-            (Get-ConfigScalar $text "enabled") -eq "true" -and
+            (Get-ConfigScalar $text "level") -eq "normal" -and
                 (Get-ConfigScalar $text "max_file_size_mib") -eq "2" -and
                 (Get-ConfigScalar $text "retained_archives") -eq "2"
         } catch {
@@ -1085,10 +1149,10 @@ max_mutations_per_evaluation = 1
     Wait-ServiceReload `
         $loggingOnBaseline `
         "observe" `
-        $true `
+        "normal" `
         2 `
         2 `
-        "service receipt after enabling logging in the GUI"
+        "service receipt after selecting normal logging in the GUI"
     Wait-Condition "background switches persisted by GUI Apply" {
         try {
             $text = Get-Content -LiteralPath $script:configPath -Raw
@@ -1109,17 +1173,40 @@ max_mutations_per_evaluation = 1
     Assert-True (-not [bool]$backgroundStatus.applied_background_efficiency.eco_qos_enabled) `
         "service unexpectedly enabled EcoQoS after GUI Apply"
 
-    Set-NamedToggleState $primaryWindow @("Enable detailed service logging") "Off"
+    Set-NamedSelection $primaryWindow @("Trace")
+    $traceBaseline = Get-StatusBaseline
+    $apply = Wait-AccessibleElement $primaryWindow @("Apply") $true
+    Assert-True $apply.Current.IsEnabled "Apply is disabled after selecting trace logging"
+    Invoke-AccessibleElement $apply
+    Wait-Condition "trace logging persisted by GUI Apply" {
+        try {
+            (Get-ConfigScalar (Get-Content -LiteralPath $script:configPath -Raw) "level") -eq "trace"
+        } catch {
+            $false
+        }
+    }
+    Wait-ServiceReload `
+        $traceBaseline `
+        "observe" `
+        "trace" `
+        2 `
+        2 `
+        "service receipt after selecting trace logging in the GUI"
+    $path = Join-Path $OutputDirectory "settings-logging-trace-en.png"
+    Capture-Window $primaryWindow $path
+    [void]$screenshots.Add((Split-Path -Leaf $path))
+
+    Set-NamedSelection $primaryWindow @("Off")
     Assert-NumericControl $primaryWindow @("Maximum active log size (MiB)") $false 2
     Assert-NumericControl $primaryWindow @("Retained circular archives") $false 2
     $loggingOffBaseline = Get-StatusBaseline
     $apply = Wait-AccessibleElement $primaryWindow @("Apply") $true
-    Assert-True $apply.Current.IsEnabled "Apply is disabled after disabling detailed logging"
+    Assert-True $apply.Current.IsEnabled "Apply is disabled after selecting logging Off"
     Invoke-AccessibleElement $apply
     Wait-Condition "disabled logging persisted by GUI Apply" {
         try {
             $text = Get-Content -LiteralPath $script:configPath -Raw
-            (Get-ConfigScalar $text "enabled") -eq "false" -and
+            (Get-ConfigScalar $text "level") -eq "off" -and
                 (Get-ConfigScalar $text "max_file_size_mib") -eq "2" -and
                 (Get-ConfigScalar $text "retained_archives") -eq "2"
         } catch {
@@ -1129,20 +1216,17 @@ max_mutations_per_evaluation = 1
     Wait-ServiceReload `
         $loggingOffBaseline `
         "observe" `
-        $false `
+        "off" `
         2 `
         2 `
-        "service receipt after disabling logging in the GUI"
+        "service receipt after selecting logging Off in the GUI"
     Invoke-NamedAccessibleElement $primaryWindow @("Reload from disk")
     [void](Wait-AccessibleElement $primaryWindow @(
         "Configuration reloaded from disk."
     ) $false)
-    $loggingToggle = Wait-AccessibleElement `
-        $primaryWindow `
-        @("Enable detailed service logging") `
-        $true
-    Assert-True ((Get-ToggleState $loggingToggle) -eq "Off") `
-        "Reload from disk did not preserve disabled logging"
+    $loggingOff = Wait-AccessibleElement $primaryWindow @("Off") $true
+    Assert-True (Test-SelectionState $loggingOff) `
+        "Reload from disk did not preserve logging level Off"
     Assert-NumericControl $primaryWindow @("Maximum active log size (MiB)") $false 2
     Assert-NumericControl $primaryWindow @("Retained circular archives") $false 2
 
@@ -1195,7 +1279,7 @@ max_mutations_per_evaluation = 1
     Wait-ServiceReload `
         $applyBaseline `
         "auto" `
-        $true `
+        "normal" `
         10 `
         1 `
         "service confirmation of GUI Apply" `
@@ -1254,7 +1338,10 @@ max_mutations_per_evaluation = 1
             "Protect the foreground application",
             "Protect visible and minimized applications",
             "Protect applications with active audio",
-            "Enable detailed service logging",
+            "Log detail level",
+            "Off",
+            "Normal (recommended)",
+            "Trace",
             "Maximum active log size (MiB)",
             "Retained circular archives",
             "Restore defaults...",
@@ -1268,7 +1355,7 @@ max_mutations_per_evaluation = 1
         responsiveness_en_ru_ui = $true
         background_en_ru_ui = $true
         background_switch_persistence = $true
-        logging_enabled_disabled_persistence = $true
+        logging_levels_persistence = $true
         logging_defaults_applied = $true
         tooltip_pages_verified = @("General", "Responsiveness", "Background", "Logging")
         tooltips_verified = 5
@@ -1330,16 +1417,13 @@ max_mutations_per_evaluation = 1
     if ($workingConfigInstalled -and $null -ne $originalBytes) {
         try {
             $restoreBaseline = Get-StatusBaseline
-            $originalText = [System.Text.Encoding]::UTF8.GetString($originalBytes)
-            $originalMode = Get-ConfigScalar $originalText "controller_mode"
-            $originalLogging = Get-ConfigLogging $originalText
             Set-FileAtomically $script:configPath $originalBytes
             Wait-RestoreReload `
                 $restoreBaseline `
                 $originalMode `
-                ([bool]$originalLogging.enabled) `
-                ([int]$originalLogging.max_file_size_mib) `
-                ([int]$originalLogging.retained_archives) `
+                $originalLoggingLevel `
+                $originalLogSizeMiB `
+                $originalLogArchives `
                 25
             $restoredHash = (Get-FileHash -LiteralPath $script:configPath -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($restoredHash -ne $originalHash) {
@@ -1347,6 +1431,7 @@ max_mutations_per_evaluation = 1
             }
             $result["original_config_restored"] = $true
             $result["restored_config_sha256"] = $restoredHash
+            $configurationRestored = $true
         } catch {
             [void]$cleanupErrors.Add("Original configuration restore failed: $($_.Exception.Message)")
             $result["original_config_restored"] = $false
@@ -1366,8 +1451,12 @@ max_mutations_per_evaluation = 1
         }
     }
 
-    Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
-    $result["cleanup_completed"] = $true
+    if ($configurationRestored) {
+        Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+    } elseif (Test-Path -LiteralPath $backupPath -PathType Leaf) {
+        $result["recovery_backup_path"] = $backupPath
+    }
+    $result["cleanup_completed"] = ($cleanupErrors.Count -eq 0 -and $configurationRestored)
     $result["cleanup_errors"] = @($cleanupErrors)
     $result["phase"] = "complete"
     if ($cleanupErrors.Count -gt 0) {

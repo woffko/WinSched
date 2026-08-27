@@ -1,0 +1,35 @@
+{
+  "result": "INVALID_FOR_POLICY",
+  "evidence_format": "privacy-minimized projection of the physical-host receipt",
+  "source_sha256": "24751605502082ed17ce90bbeea9426539e5aa08e7a6bc7e0ee52eb399941cef",
+  "reason_codes": [
+    "HUMAN_REACTION_INCLUDED_IN_ENDPOINT",
+    "PAIR_DIRECTION_INCONSISTENT",
+    "DISABLED_PHASES_CONFOUNDED_BY_SERVICE_BUSY_LOOP"
+  ],
+  "manual_p95_ms": {
+    "A1_enabled": 5040.098,
+    "B1_disabled": 3882.645,
+    "B2_disabled": 4266.142,
+    "A2_enabled": 3213.571
+  },
+  "service_cpu_one_core_percent": {
+    "A1_enabled": 3.3114191,
+    "B1_disabled": 40.5652708,
+    "B2_disabled": 35.6208318,
+    "A2_enabled": 3.4170564
+  },
+  "service_write_operations": {
+    "A1_enabled": 12,
+    "B1_disabled": 31443,
+    "B2_disabled": 27768,
+    "A2_enabled": 22
+  },
+  "restore": {
+    "config_bytes_restored": true,
+    "scheduling_state_restored": true,
+    "service_process_unchanged": true,
+    "logging_state_restored": true,
+    "temporary_files_removed": true
+  }
+}

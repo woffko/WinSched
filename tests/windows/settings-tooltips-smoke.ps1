@@ -216,8 +216,8 @@ try {
     Invoke-Element (Wait-Element $window "Logging" $true)
     Assert-Tooltip `
         $window `
-        "Enable detailed service logging" `
-        "Writes detailed service events as JSONL. Disable it to stop routine disk writes; existing logs remain until removed manually or by uninstall purge." `
+        "Log detail level" `
+        "Off performs no routine log writes. Normal records changes, failures, and one aggregated decision summary per minute. Trace additionally writes every per-process policy decision and can generate substantial disk I/O." `
         (Join-Path $OutputDirectory "tooltip-logging.png")
 
     Invoke-Element (Wait-Element $window "Close" $true)
@@ -233,7 +233,7 @@ try {
             "Default workload profile",
             "Enable topology-aware system reserve",
             "Enable background efficiency",
-            "Enable detailed service logging"
+            "Log detail level"
         )
         pages = @("General", "Responsiveness", "Background", "Logging")
         configuration_changed = $false

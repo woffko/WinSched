@@ -1,0 +1,32 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified physical-host receipt",
+  "duration_seconds": 75.0033203,
+  "service_pid_unchanged": true,
+  "cpu": {
+    "one_core_percent": 3.1248616602910579,
+    "machine_capacity_percent": 0.04882596344204778
+  },
+  "logging": {
+    "records": 9,
+    "bytes": 4601,
+    "records_per_second": 0.11999468775517662,
+    "bytes_per_second": 61.34395092906307,
+    "decision_summaries": 1,
+    "periodic_summaries": 1,
+    "raw_mutation_decisions": 2,
+    "raw_noop_decisions": 0,
+    "write_errors": 0
+  },
+  "evaluation": {
+    "rolling_mean_us": 30369,
+    "rolling_p95_us": 32443,
+    "rolling_max_us": 45896,
+    "last_scanned_processes": 387,
+    "last_eligible_processes": 29,
+    "last_decisions": 29
+  },
+  "original_config_sha256": "cbe33a966d8e0138d429210749a809511d7fa6135f09bf3d0efd05982c05518a",
+  "config_restored": true,
+  "cleanup_errors": []
+}

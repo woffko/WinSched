@@ -291,6 +291,7 @@ mod tests {
             llc_domains: 2,
             last_activity: Some("assigned game.exe to LLC 1".to_owned()),
             last_error: None,
+            telemetry: None,
             updated_at_unix_ms: 100,
         }
     }

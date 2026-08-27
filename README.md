@@ -16,7 +16,8 @@ User-Mode Scheduling is not used because it is not supported on Windows 11.
   with Windows, persists owned assignments, clears them on shutdown or disable,
   keeps an optional size-bounded circular JSONL log, reserves topology-aware
   system capacity, journals reversible background QoS changes before applying
-  them, and recovers safely after an interrupted run.
+  them, publishes anonymous controller-cost and I/O counters, and recovers
+  safely after an interrupted run.
 - `winsched-tray.exe` is a per-session notification-area controller. It shows
   the current mode, service state, managed-process count, last activity, and
   last error. An MTA worker publishes authenticated foreground, visible-window,
@@ -55,7 +56,7 @@ it cannot select a process for mutation.
 
 ## Install
 
-WinSched 0.5.0 requires 64-bit Windows 11 22H2 or newer (build 22621+). This
+WinSched 0.5.1 requires 64-bit Windows 11 22H2 or newer (build 22621+). This
 minimum keeps EcoQoS state queries on the supported Windows API baseline used
 by the ownership journal.
 
@@ -133,21 +134,31 @@ data is stored under `C:\ProgramData\WinSched`:
 included only by `all_user_processes`; `500` means 5% of one logical CPU.
 Explicit image rules remain deterministic even while an application is idle.
 
-The `[logging]` section controls the service diagnostic log. `enabled = false`
-stops all writes, creation, rotation, and deletion of `winsched.log*` while
-preserving files already on disk. `max_file_size_mib` limits the active file to
-1–100 MiB, and `retained_archives` keeps 0–10 circular archives. Archive `.1`
-is always the newest; `0` reuses only the active file. A single diagnostic
-record is never split even if that record alone is larger than the configured
-limit. Critical startup or logging failures can still be recorded separately
-in `winsched-emergency.log`. Existing schema-1 through schema-3 configurations
-remain accepted. Their first save through Settings writes schema 4 without
-losing existing values. Background efficiency remains disabled after migration
-because older Background profiles did not opt into QoS mutation. Steady
-`responsiveness_sample` telemetry is coalesced
-to one periodic summary per 60 seconds. Initial state, stable pressure
-transitions, memory-profile width changes, errors, and controller decisions
-remain immediate.
+The `[logging]` section controls the bounded service JSONL log. `level = "off"`
+stops all routine writes, creation, rotation, and deletion of `winsched.log*`
+while preserving existing files. `level = "normal"` is the recommended default:
+changes and failures remain immediate, while unchanged per-process decisions
+are aggregated into one privacy-safe `decision_summary` per minute. The exact
+unique-process set is capped at 4,096 entries and reports saturation instead of
+growing without a bound. Configuration, Scheduling, fail-closed, and shutdown
+boundaries flush any partial non-empty window.
+`level = "trace"` additionally records every raw policy decision and is intended
+only for short diagnostics because it can generate substantial write traffic.
+`max_file_size_mib` limits the active file to 1–100 MiB, and
+`retained_archives` keeps 0–10 circular archives. Archive `.1` is newest; `0`
+reuses only the active file. A single record is never split. Critical startup
+or logging failures remain independent in `winsched-emergency.log`.
+
+Configuration schema is 5. Schemas 1 through 4 remain accepted in memory;
+legacy `logging.enabled = false/true` becomes `off/normal`. The first Settings
+save writes schema 5 without losing other values. Background Efficiency remains
+disabled after schema-1 through schema-3 migration, while schema-4 Background
+rules retain their 0.5.0 QoS-only meaning. Steady `responsiveness_sample`
+telemetry remains coalesced to one periodic summary per 60 seconds.
+
+The ten-second `status.json` heartbeat does not accelerate a longer policy
+interval into an extra process scan. Service uptime used for lifetime-average
+CPU reporting comes from the controller's monotonic clock.
 
 The `[responsiveness]` section reserves whole physical cores for Windows by
 removing their CPU Sets only from WinSched-managed application assignments.
@@ -164,7 +175,7 @@ Process rules also have an independent `profile`:
 - `memory` uses a stable multi-LLC partition with one SMT sibling per physical
   core by default and an adaptive physical-core width.
 - `compute` uses both SMT siblings across all non-reserved assignable cores.
-- `background` opts that exact schema-4 rule into the reversible
+- `background` opts that exact schema-4-or-newer rule into the reversible
   background-efficiency policy. CPU Set placement is always disabled for this
   profile, even while the global feature switch is off, so a protected
   foreground/visible/audio process is not left LLC-constrained. Its exact-rule
@@ -375,6 +386,15 @@ machine; a WSL cross-build alone is not release evidence.
 ## Testing and evidence
 
 WinSched uses separate source, Windows VM, and physical Threadripper gates. The
+0.5.1 development branch adds schema-5 normal/trace logging and anonymous
+self-observability. Native tests and both native/Windows-target Clippy gates
+must pass before its Windows VM logging, UI, upgrade, and quiet-I/O matrix. A
+physical passive-click ABBA experiment then determines whether broad CPU Set
+scheduling helps this host; no benefit is inferred from healthy one-sided
+latency measurements or from the invalidated manual-marker run.
+See [0.5.1 efficiency and observability design](docs/efficiency-observability-v0.5.1.md).
+
+The released
 final 0.5.0 source, native-Windows, service, tray, Settings, installer, upgrade,
 uninstall, crash-recovery, logging, and quiet-I/O gates passed on the designated
 Windows 11 VM. The previously accepted physical Threadripper topology and

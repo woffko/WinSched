@@ -1,0 +1,88 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified physical-host receipt",
+  "protocol": {
+    "design": "ABBA",
+    "scenario": "firefox_taskbar_restore",
+    "attempts_per_phase": 10,
+    "valid_attempts_total": 40,
+    "human_reaction_time_in_endpoint": false,
+    "generated_input": false,
+    "per_monitor_dpi_aware_v2": true,
+    "dedicated_response_probe_thread": true,
+    "minimize_confirmed_with_is_iconic": true
+  },
+  "phases": [
+    {
+      "label": "A1",
+      "scheduling_enabled": true,
+      "valid_attempts": 10,
+      "restore_p50_ms": 187,
+      "restore_p95_ms": 219,
+      "taskbar_p95_us": 706,
+      "scheduler_p99_us": 575,
+      "service_cpu_one_core_percent": 3.4427517,
+      "service_write_operations": 20,
+      "evaluations": 150
+    },
+    {
+      "label": "B1",
+      "scheduling_enabled": false,
+      "valid_attempts": 10,
+      "restore_p50_ms": 172,
+      "restore_p95_ms": 218,
+      "taskbar_p95_us": 625,
+      "scheduler_p99_us": 608,
+      "service_cpu_one_core_percent": 0.2696079,
+      "service_write_operations": 12,
+      "evaluations": 0
+    },
+    {
+      "label": "B2",
+      "scheduling_enabled": false,
+      "valid_attempts": 10,
+      "restore_p50_ms": 219,
+      "restore_p95_ms": 235,
+      "taskbar_p95_us": 461,
+      "scheduler_p99_us": 601,
+      "service_cpu_one_core_percent": 0.3723423,
+      "service_write_operations": 12,
+      "evaluations": 0
+    },
+    {
+      "label": "A2",
+      "scheduling_enabled": true,
+      "valid_attempts": 10,
+      "restore_p50_ms": 203,
+      "restore_p95_ms": 266,
+      "taskbar_p95_us": 403,
+      "scheduler_p99_us": 588,
+      "service_cpu_one_core_percent": 3.4867241,
+      "service_write_operations": 13,
+      "evaluations": 170
+    }
+  ],
+  "comparison": {
+    "verdict": "no_clear_effect",
+    "passive_timing_policy_eligible": true,
+    "enabled_restore_p95_ms": 250,
+    "disabled_restore_p95_ms": 234,
+    "enabled_p95_improvement_percent": -6.8376068,
+    "pair_direction_consistent": true,
+    "enabled_slower_in_both_pairs": true,
+    "taskbar_p95_regression_percent": -12.5813449,
+    "scheduler_p99_regression_percent": -4.3261231,
+    "objective_no_regression_over_10_percent": true
+  },
+  "restore": {
+    "service_process_unchanged": true,
+    "scheduling_state_restored": true,
+    "logging_state_restored": true,
+    "temporary_processes_removed": true,
+    "aborted_pre_measurement_orphan_config_recovered_separately": true,
+    "original_config_sha256": "cbe33a966d8e0138d429210749a809511d7fa6135f09bf3d0efd05982c05518a",
+    "temporary_rule_count_after_recovery": 0,
+    "service_running_after_recovery": true,
+    "last_error_after_recovery": null
+  }
+}

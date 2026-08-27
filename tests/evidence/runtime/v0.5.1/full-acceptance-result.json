@@ -1,0 +1,25 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "windows_version": "Microsoft Windows NT 10.0.26340.0",
+  "package": "WinSched-0.5.1-windows-x64",
+  "llc_domains": 2,
+  "reserved_physical_cores": 1,
+  "reserved_cpu_sets": 1,
+  "memory_profile_cpu_sets": 1,
+  "compute_profile_cpu_sets": 1,
+  "workload_profiles": "PASS",
+  "background_efficiency": "PASS",
+  "background_tray_stale_restore": "PASS",
+  "background_disable_restore": "PASS",
+  "background_stop_restore": "PASS",
+  "background_crash_recovery": "PASS",
+  "background_invalid_config_restore": "PASS",
+  "normal_decision_coalescing": "PASS",
+  "controller_self_observability": "PASS",
+  "background_mutations_observed": {
+    "attempted": 9,
+    "succeeded": 9,
+    "failed": 0
+  }
+}

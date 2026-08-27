@@ -1,0 +1,19 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "candidate_binary_sha256": "77edceaa7af7faba00ff9590c571e012e92ce98ca94c1493f2b249dedff1af60",
+  "duration_seconds": 30.0063287,
+  "cpu_one_core_percent": 0.0,
+  "write_operations": 3,
+  "write_operations_per_second": 0.0999789,
+  "write_bytes": 9429,
+  "evaluations_completed": 0,
+  "status_writes": 3,
+  "service_pid_unchanged": true,
+  "restore": {
+    "original_binary_restored": true,
+    "config_unchanged": true,
+    "service_state_restored": true,
+    "scheduling_state_restored": true
+  }
+}

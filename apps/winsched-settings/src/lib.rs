@@ -177,7 +177,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use winsched_config::{ControllerMode, ProcessRule, RuleMode, WorkloadProfile};
+    use winsched_config::{
+        CONFIG_SCHEMA_VERSION, ControllerMode, LoggingLevel, ProcessRule, RuleMode, WorkloadProfile,
+    };
 
     struct TestDirectory(PathBuf);
 
@@ -218,7 +220,7 @@ mod tests {
         config.policy.minimum_residency_ms = 20_000;
         config.policy.cooldown_ms = 45_000;
         config.policy.max_mutations_per_evaluation = 2;
-        config.logging.enabled = false;
+        config.logging.level = LoggingLevel::Off;
         config.logging.max_file_size_mib = 77;
         config.logging.retained_archives = 0;
         config.rules.push(ProcessRule {
@@ -253,7 +255,7 @@ mod tests {
         assert_eq!(edited, shipped);
         assert_eq!(edited.controller_mode, ControllerMode::Auto);
         assert!(edited.all_user_processes);
-        assert!(edited.logging.enabled);
+        assert_eq!(edited.logging.level, LoggingLevel::Normal);
         assert_eq!(edited.logging.max_file_size_mib, 10);
         assert_eq!(edited.logging.retained_archives, 1);
         assert!(!edited.background_efficiency.enabled);
@@ -307,10 +309,10 @@ mod tests {
         .unwrap();
 
         let loaded = load_config(&path).unwrap();
-        assert_eq!(loaded.schema_version, 4);
+        assert_eq!(loaded.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(loaded.sample_interval_ms, 2_500);
         assert_eq!(loaded.minimum_process_utilization_bps, 777);
-        assert!(loaded.logging.enabled);
+        assert_eq!(loaded.logging.level, LoggingLevel::Normal);
         assert_eq!(loaded.logging.max_file_size_mib, 10);
         assert_eq!(loaded.logging.retained_archives, 1);
         assert!(!loaded.responsiveness.enabled);
@@ -318,7 +320,7 @@ mod tests {
 
         save_config_atomic(&path, &loaded).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("schema_version = 4"));
+        assert!(saved.contains(&format!("schema_version = {CONFIG_SCHEMA_VERSION}")));
         assert!(saved.contains("minimum_process_utilization_bps = 777"));
         assert!(saved.contains("[logging]"));
         assert!(saved.contains("[responsiveness]"));

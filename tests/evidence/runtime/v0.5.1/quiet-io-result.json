@@ -1,0 +1,10 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "duration_seconds": 75,
+  "status_writes": 7,
+  "service_log_byte_stable": true,
+  "tray_log_byte_stable": true,
+  "original_config_restored": true,
+  "tray_session": [1]
+}

@@ -1,0 +1,15 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified physical-host receipt",
+  "duration_seconds": 30.0061409,
+  "cpu_one_core_percent": 0.2082907,
+  "write_operations": 3,
+  "write_operations_per_second": 0.0999795,
+  "write_bytes": 11097,
+  "evaluations_completed": 0,
+  "status_writes": 3,
+  "service_pid_unchanged": true,
+  "initial_scheduling_restored": true,
+  "service_running_after_restore": true,
+  "last_error_after_restore": null
+}

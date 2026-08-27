@@ -16,6 +16,14 @@ pub(crate) struct ServiceSink {
     path: PathBuf,
     applied: LoggingConfig,
     writer: Option<RotatingWriter>,
+    records_written: u64,
+    bytes_written: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EventSinkStats {
+    pub records_written: u64,
+    pub bytes_written: u64,
 }
 
 struct RotatingWriter {
@@ -33,7 +41,7 @@ impl EventSink {
 
     pub(crate) fn service(path: PathBuf, config: LoggingConfig) -> io::Result<Self> {
         validate_config(config)?;
-        let writer = if config.enabled {
+        let writer = if config.is_enabled() {
             Some(RotatingWriter::open(&path, config)?)
         } else {
             None
@@ -42,6 +50,8 @@ impl EventSink {
             path,
             applied: config,
             writer,
+            records_written: 0,
+            bytes_written: 0,
         }))
     }
 
@@ -54,7 +64,7 @@ impl EventSink {
             return Ok(());
         }
 
-        if !config.enabled {
+        if !config.is_enabled() {
             // Disabling is deliberately side-effect free for winsched.log*: close the active
             // handle, but do not create, append, rotate, truncate, prune, or delete any file.
             service.writer = None;
@@ -81,18 +91,38 @@ impl EventSink {
                 writeln!(output, "{line}")?;
                 output.flush()
             }
-            Self::Service(service) => match &mut service.writer {
-                Some(writer) => writer.write_line(line),
-                None => Ok(()),
-            },
+            Self::Service(service) => {
+                let Some(writer) = &mut service.writer else {
+                    return Ok(());
+                };
+                writer.write_line(line)?;
+                service.records_written = service.records_written.saturating_add(1);
+                service.bytes_written = service.bytes_written.saturating_add(
+                    u64::try_from(line.len().saturating_add(1)).unwrap_or(u64::MAX),
+                );
+                Ok(())
+            }
         }
     }
 
     #[cfg(test)]
-    const fn applied_logging(&self) -> Option<LoggingConfig> {
+    pub(crate) const fn applied_logging(&self) -> Option<LoggingConfig> {
         match self {
             Self::Console => None,
             Self::Service(service) => Some(service.applied),
+        }
+    }
+
+    pub(crate) const fn stats(&self) -> EventSinkStats {
+        match self {
+            Self::Console => EventSinkStats {
+                records_written: 0,
+                bytes_written: 0,
+            },
+            Self::Service(service) => EventSinkStats {
+                records_written: service.records_written,
+                bytes_written: service.bytes_written,
+            },
         }
     }
 }
@@ -268,6 +298,8 @@ fn archive_path(path: &Path, index: u8) -> PathBuf {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use winsched_config::LoggingLevel;
+
     use super::*;
 
     struct TestDirectory(PathBuf);
@@ -368,7 +400,7 @@ mod tests {
         fs::write(&path, "active-before\n").unwrap();
         fs::write(&archive, "archive-before\n").unwrap();
         let disabled = LoggingConfig {
-            enabled: false,
+            level: LoggingLevel::Off,
             max_file_size_mib: 1,
             retained_archives: 0,
         };
@@ -384,6 +416,7 @@ mod tests {
 
         assert_eq!(contents(&path), "active-before\n");
         assert_eq!(contents(&archive), "archive-before\n");
+        assert_eq!(sink.stats(), EventSinkStats::default());
 
         let absent_path = directory.0.join("absent.log");
         let mut absent_sink = EventSink::service(absent_path.clone(), disabled).unwrap();
@@ -399,7 +432,7 @@ mod tests {
         fs::write(&parent_file, "blocking file").unwrap();
         let path = parent_file.join("winsched.log");
         let disabled = LoggingConfig {
-            enabled: false,
+            level: LoggingLevel::Off,
             max_file_size_mib: 1,
             retained_archives: 0,
         };
@@ -407,7 +440,7 @@ mod tests {
 
         assert!(
             sink.reconfigure(LoggingConfig {
-                enabled: true,
+                level: LoggingLevel::Normal,
                 ..disabled
             })
             .is_err()
@@ -426,7 +459,7 @@ mod tests {
         assert!(
             writer
                 .reconfigure(LoggingConfig {
-                    enabled: true,
+                    level: LoggingLevel::Normal,
                     max_file_size_mib: 1,
                     retained_archives: 1,
                 })
@@ -442,7 +475,7 @@ mod tests {
     fn console_sink_is_not_disabled_by_file_logging_policy() {
         let mut sink = EventSink::console();
         sink.reconfigure(LoggingConfig {
-            enabled: false,
+            level: LoggingLevel::Off,
             max_file_size_mib: 1,
             retained_archives: 0,
         })
@@ -450,5 +483,41 @@ mod tests {
 
         assert_eq!(sink.applied_logging(), None);
         assert!(matches!(sink, EventSink::Console));
+    }
+
+    #[test]
+    fn enabled_service_sink_counts_successful_jsonl_payload_bytes() {
+        let directory = TestDirectory::new("stats");
+        let path = directory.0.join("winsched.log");
+        let config = LoggingConfig {
+            level: LoggingLevel::Normal,
+            max_file_size_mib: 1,
+            retained_archives: 1,
+        };
+        let mut sink = EventSink::service(path.clone(), config).unwrap();
+
+        sink.write_line("one").unwrap();
+        sink.write_line("three").unwrap();
+        assert_eq!(
+            sink.stats(),
+            EventSinkStats {
+                records_written: 2,
+                bytes_written: 10,
+            }
+        );
+        sink.reconfigure(LoggingConfig {
+            level: LoggingLevel::Trace,
+            ..config
+        })
+        .unwrap();
+        sink.write_line("x").unwrap();
+        assert_eq!(
+            sink.stats(),
+            EventSinkStats {
+                records_written: 3,
+                bytes_written: 12,
+            }
+        );
+        assert_eq!(contents(&path), "one\nthree\nx\n");
     }
 }

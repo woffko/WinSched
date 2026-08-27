@@ -56,16 +56,17 @@ use windows::Win32::System::Pipes::{
     GetNamedPipeClientSessionId, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_MESSAGE,
 };
+use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::SystemInformation::{
-    CpuSetInformation, GetSystemCpuSetInformation, GlobalMemoryStatusEx, MEMORYSTATUSEX,
-    SYSTEM_CPU_SET_INFORMATION, SYSTEM_CPU_SET_INFORMATION_ALLOCATED,
-    SYSTEM_CPU_SET_INFORMATION_ALLOCATED_TO_TARGET_PROCESS, SYSTEM_CPU_SET_INFORMATION_PARKED,
-    SYSTEM_CPU_SET_INFORMATION_REALTIME,
+    CpuSetInformation, GetSystemCpuSetInformation, GetSystemTimePreciseAsFileTime,
+    GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_CPU_SET_INFORMATION,
+    SYSTEM_CPU_SET_INFORMATION_ALLOCATED, SYSTEM_CPU_SET_INFORMATION_ALLOCATED_TO_TARGET_PROCESS,
+    SYSTEM_CPU_SET_INFORMATION_PARKED, SYSTEM_CPU_SET_INFORMATION_REALTIME,
 };
 use windows::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateEventW, CreateProcessW, GetPriorityClass, GetProcessDefaultCpuSets,
-    GetProcessInformation, GetProcessTimes, INFINITE, MEMORY_PRIORITY,
+    CREATE_SUSPENDED, CreateEventW, CreateProcessW, GetCurrentProcess, GetPriorityClass,
+    GetProcessDefaultCpuSets, GetProcessInformation, GetProcessTimes, INFINITE, MEMORY_PRIORITY,
     MEMORY_PRIORITY_BELOW_NORMAL, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_LOW,
     MEMORY_PRIORITY_MEDIUM, MEMORY_PRIORITY_NORMAL, MEMORY_PRIORITY_VERY_LOW, OpenProcess,
     PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
@@ -92,8 +93,8 @@ use winsched_core::{
 use super::{
     EfficiencyMutationReport, InteractiveActivity, InteractiveStateWake, LaunchReport,
     MutationReport, ObservedProcess, ProcessEcoQosState, ProcessEfficiencyOwnership,
-    ProcessEfficiencySnapshot, ProcessEfficiencyState, ProcessMemoryPriority, ProcessSnapshot,
-    SystemPressureSample, safety,
+    ProcessEfficiencySnapshot, ProcessEfficiencyState, ProcessMemoryPriority, ProcessResourceUsage,
+    ProcessSnapshot, SystemPressureSample, safety,
 };
 
 const RESUME_THREAD_FAILED: u32 = u32::MAX;
@@ -1640,6 +1641,29 @@ pub fn current_process_key() -> Result<ProcessKey, PlatformError> {
     })
 }
 
+pub fn current_process_resource_usage() -> Result<ProcessResourceUsage, PlatformError> {
+    // SAFETY: The pseudo handle is valid for the lifetime of the calling process and must not be
+    // closed. Both queries only read accounting information for that process.
+    let process = unsafe { GetCurrentProcess() };
+    let times = query_process_times(process)?;
+    let mut memory = PROCESS_MEMORY_COUNTERS {
+        cb: u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>())
+            .expect("PROCESS_MEMORY_COUNTERS size fits in u32"),
+        ..PROCESS_MEMORY_COUNTERS::default()
+    };
+    // SAFETY: memory is a fully initialized writable structure of the advertised size and the
+    // current-process pseudo handle has query access.
+    unsafe { K32GetProcessMemoryInfo(process, &raw mut memory, memory.cb) }.ok()?;
+    // SAFETY: This API returns the current UTC FILETIME value and has no pointer arguments.
+    let now_100ns = filetime_value(unsafe { GetSystemTimePreciseAsFileTime() });
+
+    Ok(ProcessResourceUsage {
+        uptime_ms: now_100ns.saturating_sub(times.creation_time_100ns) / 10_000,
+        cpu_time_100ns: times.cpu_time_100ns,
+        working_set_bytes: u64::try_from(memory.WorkingSetSize).unwrap_or(u64::MAX),
+    })
+}
+
 fn window_activity() -> (bool, Option<u32>, Vec<u32>) {
     let foreground = unsafe { GetForegroundWindow() };
     let mut foreground_pid = 0u32;
@@ -2175,6 +2199,18 @@ mod tests {
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn current_process_resource_usage_is_live_and_monotonic() {
+        let first = current_process_resource_usage().unwrap();
+        std::thread::yield_now();
+        let second = current_process_resource_usage().unwrap();
+
+        assert!(first.working_set_bytes > 0);
+        assert!(second.working_set_bytes > 0);
+        assert!(second.uptime_ms >= first.uptime_ms);
+        assert!(second.cpu_time_100ns >= first.cpu_time_100ns);
     }
 
     #[test]

@@ -12,7 +12,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -40,6 +40,7 @@ windows = { version = "0.62.2", features = [
   "Win32_System_Memory",
   "Win32_System_Performance",
   "Win32_System_Pipes",
+  "Win32_System_ProcessStatus",
   "Win32_System_RemoteDesktop",
   "Win32_System_Registry",
   "Win32_System_SystemInformation",

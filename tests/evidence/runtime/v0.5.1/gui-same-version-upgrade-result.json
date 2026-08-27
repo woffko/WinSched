@@ -1,0 +1,15 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "setup_sha256": "4c92f9ef2d4c10662bc86c042a0f9df09cc9553c3b94b738be6383325c760d3d",
+  "previous_version": "0.5.1",
+  "installed_version": "0.5.1",
+  "config_sha256_before": "20d98408bef9cf98a4efa5455d786f997e8e47053b5fca2d209a984f8a9fb813",
+  "config_sha256_after": "20d98408bef9cf98a4efa5455d786f997e8e47053b5fca2d209a984f8a9fb813",
+  "config_byte_identical": true,
+  "status_schema": 5,
+  "logging_level": "normal",
+  "scheduling_preserved": true,
+  "service_running": true,
+  "last_error": null
+}

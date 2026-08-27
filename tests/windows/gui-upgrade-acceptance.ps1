@@ -39,6 +39,51 @@ function Wait-Condition([string]$Description, [scriptblock]$Condition, [int]$Tim
     throw "Timed out waiting for: $Description"
 }
 
+function Set-FileAtomically([string]$Path, [byte[]]$Bytes) {
+    $directory = Split-Path -Parent $Path
+    $temporaryPath = Join-Path $directory (
+        ".{0}.gui-upgrade-{1}.tmp" -f (Split-Path -Leaf $Path), [Guid]::NewGuid().ToString("N")
+    )
+    $replacementBackup = "$temporaryPath.backup"
+    try {
+        [IO.File]::WriteAllBytes($temporaryPath, $Bytes)
+        [IO.File]::Replace($temporaryPath, $Path, $replacementBackup, $true)
+    } finally {
+        foreach ($cleanupPath in @($temporaryPath, $replacementBackup)) {
+            Remove-Item -LiteralPath $cleanupPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Set-Utf8FileAtomically([string]$Path, [string]$Text) {
+    Set-FileAtomically $Path ([Text.UTF8Encoding]::new($false).GetBytes($Text))
+}
+
+function Set-LegacyLoggingEnabled([string]$Text, [bool]$Enabled) {
+    $encoded = if ($Enabled) { "true" } else { "false" }
+    $sectionPattern = '(?ms)^\s*\[logging\]\s*(?<body>.*?)(?=^\s*\[|\z)'
+    $section = [regex]::Match($Text, $sectionPattern)
+    if (-not $section.Success) {
+        return $Text.TrimEnd([char[]]"`r`n") + "`r`n`r`n[logging]`r`nenabled = $encoded`r`n"
+    }
+    $body = $section.Groups['body'].Value
+    Assert-True (-not ([regex]::IsMatch($body, '(?m)^\s*level\s*='))) `
+        "schema-4 fixture unexpectedly contains logging.level"
+    if ([regex]::IsMatch($body, '(?m)^\s*enabled\s*=\s*(true|false)\s*$')) {
+        $updatedBody = [regex]::Replace(
+            $body,
+            '(?m)^\s*enabled\s*=\s*(true|false)\s*$',
+            "enabled = $encoded",
+            1
+        )
+    } else {
+        $updatedBody = "enabled = $encoded`r`n$body"
+    }
+    return $Text.Substring(0, $section.Index) +
+        "[logging]`r`n$updatedBody" +
+        $Text.Substring($section.Index + $section.Length)
+}
+
 function Get-ConsoleVersion([string]$Path, [string]$ProgramName) {
     Assert-True (Test-Path -LiteralPath $Path -PathType Leaf) `
         "installed binary is missing before upgrade: $ProgramName"
@@ -83,10 +128,18 @@ $installDirectory = "$env:ProgramFiles\WinSched"
 $startupShortcut = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\WinSched Tray.lnk"
 $settingsShortcut = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\WinSched\WinSched Settings.lnk"
 $marker = "# gui-upgrade-preserve-marker-$([Guid]::NewGuid().ToString('N'))"
-$legacyImage = "winsched-legacy-$([Guid]::NewGuid().ToString('N').Substring(0, 8)).exe"
+$backgroundImage = "winsched-background-$([Guid]::NewGuid().ToString('N').Substring(0, 8)).exe"
 $backgroundStatePath = Join-Path "$env:ProgramData\WinSched" 'background-state.json'
 $result = $null
 $exitCode = 1
+$recoveryBackupPath = Join-Path $OutputDirectory "gui-upgrade-original-config.bin"
+$originalConfigBytes = $null
+$originalConfigHash = $null
+$fixtureInstalled = $false
+$upgradeCompleted = $false
+$originalMode = $null
+$originalLegacyLoggingEnabled = $null
+$cleanupErrors = New-Object System.Collections.ArrayList
 
 try {
     Assert-True (Test-Path -LiteralPath $SetupPath -PathType Leaf) "Setup is missing"
@@ -109,16 +162,18 @@ try {
             'winsched-settings.exe'
     }
     foreach ($entry in $preUpgradeVersions.GetEnumerator()) {
-        Assert-True ($entry.Value -eq '0.4.0') `
-            "upgrade prerequisite $($entry.Key) is $($entry.Value), expected exactly 0.4.0"
+        Assert-True ($entry.Value -eq '0.5.0') `
+            "upgrade prerequisite $($entry.Key) is $($entry.Value), expected exactly 0.5.0"
     }
 
     $preUpgradeStatus = Get-Content `
         -LiteralPath (Join-Path "$env:ProgramData\WinSched" 'status.json') `
         -Raw |
         ConvertFrom-Json
-    Assert-True ([int]$preUpgradeStatus.schema_version -eq 3) `
-        "0.4.0 service status is not schema 3 before upgrade"
+    Assert-True ([int]$preUpgradeStatus.schema_version -eq 4) `
+        "0.5.0 service status is not schema 4 before upgrade"
+    $originalMode = [string]$preUpgradeStatus.configured_mode
+    $originalLegacyLoggingEnabled = [bool]$preUpgradeStatus.applied_logging.enabled
     if (Test-Path -LiteralPath $backgroundStatePath -PathType Leaf) {
         $preUpgradeBackgroundState = Get-Content `
             -LiteralPath $backgroundStatePath `
@@ -128,41 +183,48 @@ try {
             "upgrade prerequisite contains stale background ownership"
     }
 
-    $beforeText = Get-Content -LiteralPath $configPath -Raw
+    $originalConfigBytes = [IO.File]::ReadAllBytes($configPath)
+    $originalConfigHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllBytes($recoveryBackupPath, $originalConfigBytes)
+    Assert-True (
+        (Get-FileHash -LiteralPath $recoveryBackupPath -Algorithm SHA256).Hash.ToLowerInvariant() -eq
+        $originalConfigHash
+    ) "could not verify the original configuration recovery copy"
+    $beforeText = [Text.UTF8Encoding]::new($false, $true).GetString($originalConfigBytes)
     $schemaMatch = [regex]::Match(
         $beforeText,
         '(?m)^\s*schema_version\s*=\s*(?<schema>\d+)\s*$'
     )
     Assert-True $schemaMatch.Success "installed config has no schema_version before upgrade"
-    Assert-True ([int]$schemaMatch.Groups['schema'].Value -eq 3) `
-        "upgrade prerequisite config schema is $($schemaMatch.Groups['schema'].Value), expected exactly 3"
+    Assert-True ([int]$schemaMatch.Groups['schema'].Value -eq 4) `
+        "upgrade prerequisite config schema is $($schemaMatch.Groups['schema'].Value), expected exactly 4"
     $withMarker = $beforeText.TrimEnd([char[]]"`r`n") + @"
 
 $marker
 
 [[rules]]
-image = "$legacyImage"
+image = "$backgroundImage"
 mode = "sticky"
 profile = "background"
 "@
-    [System.IO.File]::WriteAllText(
-        $configPath,
-        $withMarker,
-        [System.Text.UTF8Encoding]::new($false)
-    )
+    $withMarker = Set-LegacyLoggingEnabled $withMarker $false
+    $fixtureInstalled = $true
+    Set-Utf8FileAtomically $configPath $withMarker
     $oldCli = Join-Path $installDirectory 'winsched.exe'
-    $legacyBeforeUpgrade = (& $oldCli config-check $configPath --json | Out-String) |
+    $beforeUpgrade = (& $oldCli config-check $configPath --json | Out-String) |
         ConvertFrom-Json
-    Assert-True ($LASTEXITCODE -eq 0) "0.4.0 rejected the schema-3 legacy background fixture"
-    Assert-True ([int]$legacyBeforeUpgrade.schema_version -eq 3) `
-        "0.4.0 did not normalize the fixture as schema 3"
-    $oldLegacyRule = @($legacyBeforeUpgrade.rules | Where-Object {
-        $_.image -eq $legacyImage
+    Assert-True ($LASTEXITCODE -eq 0) "0.5.0 rejected the schema-4 Background fixture"
+    Assert-True ([int]$beforeUpgrade.schema_version -eq 4) `
+        "0.5.0 did not normalize the fixture as schema 4"
+    $oldBackgroundRule = @($beforeUpgrade.rules | Where-Object {
+        $_.image -eq $backgroundImage
     })
-    Assert-True ($oldLegacyRule.Count -eq 1) `
-        "0.4.0 did not preserve exactly one legacy background rule"
-    Assert-True ($oldLegacyRule[0].profile -eq 'background') `
-        "0.4.0 did not interpret the legacy rule as the old background placement profile"
+    Assert-True ($oldBackgroundRule.Count -eq 1) `
+        "0.5.0 did not preserve exactly one Background rule"
+    Assert-True ($oldBackgroundRule[0].profile -eq 'background') `
+        "0.5.0 did not preserve schema-4 Background semantics"
+    Assert-True (-not [bool]$beforeUpgrade.logging.enabled) `
+        "upgrade fixture did not explicitly set schema-4 logging.enabled=false"
     $configHashBefore = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $setupHash = (Get-FileHash -LiteralPath $SetupPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $payloadHashes = Get-PayloadHashes $PayloadDirectory
@@ -178,6 +240,7 @@ profile = "background"
         -Wait `
         -PassThru
     Assert-True ($process.ExitCode -eq 0) "Setup upgrade returned $($process.ExitCode)"
+    $upgradeCompleted = $true
     Wait-ServiceRunning
 
     $configHashAfter = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -188,26 +251,29 @@ profile = "background"
     $newCli = Join-Path $installDirectory 'winsched.exe'
     $normalizedAfterUpgrade = (& $newCli config-check $configPath --json | Out-String) |
         ConvertFrom-Json
-    Assert-True ($LASTEXITCODE -eq 0) "0.5.0 rejected the preserved schema-3 configuration"
-    Assert-True ([int]$normalizedAfterUpgrade.schema_version -eq 4) `
-        "0.5.0 did not normalize the schema-3 configuration to schema 4 in memory"
+    Assert-True ($LASTEXITCODE -eq 0) "0.5.1 rejected the preserved schema-4 configuration"
+    Assert-True ([int]$normalizedAfterUpgrade.schema_version -eq 5) `
+        "0.5.1 did not normalize the schema-4 configuration to schema 5 in memory"
     Assert-True (-not [bool]$normalizedAfterUpgrade.background_efficiency.enabled) `
-        "legacy schema unexpectedly enabled background efficiency"
-    $migratedLegacyRule = @($normalizedAfterUpgrade.rules | Where-Object {
-        $_.image -eq $legacyImage
+        "schema-4 upgrade unexpectedly enabled background efficiency"
+    Assert-True ([string]$normalizedAfterUpgrade.logging.level -eq 'off') `
+        "schema-4 logging.enabled=false did not migrate to off"
+    $migratedBackgroundRule = @($normalizedAfterUpgrade.rules | Where-Object {
+        $_.image -eq $backgroundImage
     })
-    Assert-True ($migratedLegacyRule.Count -eq 1) `
-        "0.5.0 did not preserve exactly one migrated legacy rule"
-    Assert-True ($migratedLegacyRule[0].profile -eq 'balanced') `
-        "legacy Background rule did not migrate to Balanced placement semantics"
+    Assert-True ($migratedBackgroundRule.Count -eq 1) `
+        "0.5.1 did not preserve exactly one schema-4 Background rule"
+    Assert-True ($migratedBackgroundRule[0].profile -eq 'background') `
+        "schema-4 Background rule was incorrectly normalized to another profile"
 
-    Wait-Condition "schema-4 service status after upgrade" {
+    Wait-Condition "schema-5 service status after upgrade" {
         try {
             $status = Get-Content `
                 -LiteralPath (Join-Path "$env:ProgramData\WinSched" 'status.json') `
                 -Raw |
                 ConvertFrom-Json
-            [int]$status.schema_version -eq 4 -and
+            [int]$status.schema_version -eq 5 -and
+                [string]$status.applied_logging.level -eq "off" -and
                 -not [bool]$status.applied_background_efficiency.enabled -and
                 [int]$status.background_efficiency.managed_processes -eq 0
         } catch {
@@ -218,8 +284,36 @@ profile = "background"
         $backgroundState = Get-Content -LiteralPath $backgroundStatePath -Raw |
             ConvertFrom-Json
         Assert-True (@($backgroundState.processes).Count -eq 0) `
-            "legacy Background migration created QoS ownership records"
+            "schema-4 Background upgrade created QoS ownership records"
     }
+
+    $offStatus = Get-Content `
+        -LiteralPath (Join-Path "$env:ProgramData\WinSched" 'status.json') `
+        -Raw |
+        ConvertFrom-Json
+    $trueReloadBaseline = [uint64]$offStatus.config_reload_sequence
+    $legacyTrueText = Set-LegacyLoggingEnabled `
+        (Get-Content -LiteralPath $configPath -Raw) `
+        $true
+    Set-Utf8FileAtomically $configPath $legacyTrueText
+    Wait-Condition "schema-4 logging.enabled=true hot migration" {
+        try {
+            $status = Get-Content `
+                -LiteralPath (Join-Path "$env:ProgramData\WinSched" 'status.json') `
+                -Raw |
+                ConvertFrom-Json
+            [uint64]$status.config_reload_sequence -gt $trueReloadBaseline -and
+                [string]$status.config_reload_result -eq "reloaded" -and
+                [string]$status.applied_logging.level -eq "normal"
+        } catch {
+            $false
+        }
+    } 30
+    $normalizedLegacyTrue = (& $newCli config-check $configPath --json | Out-String) |
+        ConvertFrom-Json
+    Assert-True ($LASTEXITCODE -eq 0) "0.5.1 rejected schema-4 logging.enabled=true"
+    Assert-True ([string]$normalizedLegacyTrue.logging.level -eq "normal") `
+        "schema-4 logging.enabled=true did not migrate to normal"
 
     $installedHashes = [ordered]@{}
     foreach ($name in $payloadHashes.Keys) {
@@ -250,11 +344,14 @@ profile = "background"
         config_byte_identical = $true
         marker = $marker
         pre_upgrade_versions = $preUpgradeVersions
-        pre_upgrade_config_schema = 3
-        legacy_background_image = $legacyImage
-        legacy_profile_before_upgrade = $oldLegacyRule[0].profile
-        migrated_profile_after_upgrade = $migratedLegacyRule[0].profile
-        legacy_background_qos_enabled = $false
+        pre_upgrade_config_schema = 4
+        background_image = $backgroundImage
+        profile_before_upgrade = $oldBackgroundRule[0].profile
+        profile_after_upgrade = $migratedBackgroundRule[0].profile
+        logging_level_after_upgrade = $normalizedAfterUpgrade.logging.level
+        logging_false_through_setup = "off"
+        logging_true_hot_reload = $normalizedLegacyTrue.logging.level
+        background_qos_enabled = $false
         service_state = $service.State
         service_path = $service.PathName
         installed_sha256 = $installedHashes
@@ -268,6 +365,52 @@ profile = "background"
     }
     $exitCode = 1
 } finally {
+    if ($fixtureInstalled -and $null -ne $originalConfigBytes) {
+        try {
+            $statusBeforeRestore = Get-Content `
+                -LiteralPath (Join-Path "$env:ProgramData\WinSched" 'status.json') `
+                -Raw |
+                ConvertFrom-Json
+            $restoreSequence = [uint64]$statusBeforeRestore.config_reload_sequence
+            Set-FileAtomically $configPath $originalConfigBytes
+            Assert-True (
+                (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant() -eq
+                $originalConfigHash
+            ) "original configuration bytes were not restored exactly"
+            if ($upgradeCompleted) {
+                $expectedLevel = if ($originalLegacyLoggingEnabled) { "normal" } else { "off" }
+                Wait-Condition "service reload of restored original configuration" {
+                    try {
+                        $status = Get-Content `
+                            -LiteralPath (Join-Path "$env:ProgramData\WinSched" 'status.json') `
+                            -Raw |
+                            ConvertFrom-Json
+                        [int]$status.schema_version -eq 5 -and
+                            [uint64]$status.config_reload_sequence -gt $restoreSequence -and
+                            [string]$status.config_reload_result -eq "reloaded" -and
+                            [string]$status.configured_mode -eq $originalMode -and
+                            [string]$status.applied_logging.level -eq $expectedLevel
+                    } catch {
+                        $false
+                    }
+                } 30
+            }
+            $result["original_config_restored"] = $true
+            Remove-Item -LiteralPath $recoveryBackupPath -Force -ErrorAction SilentlyContinue
+        } catch {
+            [void]$cleanupErrors.Add($_.Exception.Message)
+            $result["original_config_restored"] = $false
+            $result["recovery_backup_retained"] = `
+                Test-Path -LiteralPath $recoveryBackupPath -PathType Leaf
+        }
+    }
+    $result["cleanup_completed"] = $cleanupErrors.Count -eq 0
+    $result["cleanup_errors"] = @($cleanupErrors)
+    if ($cleanupErrors.Count -gt 0) {
+        $result["result"] = "FAIL"
+        $result["error"] = "Upgrade cleanup failed: $(@($cleanupErrors) -join '; ')"
+        $exitCode = 1
+    }
     [pscustomobject]$result |
         ConvertTo-Json -Depth 7 |
         Set-Content -LiteralPath $resultPath -Encoding UTF8

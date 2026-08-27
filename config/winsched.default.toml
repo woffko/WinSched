@@ -1,4 +1,4 @@
-schema_version = 4
+schema_version = 5
 controller_mode = "auto"
 sample_interval_ms = 1000
 minimum_process_utilization_bps = 500
@@ -7,7 +7,7 @@ default_rule_mode = "auto"
 default_workload_profile = "balanced"
 
 [logging]
-enabled = true
+level = "normal"
 max_file_size_mib = 10
 retained_archives = 1
 

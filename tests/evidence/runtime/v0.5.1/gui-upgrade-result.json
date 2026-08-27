@@ -1,0 +1,26 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "setup_sha256": "4c92f9ef2d4c10662bc86c042a0f9df09cc9553c3b94b738be6383325c760d3d",
+  "setup_exit_code": 0,
+  "pre_upgrade_config_schema": 4,
+  "pre_upgrade_versions": {
+    "winsched.exe": "0.5.0",
+    "winsched-service.exe": "0.5.0",
+    "winsched-tray.exe": "0.5.0",
+    "winsched-settings.exe": "0.5.0"
+  },
+  "config_sha256_before": "664e9a0e0ce305e594b3c433d6ea4f0287b51b446e206fc6563b6ae14732322f",
+  "config_sha256_after": "664e9a0e0ce305e594b3c433d6ea4f0287b51b446e206fc6563b6ae14732322f",
+  "config_byte_identical": true,
+  "profile_before_upgrade": "background",
+  "profile_after_upgrade": "background",
+  "background_qos_enabled": false,
+  "logging_false_through_setup": "off",
+  "logging_true_hot_reload": "normal",
+  "installed_service_sha256": "77edceaa7af7faba00ff9590c571e012e92ce98ca94c1493f2b249dedff1af60",
+  "service_state": "Running",
+  "original_config_restored": true,
+  "cleanup_completed": true,
+  "cleanup_errors": []
+}

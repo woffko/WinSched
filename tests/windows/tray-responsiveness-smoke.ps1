@@ -4,7 +4,7 @@ param(
     [string]$OutputDirectory,
     [string]$InstallDirectory = "$env:ProgramFiles\WinSched",
     [string]$DataDirectory = "$env:ProgramData\WinSched",
-    [string]$ExpectedVersion = "0.5.0"
+    [string]$ExpectedVersion = "0.5.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -133,7 +133,7 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $InstallDirectory "winsched-tray.exe")) `
         "tray executable is missing"
     $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
-    Assert-True ([int]$status.schema_version -eq 4) "service status is not schema 4"
+    Assert-True ([int]$status.schema_version -eq 5) "service status is not schema 5"
 
     $script:trayIcon = $null
     Wait-Condition "WinSched tray icon" {

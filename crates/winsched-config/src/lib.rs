@@ -16,7 +16,8 @@ use winsched_core::{
 pub const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const LOGGING_CONFIG_SCHEMA_VERSION: u32 = 2;
 pub const RESPONSIVENESS_CONFIG_SCHEMA_VERSION: u32 = 3;
-pub const CONFIG_SCHEMA_VERSION: u32 = 4;
+pub const BACKGROUND_EFFICIENCY_CONFIG_SCHEMA_VERSION: u32 = 4;
+pub const CONFIG_SCHEMA_VERSION: u32 = 5;
 pub const MIN_LOG_FILE_SIZE_MIB: u16 = 1;
 pub const MAX_LOG_FILE_SIZE_MIB: u16 = 100;
 pub const MAX_RETAINED_LOG_ARCHIVES: u8 = 10;
@@ -131,11 +132,21 @@ impl Default for ResponsivenessConfig {
     }
 }
 
+/// Diagnostic event detail written by the service.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoggingLevel {
+    Off,
+    #[default]
+    Normal,
+    Trace,
+}
+
 /// Bounded diagnostic event logging policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
-    pub enabled: bool,
+    pub level: LoggingLevel,
     pub max_file_size_mib: u16,
     pub retained_archives: u8,
 }
@@ -143,7 +154,7 @@ pub struct LoggingConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            level: LoggingLevel::Normal,
             max_file_size_mib: 10,
             retained_archives: 1,
         }
@@ -151,6 +162,16 @@ impl Default for LoggingConfig {
 }
 
 impl LoggingConfig {
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self.level, LoggingLevel::Off)
+    }
+
+    #[must_use]
+    pub const fn traces_decisions(self) -> bool {
+        matches!(self.level, LoggingLevel::Trace)
+    }
+
     /// Maximum active file length in bytes.
     #[must_use]
     pub fn max_file_size_bytes(self) -> u64 {
@@ -249,6 +270,14 @@ pub enum ConfigError {
     LogFileSize,
     #[error("logging.retained_archives must be <= 10")]
     LogArchives,
+    #[error("schema {schema_version} logging.enabled must be a boolean")]
+    InvalidLegacyLoggingEnabled { schema_version: u32 },
+    #[error("schema {schema_version} cannot define both logging.enabled and logging.level")]
+    ConflictingLegacyLoggingFields { schema_version: u32 },
+    #[error("schema {schema_version} does not support logging.level")]
+    UnexpectedLegacyLoggingLevel { schema_version: u32 },
+    #[error("configuration document root must be a TOML table")]
+    InvalidDocumentRoot,
     #[error("responsiveness.system_reserve_percent must be between 1 and 25")]
     SystemReservePercent,
     #[error("responsiveness reserved core bounds must satisfy 1 <= minimum <= maximum <= 256")]
@@ -273,6 +302,41 @@ pub enum ConfigError {
     UnexpectedDomain(String),
 }
 
+fn migrate_legacy_logging(
+    document: &mut toml::Value,
+    schema_version: u32,
+) -> Result<(), ConfigError> {
+    let Some(logging) = document.get_mut("logging") else {
+        return Ok(());
+    };
+    let Some(logging) = logging.as_table_mut() else {
+        // Typed deserialization below reports the original structural error.
+        return Ok(());
+    };
+
+    let enabled = logging.remove("enabled");
+    if logging.contains_key("level") {
+        return Err(if enabled.is_some() {
+            ConfigError::ConflictingLegacyLoggingFields { schema_version }
+        } else {
+            ConfigError::UnexpectedLegacyLoggingLevel { schema_version }
+        });
+    }
+    let Some(enabled) = enabled else {
+        // Logging was enabled by default in schemas 1-4, so the schema-5 default
+        // preserves an omitted legacy field as the normal level.
+        return Ok(());
+    };
+    let enabled = enabled
+        .as_bool()
+        .ok_or(ConfigError::InvalidLegacyLoggingEnabled { schema_version })?;
+    logging.insert(
+        "level".to_owned(),
+        toml::Value::String(if enabled { "normal" } else { "off" }.to_owned()),
+    );
+    Ok(())
+}
+
 impl ControllerConfig {
     /// Stable within one `WinSched` build and used to match a live service receipt to Settings.
     #[must_use]
@@ -289,17 +353,51 @@ impl ControllerConfig {
     /// Returns [`ConfigError`] for syntax errors, unknown fields, unsupported
     /// schema versions, unsafe sampling intervals, or inconsistent rules.
     pub fn from_toml(value: &str) -> Result<Self, ConfigError> {
-        let mut config = toml::from_str::<Self>(value)?;
-        if matches!(
-            config.schema_version,
-            LEGACY_CONFIG_SCHEMA_VERSION
-                | LOGGING_CONFIG_SCHEMA_VERSION
-                | RESPONSIVENESS_CONFIG_SCHEMA_VERSION
-        ) {
-            config.schema_version = CONFIG_SCHEMA_VERSION;
+        #[derive(Deserialize)]
+        struct SchemaHeader {
+            #[serde(default = "current_schema_version")]
+            schema_version: u32,
+        }
+
+        const fn current_schema_version() -> u32 {
+            CONFIG_SCHEMA_VERSION
+        }
+
+        let mut document = toml::from_str::<toml::Value>(value)?;
+        let schemaless_legacy_logging = document.as_table().is_some_and(|table| {
+            !table.contains_key("schema_version")
+                && table
+                    .get("logging")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|logging| logging.contains_key("enabled"))
+        });
+        // Before schema 5, serde filled an omitted schema_version from the then-current
+        // ControllerConfig default. Preserve that compatibility when the removed
+        // logging.enabled field proves the document came from a pre-schema-5 build.
+        let original_schema = if schemaless_legacy_logging {
+            BACKGROUND_EFFICIENCY_CONFIG_SCHEMA_VERSION
+        } else {
+            document.clone().try_into::<SchemaHeader>()?.schema_version
+        };
+        if !(LEGACY_CONFIG_SCHEMA_VERSION..=CONFIG_SCHEMA_VERSION).contains(&original_schema) {
+            return Err(ConfigError::SchemaVersion(original_schema));
+        }
+        if original_schema < CONFIG_SCHEMA_VERSION {
+            migrate_legacy_logging(&mut document, original_schema)?;
+            let Some(table) = document.as_table_mut() else {
+                return Err(ConfigError::InvalidDocumentRoot);
+            };
+            table.insert(
+                "schema_version".to_owned(),
+                toml::Value::Integer(i64::from(CONFIG_SCHEMA_VERSION)),
+            );
+        }
+
+        let mut config = document.try_into::<Self>()?;
+        if original_schema <= RESPONSIVENESS_CONFIG_SCHEMA_VERSION {
             // Schema 1-3 users opted into placement profiles, not process QoS mutation.
             // Balanced had the same placement behavior, so normalize legacy Background
-            // profiles before schema 4 gives Background its QoS-only meaning.
+            // profiles before schema 4 gave Background its QoS-only meaning.
             if config.default_workload_profile == WorkloadProfile::Background {
                 config.default_workload_profile = WorkloadProfile::Balanced;
             }
@@ -570,6 +668,7 @@ stability_samples = 5
         let config = ControllerConfig::from_toml("schema_version = 1").unwrap();
         assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(config.logging, LoggingConfig::default());
+        assert_eq!(config.logging.level, LoggingLevel::Normal);
         assert_eq!(config.logging.max_file_size_bytes(), 10 * 1024 * 1024);
     }
 
@@ -578,45 +677,164 @@ stability_samples = 5
         let legacy = ControllerConfig::from_toml("schema_version = 1").unwrap();
         let logging_schema = ControllerConfig::from_toml("schema_version = 2").unwrap();
         let responsiveness_schema = ControllerConfig::from_toml("schema_version = 3").unwrap();
-        let current = ControllerConfig::from_toml("schema_version = 4").unwrap();
+        let background_schema = ControllerConfig::from_toml("schema_version = 4").unwrap();
+        let current = ControllerConfig::from_toml("schema_version = 5").unwrap();
         assert_eq!(legacy.fingerprint(), logging_schema.fingerprint());
         assert_eq!(legacy.fingerprint(), responsiveness_schema.fingerprint());
+        assert_eq!(legacy.fingerprint(), background_schema.fingerprint());
         assert_eq!(legacy.fingerprint(), current.fingerprint());
 
         let mut changed = current;
-        changed.logging.enabled = false;
+        changed.logging.level = LoggingLevel::Trace;
         assert_ne!(legacy.fingerprint(), changed.fingerprint());
+
+        let legacy_off =
+            ControllerConfig::from_toml("schema_version = 4\n[logging]\nenabled = false\n")
+                .unwrap();
+        let current_off =
+            ControllerConfig::from_toml("schema_version = 5\n[logging]\nlevel = \"off\"\n")
+                .unwrap();
+        assert_eq!(legacy_off.fingerprint(), current_off.fingerprint());
     }
 
     #[test]
-    fn partial_logging_table_preserves_bounded_defaults() {
+    fn legacy_logging_enabled_values_and_omission_migrate_for_every_prior_schema() {
+        for schema_version in
+            LEGACY_CONFIG_SCHEMA_VERSION..=BACKGROUND_EFFICIENCY_CONFIG_SCHEMA_VERSION
+        {
+            for (field, expected) in [
+                ("", LoggingLevel::Normal),
+                ("enabled = true\n", LoggingLevel::Normal),
+                ("enabled = false\n", LoggingLevel::Off),
+            ] {
+                let config = ControllerConfig::from_toml(&format!(
+                    "schema_version = {schema_version}\n[logging]\n{field}max_file_size_mib = 17\nretained_archives = 3\n"
+                ))
+                .unwrap();
+                assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+                assert_eq!(config.logging.level, expected);
+                assert_eq!(config.logging.max_file_size_mib, 17);
+                assert_eq!(config.logging.retained_archives, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn every_current_logging_level_roundtrips_and_has_a_distinct_fingerprint() {
+        let mut fingerprints = BTreeSet::new();
+        for (encoded, expected) in [
+            ("off", LoggingLevel::Off),
+            ("normal", LoggingLevel::Normal),
+            ("trace", LoggingLevel::Trace),
+        ] {
+            let config = ControllerConfig::from_toml(&format!(
+                "schema_version = 5\n[logging]\nlevel = \"{encoded}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.logging.level, expected);
+            let rendered = toml::to_string_pretty(&config).unwrap();
+            assert_eq!(ControllerConfig::from_toml(&rendered).unwrap(), config);
+            assert!(fingerprints.insert(config.fingerprint()));
+        }
+    }
+
+    #[test]
+    fn partial_legacy_logging_table_preserves_bounded_defaults() {
         let config = ControllerConfig::from_toml(
             r"
-schema_version = 1
+schema_version = 4
 [logging]
 enabled = false
 ",
         )
         .unwrap();
-        assert!(!config.logging.enabled);
+        assert_eq!(config.logging.level, LoggingLevel::Off);
         assert_eq!(config.logging.max_file_size_mib, 10);
         assert_eq!(config.logging.retained_archives, 1);
     }
 
     #[test]
-    fn logging_bounds_apply_even_when_logging_is_disabled() {
+    fn schemaless_pre_v5_logging_migrates_without_changing_background_semantics() {
+        for (enabled, expected_level) in
+            [("true", LoggingLevel::Normal), ("false", LoggingLevel::Off)]
+        {
+            let config = ControllerConfig::from_toml(&format!(
+                r#"
+[logging]
+enabled = {enabled}
+
+[[rules]]
+image = "legacy-background.exe"
+mode = "sticky"
+profile = "background"
+"#
+            ))
+            .unwrap();
+            assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+            assert_eq!(config.logging.level, expected_level);
+            assert_eq!(config.rules[0].profile, WorkloadProfile::Background);
+        }
+    }
+
+    #[test]
+    fn logging_bounds_apply_even_when_logging_is_off() {
         for document in [
-            "schema_version = 1\n[logging]\nenabled = false\nmax_file_size_mib = 0\n",
-            "schema_version = 1\n[logging]\nenabled = false\nmax_file_size_mib = 101\n",
-            "schema_version = 1\n[logging]\nenabled = false\nretained_archives = 11\n",
+            "schema_version = 5\n[logging]\nlevel = \"off\"\nmax_file_size_mib = 0\n",
+            "schema_version = 5\n[logging]\nlevel = \"off\"\nmax_file_size_mib = 101\n",
+            "schema_version = 5\n[logging]\nlevel = \"off\"\nretained_archives = 11\n",
         ] {
             assert!(ControllerConfig::from_toml(document).is_err());
         }
     }
 
     #[test]
+    fn malformed_or_conflicting_legacy_logging_fields_fail_closed() {
+        for enabled in ["\"false\"", "0", "[]"] {
+            let error = ControllerConfig::from_toml(&format!(
+                "schema_version = 4\n[logging]\nenabled = {enabled}\n"
+            ))
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ConfigError::InvalidLegacyLoggingEnabled { schema_version: 4 }
+            ));
+        }
+
+        let error = ControllerConfig::from_toml(
+            "schema_version = 4\n[logging]\nenabled = false\nlevel = \"off\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::ConflictingLegacyLoggingFields { schema_version: 4 }
+        ));
+
+        let error =
+            ControllerConfig::from_toml("schema_version = 4\n[logging]\nlevel = \"normal\"\n")
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::UnexpectedLegacyLoggingLevel { schema_version: 4 }
+        ));
+    }
+
+    #[test]
+    fn current_schema_rejects_removed_or_unknown_logging_fields() {
+        for document in [
+            "schema_version = 5\n[logging]\nenabled = true\n",
+            "schema_version = 5\n[logging]\nlevel = \"verbose\"\n",
+            "schema_version = 5\n[logging]\nlevel = \"normal\"\nmagic = true\n",
+        ] {
+            assert!(matches!(
+                ControllerConfig::from_toml(document),
+                Err(ConfigError::Parse(_))
+            ));
+        }
+    }
+
+    #[test]
     fn unsupported_config_schema_is_rejected() {
-        for schema in [0, 5] {
+        for schema in [0, 6] {
             let error =
                 ControllerConfig::from_toml(&format!("schema_version = {schema}")).unwrap_err();
             assert!(matches!(error, ConfigError::SchemaVersion(value) if value == schema));
@@ -637,9 +855,10 @@ enabled = false
 
     #[test]
     fn legacy_background_profiles_keep_their_old_balanced_placement_semantics() {
-        let config = ControllerConfig::from_toml(
-            r#"
-schema_version = 3
+        for schema_version in LEGACY_CONFIG_SCHEMA_VERSION..=RESPONSIVENESS_CONFIG_SCHEMA_VERSION {
+            let config = ControllerConfig::from_toml(&format!(
+                r#"
+schema_version = {schema_version}
 controller_mode = "auto"
 all_user_processes = true
 default_workload_profile = "background"
@@ -649,16 +868,17 @@ image = "legacy.exe"
 mode = "sticky"
 profile = "background"
 "#,
-        )
-        .unwrap();
+            ))
+            .unwrap();
 
-        assert_eq!(config.default_workload_profile, WorkloadProfile::Balanced);
-        assert_eq!(config.rules[0].profile, WorkloadProfile::Balanced);
-        assert_eq!(
-            config.resolve("legacy.exe").unwrap().placement,
-            PlacementMode::Sticky
-        );
-        assert!(!config.background_efficiency_applies("legacy.exe"));
+            assert_eq!(config.default_workload_profile, WorkloadProfile::Balanced);
+            assert_eq!(config.rules[0].profile, WorkloadProfile::Balanced);
+            assert_eq!(
+                config.resolve("legacy.exe").unwrap().placement,
+                PlacementMode::Sticky
+            );
+            assert!(!config.background_efficiency_applies("legacy.exe"));
+        }
     }
 
     #[test]
@@ -686,6 +906,9 @@ profile = "background"
 "#,
         )
         .unwrap();
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.default_workload_profile, WorkloadProfile::Background);
+        assert_eq!(config.rules[0].profile, WorkloadProfile::Background);
         assert!(config.background_efficiency_applies("WORKER.EXE"));
         assert!(!config.background_efficiency_applies("implicit.exe"));
         assert!(!config.background_efficiency_applies("disabled.exe"));

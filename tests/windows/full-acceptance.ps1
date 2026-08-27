@@ -10,6 +10,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+$acceptanceStartedUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $expectedInstallDirectory = [IO.Path]::GetFullPath(
     (Join-Path ([Environment]::GetFolderPath("ProgramFiles")) "WinSched")
 ).TrimEnd('\')
@@ -91,6 +92,47 @@ function Read-Managed {
     }
 }
 
+function Read-ServiceLogEvents {
+    $events = New-Object Collections.Generic.List[object]
+    $files = @(
+        Get-ChildItem -LiteralPath $DataDirectory -Filter "winsched.log*" -File |
+            Where-Object Name -Match '^winsched\.log(?:\.\d+)?$' |
+            Sort-Object Name -Descending
+    )
+    foreach ($file in $files) {
+        try {
+            $stream = [IO.File]::Open(
+                $file.FullName,
+                [IO.FileMode]::Open,
+                [IO.FileAccess]::Read,
+                ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            )
+        } catch [IO.FileNotFoundException] {
+            continue
+        }
+        try {
+            $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true, 4096, $true)
+            try {
+                $text = $reader.ReadToEnd()
+            } finally {
+                $reader.Dispose()
+            }
+        } finally {
+            $stream.Dispose()
+        }
+        $lines = @([regex]::Split($text, "\r?\n"))
+        if (-not ($text.EndsWith("`n") -or $text.EndsWith("`r")) -and $lines.Count -gt 0) {
+            $lines = @($lines | Select-Object -First ($lines.Count - 1))
+        }
+        foreach ($line in $lines) {
+            if (-not [string]::IsNullOrWhiteSpace($line)) {
+                $events.Add(($line | ConvertFrom-Json))
+            }
+        }
+    }
+    return $events.ToArray()
+}
+
 function Read-BackgroundManaged {
     $path = Join-Path $DataDirectory "background-state.json"
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -136,7 +178,47 @@ function Assert-PowerShellSyntax([string]$Path) {
 
 function Write-Utf8NoBom([string]$Path, [string]$Value) {
     $encoding = New-Object System.Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($Path, $Value, $encoding)
+    $directory = Split-Path -Parent $Path
+    $temporaryPath = Join-Path $directory (
+        ".{0}.full-acceptance-{1}.tmp" -f `
+            (Split-Path -Leaf $Path), `
+            [Guid]::NewGuid().ToString("N")
+    )
+    $replacementBackup = "$temporaryPath.backup"
+    try {
+        [IO.File]::WriteAllText($temporaryPath, $Value, $encoding)
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            [IO.File]::Replace($temporaryPath, $Path, $replacementBackup, $true)
+        } else {
+            [IO.File]::Move($temporaryPath, $Path)
+        }
+    } finally {
+        foreach ($cleanupPath in @($temporaryPath, $replacementBackup)) {
+            Remove-Item -LiteralPath $cleanupPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-ReloadBaseline {
+    $status = Read-Status
+    Assert-True ($null -ne $status) "status is unavailable before config reload"
+    return [pscustomobject]@{
+        service_pid = [int]$status.service_pid
+        sequence = [uint64]$status.config_reload_sequence
+    }
+}
+
+function Wait-ConfigReload($Baseline, [string]$Description, [int]$TimeoutSeconds = 45) {
+    Wait-Condition $Description {
+        $status = Read-Status
+        if ($null -eq $status -or $status.config_reload_result -ne "reloaded") {
+            return $false
+        }
+        if ([int]$status.service_pid -ne [int]$Baseline.service_pid) {
+            return [uint64]$status.config_reload_sequence -gt 0
+        }
+        return [uint64]$status.config_reload_sequence -gt [uint64]$Baseline.sequence
+    } $TimeoutSeconds
 }
 
 function Start-InteractiveBurner(
@@ -220,6 +302,7 @@ $visibleProcessId = $null
 $windowScript = Join-Path $env:PUBLIC "WinSchedVisibleWindowAcceptance.ps1"
 $windowPidFile = Join-Path $env:PUBLIC "WinSchedVisibleWindowAcceptance.pid"
 $productionConfig = $null
+$backgroundMutationTelemetry = $null
 
 Get-Content -LiteralPath (Join-Path $PackageDirectory "SHA256SUMS") | ForEach-Object {
     if ($_ -notmatch '^(?<hash>[0-9a-f]{64})\s+(?<file>.+)$') {
@@ -249,8 +332,8 @@ try {
         } else {
             [Diagnostics.FileVersionInfo]::GetVersionInfo($binaryPath).ProductVersion.Trim()
         }
-        Assert-True ($version -eq "0.5.0") `
-            "full acceptance requires installed 0.5.0, found $version in $binaryName"
+        Assert-True ($version -eq "0.5.1") `
+            "full acceptance requires installed 0.5.1, found $version in $binaryName"
     }
     Wait-ServiceState "Running"
 
@@ -286,7 +369,7 @@ try {
         return $status -and $status.phase -eq "running" -and $status.configured_mode -eq "auto"
     }
     $status = Read-Status
-    Assert-True ([int]$status.schema_version -eq 4) "service did not publish status schema 4"
+    Assert-True ([int]$status.schema_version -eq 5) "service did not publish status schema 5"
     Assert-True ([bool]$status.scheduling_enabled) "automatic package did not start with scheduling enabled"
     Assert-True ($status.llc_domains -gt 0) "status reports no LLC domains"
     Assert-True ([bool]$status.applied_responsiveness.enabled) `
@@ -374,9 +457,11 @@ profile = "background"
         $backgroundConfig -match '(?m)(^\[background_efficiency\]\r?\n)enabled\s*=\s*true\s*$' -and
         $backgroundConfig -match '(?m)^\s*eco_qos_enabled\s*=\s*true\s*$'
     ) "background fixture did not explicitly opt into the feature and EcoQoS"
+    $backgroundReloadBaseline = Get-ReloadBaseline
     Write-Utf8NoBom $installedConfig $backgroundConfig
     & $cliBinary config-check $installedConfig | Out-Null
     Assert-True ($LASTEXITCODE -eq 0) "background-efficiency fixture failed config validation"
+    Wait-ConfigReload $backgroundReloadBaseline "background configuration reload receipt"
     Wait-Condition "interactive probe accepted by service" {
         $current = Read-Status
         return $current -and
@@ -504,6 +589,18 @@ $form.WindowState = [Windows.Forms.FormWindowState]::Minimized
             return $false
         }
     } 45
+    Wait-Condition "background mutation self-observability" {
+        $current = Read-Status
+        if ($null -eq $current -or $null -eq $current.telemetry) { return $false }
+        $mutations = $current.telemetry.mutations
+        return [uint64]$mutations.background_attempted -gt 0 -and
+            [uint64]$mutations.background_succeeded -gt 0 -and
+            [uint64]$mutations.background_attempted -eq
+                ([uint64]$mutations.background_succeeded + [uint64]$mutations.background_failed)
+    } 30
+    $backgroundMutationTelemetry = (Read-Status).telemetry.mutations
+    Assert-True ([uint64]$backgroundMutationTelemetry.background_failed -eq 0) `
+        "background mutation telemetry reports failed operations"
 
     Write-Host "acceptance stage: graceful stop restores active background ownership"
     & $serviceBinary stop | Out-Null
@@ -560,7 +657,7 @@ $form.WindowState = [Windows.Forms.FormWindowState]::Minimized
     } 45
 
     Write-Host "acceptance stage: invalid config restores active background ownership"
-    Write-Utf8NoBom $installedConfig "schema_version = 4`nunknown_field = true"
+    Write-Utf8NoBom $installedConfig "schema_version = 5`nunknown_field = true"
     Wait-Condition "invalid config rejected with background cleanup" {
         try {
             $inspection = Get-Inspection $burnerId
@@ -573,7 +670,9 @@ $form.WindowState = [Windows.Forms.FormWindowState]::Minimized
             return $false
         }
     } 45
+    $backgroundRecoveryBaseline = Get-ReloadBaseline
     Write-Utf8NoBom $installedConfig $backgroundConfig
+    Wait-ConfigReload $backgroundRecoveryBaseline "valid background recovery reload receipt"
     Wait-Condition "valid background configuration recovered after rejection" {
         try {
             $inspection = Get-Inspection $burnerId
@@ -586,7 +685,9 @@ $form.WindowState = [Windows.Forms.FormWindowState]::Minimized
         }
     } 45
 
+    $productionRestoreBaseline = Get-ReloadBaseline
     Write-Utf8NoBom $installedConfig $productionConfig
+    Wait-ConfigReload $productionRestoreBaseline "production reload after Background rule removal"
     Wait-Condition "background efficiency restored after rule removal" {
         try {
             $inspection = Get-Inspection $burnerId
@@ -609,7 +710,9 @@ image = "powershell.exe"
 mode = "sticky"
 profile = "memory"
 "@
+    $memoryReloadBaseline = Get-ReloadBaseline
     Write-Utf8NoBom $installedConfig $memoryConfig
+    Wait-ConfigReload $memoryReloadBaseline "memory profile config reload receipt"
     Wait-Condition "memory profile applied to burner" {
         $current = Get-Inspection $burnerId
         $ids = @($current.default_cpu_set_ids)
@@ -643,7 +746,9 @@ profile = "memory"
             (-not $_.flags.allocated -or $_.flags.allocated_to_target_process) -and
             $reservedCpuSetIds -notcontains $_.id
     } | Select-Object -ExpandProperty id | Sort-Object)
+    $computeReloadBaseline = Get-ReloadBaseline
     Write-Utf8NoBom $installedConfig $computeConfig
+    Wait-ConfigReload $computeReloadBaseline "compute profile config reload receipt"
     Wait-Condition "compute profile applied to burner" {
         $ids = @((Get-Inspection $burnerId).default_cpu_set_ids | Sort-Object)
         return ($ids -join ',') -eq ($availableComputeIds -join ',')
@@ -687,9 +792,11 @@ profile = "memory"
     Assert-True (
         $moveConfig -match '(?m)^\s*\[responsiveness\]\s*\r?\n\s*enabled\s*=\s*false\s*$'
     ) "adaptive-move fixture did not disable responsiveness reserve"
+    $moveReloadBaseline = Get-ReloadBaseline
     Write-Utf8NoBom $installedConfig $moveConfig
     & $cliBinary config-check $installedConfig | Out-Null
     Assert-True ($LASTEXITCODE -eq 0) "adaptive-move fixture failed config validation"
+    Wait-ConfigReload $moveReloadBaseline "adaptive-move config reload receipt"
     Wait-Condition "managed burner ready for adaptive move" {
         $entries = @((Read-Managed).processes | Where-Object { $_.key.pid -eq $burnerId })
         return $entries.Count -eq 1
@@ -797,9 +904,93 @@ profile = "memory"
     Assert-True ($LASTEXITCODE -eq 0) "final graceful stop command failed"
     Wait-ServiceState "Stopped"
     Assert-True (@((Get-Inspection $burnerId).default_cpu_set_ids).Count -eq 0) "graceful stop did not clear CPU Sets"
+    $finalRestartStartedUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     & $serviceBinary start | Out-Null
     Assert-True ($LASTEXITCODE -eq 0) "final service start command failed"
     Wait-ServiceState "Running"
+
+    Wait-Condition "schema-5 self-observability after final restart" {
+        $current = Read-Status
+        return $current -and $current.telemetry -and
+            [uint64]$current.telemetry.evaluation.completed_total -gt 0 -and
+            [uint64]$current.telemetry.mutations.placement_attempted -gt 0 -and
+            [uint64]$current.telemetry.mutations.placement_succeeded -gt 0 -and
+            $null -ne $current.telemetry.service_process
+    } 45
+    $finalStatus = Read-Status
+    Assert-True ($null -ne $finalStatus.telemetry) "status self-observability is missing"
+    Assert-True ([uint64]$finalStatus.telemetry.evaluation.completed_total -gt 0) `
+        "evaluation telemetry did not advance"
+    Assert-True ([int]$finalStatus.telemetry.evaluation.window_samples -gt 0) `
+        "evaluation telemetry window is empty"
+    Assert-True ([uint64]$finalStatus.telemetry.evaluation.rolling_max_us -gt 0) `
+        "evaluation duration telemetry is empty"
+    Assert-True ([uint64]$finalStatus.telemetry.logging.records_written -gt 0) `
+        "logging telemetry did not count records"
+    Assert-True ([uint64]$finalStatus.telemetry.logging.status_writes -gt 0) `
+        "status-write telemetry did not advance"
+    Assert-True ([uint64]$finalStatus.telemetry.logging.write_errors -eq 0) `
+        "logging telemetry reports write errors"
+    $placementMutations = $finalStatus.telemetry.mutations
+    Assert-True ([uint64]$placementMutations.placement_attempted -gt 0) `
+        "placement mutation telemetry did not advance"
+    Assert-True (
+        [uint64]$placementMutations.placement_attempted -eq
+        ([uint64]$placementMutations.placement_succeeded + [uint64]$placementMutations.placement_failed)
+    ) "placement mutation outcome counters are inconsistent"
+    Assert-True ([uint64]$placementMutations.placement_succeeded -gt 0) `
+        "placement mutation telemetry has no successful operation"
+    Assert-True ($null -ne $finalStatus.telemetry.service_process) `
+        "service process telemetry is unavailable"
+    Assert-True ([uint64]$finalStatus.telemetry.service_process.uptime_ms -gt 0) `
+        "service uptime telemetry is empty"
+    Assert-True ([uint64]$finalStatus.telemetry.service_process.cpu_time_100ns -gt 0) `
+        "service CPU telemetry is empty"
+    Assert-True ([uint64]$finalStatus.telemetry.service_process.working_set_bytes -gt 0) `
+        "service working-set telemetry is empty"
+
+    Wait-Condition "one complete 60-second Normal decision window" {
+        $complete = @(Read-ServiceLogEvents | Where-Object {
+            $_.event -eq "decision_summary" -and
+                $_.flush_reason -eq "periodic" -and
+                [uint64]$_.timestamp_ms -ge [uint64]$finalRestartStartedUnixMs -and
+                [uint64]$_.window_duration_ms -ge 60000
+        })
+        $complete.Count -gt 0
+    } 75
+
+    $logEvents = @(Read-ServiceLogEvents | Where-Object {
+        [uint64]$_.timestamp_ms -ge [uint64]$acceptanceStartedUnixMs
+    })
+    $decisionSummaries = @($logEvents | Where-Object event -eq "decision_summary")
+    Assert-True ($decisionSummaries.Count -gt 0) `
+        "normal logging emitted no periodic decision summary"
+    $periodicSummaries = @($decisionSummaries | Where-Object flush_reason -eq "periodic")
+    Assert-True ($periodicSummaries.Count -gt 0) `
+        "normal logging emitted no interval-complete decision summary"
+    foreach ($summary in $periodicSummaries) {
+        Assert-True ([uint64]$summary.window_duration_ms -ge 60000) `
+            "normal logging emitted a periodic summary before 60 seconds"
+        Assert-True ([uint64]$summary.decisions -gt 0) `
+            "normal logging emitted an empty periodic summary"
+    }
+    $acceptanceElapsedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $acceptanceStartedUnixMs
+    $maximumPeriodicSummaries = [int][Math]::Ceiling($acceptanceElapsedMs / 60000.0) + 4
+    Assert-True ($periodicSummaries.Count -le $maximumPeriodicSummaries) `
+        "normal logging emitted too many periodic summaries: $($periodicSummaries.Count)"
+    foreach ($summary in $decisionSummaries) {
+        $summaryFields = @($summary.PSObject.Properties.Name)
+        Assert-True ($summaryFields -notcontains "process" -and $summaryFields -notcontains "image") `
+            "decision summary leaked a process identity"
+    }
+    $rawDecisions = @($logEvents | Where-Object event -eq "decision")
+    Assert-True ($rawDecisions.Count -gt 0) `
+        "normal logging lost mutation-shaped decisions"
+    foreach ($rawDecision in $rawDecisions) {
+        $actionJson = $rawDecision.action | ConvertTo-Json -Compress
+        Assert-True ($actionJson -match '^\{"(Assign|Move|Clear)"') `
+            "normal logging emitted a raw no-op decision: $actionJson"
+    }
 
     [pscustomobject]@{
         result = "PASS"
@@ -818,6 +1009,13 @@ profile = "memory"
         background_stop_restore = "PASS"
         background_crash_recovery = "PASS"
         background_invalid_config_restore = "PASS"
+        normal_decision_coalescing = "PASS"
+        controller_self_observability = "PASS"
+        background_mutations_observed = [ordered]@{
+            attempted = [uint64]$backgroundMutationTelemetry.background_attempted
+            succeeded = [uint64]$backgroundMutationTelemetry.background_succeeded
+            failed = [uint64]$backgroundMutationTelemetry.background_failed
+        }
         install_directory = $InstallDirectory
         data_directory = $DataDirectory
     } | ConvertTo-Json -Depth 4

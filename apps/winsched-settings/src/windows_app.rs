@@ -18,7 +18,7 @@ use winsched::diagnostics::{
     self, DiagnosticFindingCode, DiagnosticOptions, DiagnosticReport, DiagnosticSeverity,
 };
 use winsched_config::{
-    CONFIG_SCHEMA_VERSION, ControllerConfig, ControllerMode, LoggingConfig,
+    CONFIG_SCHEMA_VERSION, ControllerConfig, ControllerMode, LoggingConfig, LoggingLevel,
     MAX_CONFIGURED_PHYSICAL_CORES, MAX_LATENCY_THRESHOLD_US, MAX_LOG_FILE_SIZE_MIB,
     MAX_MEMORY_RESIZE_COOLDOWN_MS, MAX_RESPONSIVENESS_STABILITY_SAMPLES, MAX_RETAINED_LOG_ARCHIVES,
     MAX_SYSTEM_RESERVE_PERCENT, MIN_LATENCY_THRESHOLD_US, MIN_LOG_FILE_SIZE_MIB,
@@ -903,6 +903,7 @@ impl SettingsApp {
         );
     }
 
+    #[allow(clippy::too_many_lines)] // One tab keeps the three bilingual log levels together.
     fn logging_tab(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
         ui.heading(language.text("Diagnostic logging", "Диагностический журнал"));
@@ -912,17 +913,31 @@ impl SettingsApp {
         ));
         ui.add_space(8.0);
         let logging_help = language.text(
-            "Writes detailed service events as JSONL. Disable it to stop routine disk writes; existing logs remain until removed manually or by uninstall purge.",
-            "Записывает подробные события службы в JSONL. Выключите, чтобы прекратить обычные записи на диск; существующие журналы сохраняются до ручного удаления или полной очистки при удалении программы.",
+            "Off performs no routine log writes. Normal records changes, failures, and one aggregated decision summary per minute. Trace additionally writes every per-process policy decision and can generate substantial disk I/O.",
+            "Off отключает обычные записи. Normal записывает изменения, ошибки и одну агрегированную сводку решений в минуту. Trace дополнительно записывает каждое решение по процессу и может создавать значительный дисковый I/O.",
         );
-        ui.checkbox(
-            &mut self.config.logging.enabled,
-            language.text(
-                "Enable detailed service logging",
-                "Включить подробный журнал службы",
-            ),
-        )
-        .on_hover_text(logging_help);
+        ui.label(language.text("Log detail level", "Уровень детализации журнала"))
+            .on_hover_text(logging_help);
+        ui.horizontal(|ui| {
+            ui.radio_value(
+                &mut self.config.logging.level,
+                LoggingLevel::Off,
+                language.text("Off", "Выключен"),
+            )
+            .on_hover_text(logging_help);
+            ui.radio_value(
+                &mut self.config.logging.level,
+                LoggingLevel::Normal,
+                language.text("Normal (recommended)", "Обычный (рекомендуется)"),
+            )
+            .on_hover_text(logging_help);
+            ui.radio_value(
+                &mut self.config.logging.level,
+                LoggingLevel::Trace,
+                language.text("Trace", "Трассировка"),
+            )
+            .on_hover_text(logging_help);
+        });
         ui.label(language.text(
             "Diagnostic events are written as JSON lines to:",
             "Диагностические события записываются строками JSON в:",
@@ -931,16 +946,40 @@ impl SettingsApp {
         ui.monospace(self.paths.log.display().to_string());
         ui.add_space(8.0);
 
-        if !self.config.logging.enabled {
-            ui.group(|ui| {
-                ui.label(language.text(
-                    "Detailed logging is off. Existing log and archive files are preserved, and no new diagnostic events are written.",
-                    "Подробный журнал выключен. Существующие файлы журнала и архивы сохраняются, новые диагностические события не записываются.",
-                ));
-            });
-            ui.add_space(8.0);
+        match self.config.logging.level {
+            LoggingLevel::Off => {
+                ui.group(|ui| {
+                    ui.label(language.text(
+                        "Routine logging is off. Existing log and archive files are preserved.",
+                        "Обычный журнал выключен. Существующие файлы журнала и архивы сохраняются.",
+                    ));
+                });
+                ui.add_space(8.0);
+            }
+            LoggingLevel::Normal => {
+                ui.group(|ui| {
+                    ui.label(language.text(
+                        "Normal records important events immediately and coalesces unchanged process decisions into a one-minute summary.",
+                        "Normal немедленно записывает важные события и объединяет неизменившиеся решения по процессам в минутную сводку.",
+                    ));
+                });
+                ui.add_space(8.0);
+            }
+            LoggingLevel::Trace => {
+                ui.group(|ui| {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        language.text(
+                            "Trace is intended only for short diagnostics and may rotate the log frequently.",
+                            "Trace предназначен только для короткой диагностики и может часто ротировать журнал.",
+                        ),
+                    );
+                });
+                ui.add_space(8.0);
+            }
         }
 
+        let logging_enabled = self.config.logging.level != LoggingLevel::Off;
         logging_value_u16(
             ui,
             language.text(
@@ -948,7 +987,7 @@ impl SettingsApp {
                 "Максимальный размер активного журнала (МиБ)",
             ),
             &mut self.config.logging.max_file_size_mib,
-            self.config.logging.enabled,
+            logging_enabled,
             language.text(
                 "The active log is rotated before a new diagnostic record would exceed this size.",
                 "Активный журнал ротируется до записи диагностического события, которое превысило бы этот размер.",
@@ -962,7 +1001,7 @@ impl SettingsApp {
                 "Сохраняемые циклические архивы",
             ),
             &mut self.config.logging.retained_archives,
-            self.config.logging.enabled,
+            logging_enabled,
             language.text(
                 "0 reuses the active file without archives. Otherwise winsched.log.1 is newest and the oldest retained archive is removed.",
                 "0 означает повторное использование активного файла без архивов. В остальных случаях winsched.log.1 — самый новый архив, а самый старый сохраняемый архив удаляется.",
@@ -996,6 +1035,8 @@ impl SettingsApp {
             "В течение 10 секунд измеряет планировщик, CPU, память, панель задач, Explorer, WSL и VMware. Диагностика не нажимает кнопки, не двигает указатель, не меняет фокус, не редактирует .wslconfig и не изменяет CPU Sets.",
         ));
         ui.add_space(8.0);
+        self.controller_efficiency_status(ui);
+        ui.add_space(12.0);
 
         if let Some(pending) = &self.pending_diagnostic {
             let elapsed = pending.started.elapsed().as_secs_f32();
@@ -1121,6 +1162,138 @@ impl SettingsApp {
                     )
                 ),
             ),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // One read-only panel keeps related telemetry understandable.
+    fn controller_efficiency_status(&self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.heading(language.text("Controller efficiency", "Эффективность контроллера"));
+        let Some(status) = read_status(&self.paths.status)
+            .filter(|status| status.schema_version == STATUS_SCHEMA_VERSION)
+        else {
+            ui.label(match language {
+                Language::English => format!(
+                    "Self-observability is available when a status-schema-{STATUS_SCHEMA_VERSION} service is running."
+                ),
+                Language::Russian => format!(
+                    "Самодиагностика доступна после запуска службы со схемой статуса {STATUS_SCHEMA_VERSION}."
+                ),
+            });
+            return;
+        };
+        let Some(telemetry) = status.telemetry else {
+            ui.label(language.text(
+                "The running service has not published self-observability yet.",
+                "Запущенная служба ещё не опубликовала самодиагностику.",
+            ));
+            return;
+        };
+
+        let evaluation = telemetry.evaluation;
+        ui.label(match language {
+            Language::English => format!(
+                "Evaluations: {} total, {} in the rolling window. Last/mean/p95/max: {}/{}/{}/{} us.",
+                evaluation.completed_total,
+                evaluation.window_samples,
+                evaluation.last_duration_us,
+                evaluation.rolling_mean_us,
+                evaluation.rolling_p95_us,
+                evaluation.rolling_max_us,
+            ),
+            Language::Russian => format!(
+                "Оценки: всего {}, в скользящем окне {}. Последняя/средняя/p95/максимум: {}/{}/{}/{} мкс.",
+                evaluation.completed_total,
+                evaluation.window_samples,
+                evaluation.last_duration_us,
+                evaluation.rolling_mean_us,
+                evaluation.rolling_p95_us,
+                evaluation.rolling_max_us,
+            ),
+        });
+        ui.label(match language {
+            Language::English => format!(
+                "Last pass: {} scanned, {} eligible, {} decisions, {} currently managed.",
+                evaluation.last_scanned_processes,
+                evaluation.last_eligible_processes,
+                evaluation.last_decisions,
+                status.managed_processes,
+            ),
+            Language::Russian => format!(
+                "Последний проход: просмотрено {}, подходят {}, решений {}, сейчас управляются {}.",
+                evaluation.last_scanned_processes,
+                evaluation.last_eligible_processes,
+                evaluation.last_decisions,
+                status.managed_processes,
+            ),
+        });
+
+        let logging = telemetry.logging;
+        ui.label(match language {
+            Language::English => format!(
+                "File log since service start: {} records / {} KiB, {} write errors. Status writes: {}.",
+                logging.records_written,
+                logging.bytes_written / 1024,
+                logging.write_errors,
+                logging.status_writes,
+            ),
+            Language::Russian => format!(
+                "Файловый журнал с запуска службы: {} записей / {} КиБ, ошибок записи: {}. Записей status: {}.",
+                logging.records_written,
+                logging.bytes_written / 1024,
+                logging.write_errors,
+                logging.status_writes,
+            ),
+        });
+
+        let mutations = telemetry.mutations;
+        ui.label(match language {
+            Language::English => format!(
+                "Mutations: placement {}/{}/{} and Background {}/{}/{} attempted/succeeded/failed.",
+                mutations.placement_attempted,
+                mutations.placement_succeeded,
+                mutations.placement_failed,
+                mutations.background_attempted,
+                mutations.background_succeeded,
+                mutations.background_failed,
+            ),
+            Language::Russian => format!(
+                "Изменения: размещение {}/{}/{} и Background {}/{}/{} попыток/успешно/ошибок.",
+                mutations.placement_attempted,
+                mutations.placement_succeeded,
+                mutations.placement_failed,
+                mutations.background_attempted,
+                mutations.background_succeeded,
+                mutations.background_failed,
+            ),
+        });
+
+        if let Some(process) = telemetry.service_process {
+            let one_core_bps = process
+                .cpu_time_100ns
+                .checked_div(process.uptime_ms)
+                .unwrap_or(0);
+            ui.label(match language {
+                Language::English => format!(
+                    "Service process: {}.{:02}% of one core average, {} MiB working set, uptime {} s.",
+                    one_core_bps / 100,
+                    one_core_bps % 100,
+                    process.working_set_bytes.div_ceil(1024 * 1024),
+                    process.uptime_ms / 1000,
+                ),
+                Language::Russian => format!(
+                    "Процесс службы: в среднем {}.{:02}% одного ядра, working set {} МиБ, uptime {} с.",
+                    one_core_bps / 100,
+                    one_core_bps % 100,
+                    process.working_set_bytes.div_ceil(1024 * 1024),
+                    process.uptime_ms / 1000,
+                ),
+            });
+        } else {
+            ui.label(language.text(
+                "Service process resource counters are unavailable.",
+                "Счётчики ресурсов процесса службы недоступны.",
+            ));
         }
     }
 
@@ -1316,6 +1489,7 @@ impl SettingsApp {
         );
     }
 
+    #[allow(clippy::too_many_lines)] // One panel keeps the complete live reserve state together.
     fn responsiveness_live_status(&self, ui: &mut egui::Ui) {
         let language = self.language;
         ui.heading(language.text("Live service plan", "Текущий план службы"));
@@ -1411,10 +1585,14 @@ impl SettingsApp {
                 }
             }
             None => {
-                ui.label(language.text(
-                    "Live reserve information is unavailable until a schema-4 service is running.",
-                    "Информация о резерве появится после запуска службы со схемой статуса 4.",
-                ));
+                ui.label(match language {
+                    Language::English => format!(
+                        "Live reserve information is unavailable until a status-schema-{STATUS_SCHEMA_VERSION} service is running."
+                    ),
+                    Language::Russian => format!(
+                        "Информация о резерве появится после запуска службы со схемой статуса {STATUS_SCHEMA_VERSION}."
+                    ),
+                });
             }
         }
     }
@@ -1576,10 +1754,14 @@ impl SettingsApp {
                 }
             }
             None => {
-                ui.label(language.text(
-                    "Live background-efficiency information is unavailable until a schema-4 service is running.",
-                    "Информация об эффективности фоновых задач появится после запуска службы со схемой статуса 4.",
-                ));
+                ui.label(match language {
+                    Language::English => format!(
+                        "Live background-efficiency information is unavailable until a status-schema-{STATUS_SCHEMA_VERSION} service is running."
+                    ),
+                    Language::Russian => format!(
+                        "Информация об эффективности фоновых задач появится после запуска службы со схемой статуса {STATUS_SCHEMA_VERSION}."
+                    ),
+                });
             }
         }
     }

@@ -1,0 +1,29 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "current_setup_sha256": "4c92f9ef2d4c10662bc86c042a0f9df09cc9553c3b94b738be6383325c760d3d",
+  "old_setup_sha256": "5971a182659b764e8c7d20c2fb99b8451b6f67b034d97dd6b50c456d4d00d553",
+  "upgrade": {
+    "result": "PASS",
+    "pre_upgrade_version": "0.5.0",
+    "pre_upgrade_config_schema": 4,
+    "config_byte_identical": true,
+    "background_profile_preserved": true,
+    "background_qos_enabled": false,
+    "logging_false_through_setup": "off",
+    "logging_true_hot_reload": "normal",
+    "service_running": true,
+    "installed_service_sha256": "77edceaa7af7faba00ff9590c571e012e92ce98ca94c1493f2b249dedff1af60",
+    "cleanup_completed": true,
+    "cleanup_errors": []
+  },
+  "restore": {
+    "current_setup_installed": true,
+    "original_current_config_bytes_restored": true,
+    "original_scheduling_restored": true,
+    "service_running": true,
+    "current_payload_hashes_match": true
+  },
+  "error": null,
+  "restore_error": null
+}

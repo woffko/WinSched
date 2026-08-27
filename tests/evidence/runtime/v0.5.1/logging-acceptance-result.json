@@ -1,0 +1,15 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "status_schema": 5,
+  "levels_tested": ["off", "normal", "trace"],
+  "disabled_absent_file": true,
+  "disabled_hot_reload_byte_stable": true,
+  "disabled_restart_byte_stable": true,
+  "hot_reload_same_pid": true,
+  "trace_raw_noop_decision": true,
+  "max_file_size_mib": 1,
+  "retained_archives_tested": [2, 0],
+  "circular_rotation": true,
+  "complete_jsonl": true
+}
