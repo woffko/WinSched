@@ -1,6 +1,7 @@
-# WinSched 0.6.0 development notes
+# WinSched 0.6.0 release notes
 
-WinSched 0.6.0 is under development and is not a published release.
+WinSched 0.6.0 adds an on-demand Process Monitor while preserving the accepted
+0.5.1 scheduling policy and configuration contract.
 
 ## Implemented
 
@@ -19,7 +20,7 @@ WinSched 0.6.0 is under development and is not a published release.
 - Single-instance activation for Monitor and Settings.
 - Fixed self-exclusion for every WinSched executable.
 
-## Current validation
+## Validation
 
 | Gate | Result |
 |---|---:|
@@ -50,8 +51,8 @@ the frozen payload against every packaged file before invoking Inno Setup.
 
 The accepted Setup passed the focused failure-receipt rollback test and the
 complete provision, install, preserve, purge, GUI, reinstall, and recovery
-lifecycle. See
-[0.6.0 installer lifecycle evidence](../tests/evidence/2026-08-28-v0.6.0-installer-lifecycle.md)
+lifecycle. See the
+[0.6.0 installer lifecycle evidence](https://github.com/woffko/WinSched/blob/v0.6.0/tests/evidence/2026-08-28-v0.6.0-installer-lifecycle.md)
 and the privacy-minimized JSON receipts under
 `tests/evidence/runtime/v0.6.0/`.
 
@@ -62,4 +63,4 @@ LocalSystem, Scheduling enabled in Auto mode, and no status error. The operator
 confirmed tray left-click activation, single-instance focus, the preserved
 right-click menu, required columns, exact-rule draft handoff without Apply, and
 polling resumption after minimize/restore. See
-[physical Process Monitor smoke](../tests/evidence/2026-08-28-v0.6.0-physical-smoke.md).
+[physical Process Monitor smoke](https://github.com/woffko/WinSched/blob/v0.6.0/tests/evidence/2026-08-28-v0.6.0-physical-smoke.md).
