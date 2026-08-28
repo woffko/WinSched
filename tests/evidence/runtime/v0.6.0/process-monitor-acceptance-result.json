@@ -1,0 +1,33 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified installed-payload VM receipt",
+  "ui": {
+    "active_snapshots": 2,
+    "minimized_settled_snapshots": 2,
+    "minimized_snapshots": 2,
+    "resumed_snapshots": 3,
+    "polling_paused_while_minimized": true,
+    "polling_resumed_when_active": true,
+    "second_instance_focused_existing_window": true,
+    "settings_button": true,
+    "required_columns": [
+      "CPU Sets",
+      "LLC",
+      "EcoQoS",
+      "Memory",
+      "Rule / scope"
+    ]
+  },
+  "tray": {
+    "left_click_opened_or_focused_monitor": true,
+    "second_left_click_kept_one_monitor": true,
+    "right_click_menu_preserved": true
+  },
+  "rule_handoff": {
+    "first_draft_prefilled": true,
+    "second_draft_forwarded_to_existing_instance": true,
+    "single_settings_instance": true,
+    "config_unchanged_without_apply": true,
+    "config_sha256": "20d98408bef9cf98a4efa5455d786f997e8e47053b5fca2d209a984f8a9fb813"
+  }
+}

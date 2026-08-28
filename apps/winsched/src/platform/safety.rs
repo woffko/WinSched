@@ -31,7 +31,10 @@ pub(super) fn is_fixed_system_process(pid: u32, image_name: &str) -> bool {
         "vmwp.exe",
         "wininit.exe",
         "winlogon.exe",
+        "winsched.exe",
+        "winsched-monitor.exe",
         "winsched-service.exe",
+        "winsched-settings.exe",
         "winsched-tray.exe",
         "wslhost.exe",
         "wslservice.exe",
@@ -60,6 +63,10 @@ mod tests {
             "vmmemWSL",
             "wslhost.exe",
             "wslservice.exe",
+            "winsched.exe",
+            "winsched-monitor.exe",
+            "winsched-service.exe",
+            "winsched-settings.exe",
             "winsched-tray.exe",
         ] {
             assert!(

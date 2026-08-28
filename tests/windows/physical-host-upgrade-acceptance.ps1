@@ -11,11 +11,13 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ExpectedServiceSha256,
     [Parameter(Mandatory = $true)]
+    [string]$ExpectedMonitorSha256,
+    [Parameter(Mandatory = $true)]
     [string]$ExpectedTraySha256,
     [Parameter(Mandatory = $true)]
     [string]$ExpectedSettingsSha256,
     [string]$ExpectedPreviousVersion = "0.5.0",
-    [string]$ExpectedVersion = "0.5.1",
+    [string]$ExpectedVersion = "0.6.0",
     [ValidateSet("off", "normal", "trace")]
     [string]$ExpectedLoggingLevel = "off",
     [string]$InstallDirectory = "$env:ProgramFiles\WinSched",
@@ -70,6 +72,7 @@ $setupLog = Join-Path $WorkDirectory "host-upgrade-setup.log"
 $configPath = Join-Path $DataDirectory "winsched.toml"
 $cliPath = Join-Path $InstallDirectory "winsched.exe"
 $servicePath = Join-Path $InstallDirectory "winsched-service.exe"
+$monitorPath = Join-Path $InstallDirectory "winsched-monitor.exe"
 $trayPath = Join-Path $InstallDirectory "winsched-tray.exe"
 $settingsPath = Join-Path $InstallDirectory "winsched-settings.exe"
 $originalBytes = $null
@@ -111,7 +114,7 @@ try {
         -Wait `
         -PassThru
     Assert-True ($process.ExitCode -eq 0) "Setup returned $($process.ExitCode)"
-    Wait-Condition "WinSched 0.5.1 service status" {
+    Wait-Condition "WinSched current service status" {
         try {
             $status = Get-Content -LiteralPath (Join-Path $DataDirectory "status.json") -Raw |
                 ConvertFrom-Json
@@ -132,6 +135,7 @@ try {
     foreach ($entry in @(
         [pscustomobject]@{ Path = $cliPath; Hash = $ExpectedWinSchedSha256 },
         [pscustomobject]@{ Path = $servicePath; Hash = $ExpectedServiceSha256 },
+        [pscustomobject]@{ Path = $monitorPath; Hash = $ExpectedMonitorSha256 },
         [pscustomobject]@{ Path = $trayPath; Hash = $ExpectedTraySha256 },
         [pscustomobject]@{ Path = $settingsPath; Hash = $ExpectedSettingsSha256 }
     )) {

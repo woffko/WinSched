@@ -1,0 +1,28 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "previous_setup_sha256": "4c92f9ef2d4c10662bc86c042a0f9df09cc9553c3b94b738be6383325c760d3d",
+  "current_setup_sha256": "5d4c25bc3bdf11100bf129aa2ad52b7553194ad5239a0974cce2b0d0646fef2a",
+  "previous_version": "0.5.1",
+  "installed_version": "0.6.0",
+  "config_sha256_before": "0a90a364bd7de298f9c3d718bde6e217ebff5fb25a82b42f91ad41520925a546",
+  "config_sha256_after": "0a90a364bd7de298f9c3d718bde6e217ebff5fb25a82b42f91ad41520925a546",
+  "config_byte_identical": true,
+  "scheduling_preserved": true,
+  "mode_preserved": true,
+  "logging_level_preserved": true,
+  "five_payload_hashes_match": true,
+  "monitor_installed": true,
+  "shortcuts_preserved_or_created": true,
+  "service_running": true,
+  "status_schema": 5,
+  "original_state_restored": true,
+  "restore": {
+    "current_setup_installed": true,
+    "config_bytes_restored": true,
+    "scheduling_restored": true,
+    "service_running": true,
+    "payload_hashes_match": true
+  },
+  "restore_error": null
+}

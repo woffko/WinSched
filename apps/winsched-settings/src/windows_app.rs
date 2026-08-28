@@ -1,6 +1,7 @@
 #![allow(unsafe_code)] // Narrow Win32 UI and locale calls are documented at each use.
 
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
@@ -11,7 +12,12 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Color32, RichText};
+use serde::{Deserialize, Serialize};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Globalization::GetUserDefaultLocaleName;
+use windows::Win32::System::Threading::{
+    CreateEventW, EVENT_MODIFY_STATE, INFINITE, OpenEventW, SetEvent, WaitForSingleObject,
+};
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
 use windows::core::PCWSTR;
 use winsched::diagnostics::{
@@ -33,9 +39,20 @@ use winsched_settings::{
 };
 
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SETTINGS_REQUEST_SCHEMA_VERSION: u32 = 1;
+const SETTINGS_REQUEST_MAX_AGE_MS: u64 = 60_000;
+
 pub fn run() -> Result<(), Box<dyn Error>> {
+    let launch_request = parse_launch_request()?;
     let paths = SettingsPaths::discover();
-    let _instance = InstanceLock::acquire(&paths.instance_lock)?;
+    let request_path = settings_request_path();
+    let Some(instance) = InstanceLock::try_acquire(&paths.instance_lock)? else {
+        if let Some(request) = launch_request {
+            write_activation_request(&request_path, &request)?;
+        }
+        signal_existing_instance()?;
+        return Ok(());
+    };
     let config = load_config(&paths.config)?;
     let language = detect_language();
     let title = language.text("WinSched Settings", "Настройки WinSched");
@@ -51,9 +68,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         native_options,
         Box::new(move |context| {
             context.egui_ctx.set_zoom_factor(1.05);
-            Ok(Box::new(SettingsApp::new(paths, config, language)))
+            let activation =
+                start_activation_listener(context.egui_ctx.clone()).map_err(|error| {
+                    Box::<dyn Error + Send + Sync>::from(std::io::Error::other(error))
+                })?;
+            Ok(Box::new(SettingsApp::new(
+                paths,
+                config,
+                language,
+                launch_request,
+                request_path,
+                activation,
+            )))
         }),
     )?;
+    drop(instance);
     Ok(())
 }
 
@@ -75,6 +104,157 @@ pub fn show_startup_error(message: &str) {
             MB_OK | MB_ICONERROR,
         );
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsActivationRequest {
+    schema_version: u32,
+    rule_image: String,
+    created_at_unix_ms: u64,
+}
+
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        // SAFETY: This wrapper owns the event handle exactly once.
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+fn parse_launch_request() -> Result<Option<SettingsActivationRequest>, std::io::Error> {
+    let mut arguments = std::env::args_os().skip(1);
+    let Some(argument) = arguments.next() else {
+        return Ok(None);
+    };
+    if argument != "--rule-image" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported Settings command-line argument",
+        ));
+    }
+    let image = arguments.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--rule-image requires one executable image name",
+        )
+    })?;
+    if arguments.next().is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unexpected arguments after --rule-image",
+        ));
+    }
+    Ok(Some(SettingsActivationRequest {
+        schema_version: SETTINGS_REQUEST_SCHEMA_VERSION,
+        rule_image: validate_rule_image(image)?,
+        created_at_unix_ms: unix_time_ms(),
+    }))
+}
+
+fn validate_rule_image(image: OsString) -> Result<String, std::io::Error> {
+    let image = image.into_string().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rule image name is not valid Unicode",
+        )
+    })?;
+    let image = image.trim();
+    if image.is_empty() || image.contains(['/', '\\']) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rule image must be one executable file name without a path",
+        ));
+    }
+    Ok(image.to_owned())
+}
+
+fn settings_request_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("WinSched")
+        .join("settings-activation.json")
+}
+
+fn write_activation_request(
+    path: &Path,
+    request: &SettingsActivationRequest,
+) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let encoded = serde_json::to_vec(request).map_err(std::io::Error::other)?;
+    winsched::platform::atomic_replace_file(path, &encoded)
+}
+
+fn take_activation_request(path: &Path) -> Option<SettingsActivationRequest> {
+    let request = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<SettingsActivationRequest>(&bytes).ok());
+    let _ = fs::remove_file(path);
+    request.filter(|request| {
+        request.schema_version == SETTINGS_REQUEST_SCHEMA_VERSION
+            && request.created_at_unix_ms <= unix_time_ms()
+            && unix_time_ms().saturating_sub(request.created_at_unix_ms)
+                <= SETTINGS_REQUEST_MAX_AGE_MS
+            && !request.rule_image.is_empty()
+            && !request.rule_image.contains(['/', '\\'])
+    })
+}
+
+fn settings_activation_event_name() -> Result<Vec<u16>, String> {
+    let session = winsched::platform::current_session_id().map_err(|error| error.to_string())?;
+    Ok(format!("Local\\WinSchedSettingsActivate-{session}")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect())
+}
+
+fn signal_existing_instance() -> Result<(), String> {
+    let name = settings_activation_event_name()?;
+    for _ in 0..20 {
+        // SAFETY: The event name is NUL-terminated and access is limited to signalling.
+        if let Ok(event) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) } {
+            // SAFETY: event is a valid opened event handle.
+            let result = unsafe { SetEvent(event) };
+            // SAFETY: This invocation owns the opened handle.
+            unsafe {
+                let _ = CloseHandle(event);
+            }
+            return result.map_err(|error| error.to_string());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err("existing Settings instance did not publish its activation event".to_owned())
+}
+
+fn start_activation_listener(context: egui::Context) -> Result<mpsc::Receiver<()>, String> {
+    let name = settings_activation_event_name()?;
+    // SAFETY: The event name is NUL-terminated; auto-reset coalesces activation requests.
+    let event = unsafe { CreateEventW(None, false, false, PCWSTR(name.as_ptr())) }
+        .map_err(|error| error.to_string())?;
+    let event_value = event.0 as usize;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("winsched-settings-activation".to_owned())
+        .spawn(move || {
+            let event = OwnedHandle(HANDLE(event_value as *mut core::ffi::c_void));
+            loop {
+                // SAFETY: The owned event remains valid for the complete wait.
+                unsafe {
+                    WaitForSingleObject(event.0, INFINITE);
+                }
+                if sender.send(()).is_err() {
+                    break;
+                }
+                context.request_repaint();
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(receiver)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,26 +297,22 @@ struct InstanceLock {
 }
 
 impl InstanceLock {
-    fn acquire(path: &Path) -> std::io::Result<Self> {
+    fn try_acquire(path: &Path) -> std::io::Result<Option<Self>> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
+        match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .share_mode(0)
             .open(path)
-            .map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "another WinSched Settings window is already open, or the lock is unavailable: {error}"
-                    ),
-                )
-            })?;
-        Ok(Self { _file: file })
+        {
+            Ok(file) => Ok(Some(Self { _file: file })),
+            Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -255,13 +431,23 @@ struct SettingsApp {
     pending_diagnostic: Option<PendingDiagnostic>,
     diagnostic_report: Option<DiagnosticReport>,
     diagnostic_error: Option<String>,
+    activation_request_path: PathBuf,
+    activation_receiver: mpsc::Receiver<()>,
+    rule_focus_image: Option<String>,
     language: Language,
 }
 
 impl SettingsApp {
-    fn new(paths: SettingsPaths, config: ControllerConfig, language: Language) -> Self {
+    fn new(
+        paths: SettingsPaths,
+        config: ControllerConfig,
+        language: Language,
+        launch_request: Option<SettingsActivationRequest>,
+        activation_request_path: PathBuf,
+        activation_receiver: mpsc::Receiver<()>,
+    ) -> Self {
         let tray_autostart = tray_autostart_enabled(&paths.tray_startup_shortcut);
-        Self {
+        let mut app = Self {
             paths,
             persisted: config.clone(),
             config,
@@ -284,8 +470,61 @@ impl SettingsApp {
             pending_diagnostic: None,
             diagnostic_report: None,
             diagnostic_error: None,
+            activation_request_path,
+            activation_receiver,
+            rule_focus_image: None,
             language,
+        };
+        if let Some(request) = launch_request {
+            app.open_rule_request(&request);
         }
+        app
+    }
+
+    fn open_rule_request(&mut self, request: &SettingsActivationRequest) {
+        let language = self.language;
+        self.tab = SettingsTab::Rules;
+        let existing = !ensure_exact_rule_draft(&mut self.config, &request.rule_image);
+        self.rule_focus_image = Some(request.rule_image.clone());
+        self.set_banner(
+            BannerKind::Information,
+            if existing {
+                format!(
+                    "{}: {}",
+                    language.text("Existing exact rule opened", "Открыто существующее правило"),
+                    request.rule_image
+                )
+            } else {
+                format!(
+                    "{}: {}. {}",
+                    language.text(
+                        "Exact-rule draft created",
+                        "Создан черновик точного правила"
+                    ),
+                    request.rule_image,
+                    language.text(
+                        "Review it and choose Apply to save.",
+                        "Проверьте его и нажмите «Применить» для сохранения."
+                    )
+                )
+            },
+        );
+    }
+
+    fn poll_activation(&mut self, context: &egui::Context) {
+        let mut activated = false;
+        while self.activation_receiver.try_recv().is_ok() {
+            activated = true;
+        }
+        if !activated {
+            return;
+        }
+        if let Some(request) = take_activation_request(&self.activation_request_path) {
+            self.open_rule_request(&request);
+        }
+        context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        context.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
     fn is_dirty(&self) -> bool {
@@ -1804,11 +2043,20 @@ impl SettingsApp {
         }
 
         let mut remove = None;
+        let requested_image = self.rule_focus_image.clone();
+        let mut requested_rule_shown = false;
         for (index, rule) in self.config.rules.iter_mut().enumerate() {
-            if process_rule_ui(ui, index, rule, language) {
+            let requested = requested_image
+                .as_deref()
+                .is_some_and(|image| rule.image.eq_ignore_ascii_case(image));
+            if process_rule_ui(ui, index, rule, language, requested) {
                 remove = Some(index);
             }
+            requested_rule_shown |= requested;
             ui.add_space(8.0);
+        }
+        if requested_rule_shown {
+            self.rule_focus_image = None;
         }
         if let Some(index) = remove {
             self.config.rules.remove(index);
@@ -2029,6 +2277,24 @@ impl SettingsApp {
     }
 }
 
+fn ensure_exact_rule_draft(config: &mut ControllerConfig, image: &str) -> bool {
+    if config
+        .rules
+        .iter()
+        .any(|rule| rule.image.eq_ignore_ascii_case(image))
+    {
+        return false;
+    }
+    config.rules.push(ProcessRule {
+        image: image.to_owned(),
+        mode: RuleMode::Auto,
+        profile: WorkloadProfile::Balanced,
+        group: None,
+        llc: None,
+    });
+    true
+}
+
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2039,6 +2305,7 @@ fn unix_time_ms() -> u64 {
 
 impl eframe::App for SettingsApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_activation(context);
         if context.input(|input| input.viewport().close_requested())
             && self.is_dirty()
             && !self.allow_close
@@ -2198,9 +2465,10 @@ fn process_rule_ui(
     index: usize,
     rule: &mut ProcessRule,
     language: Language,
+    scroll_to: bool,
 ) -> bool {
     let mut remove = false;
-    ui.group(|ui| {
+    let group = ui.group(|ui| {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!(
@@ -2226,6 +2494,9 @@ fn process_rule_ui(
             ));
         }
     });
+    if scroll_to {
+        group.response.scroll_to_me(Some(egui::Align::Center));
+    }
     remove
 }
 
@@ -2822,4 +3093,29 @@ fn logging_value_u8(
         .on_hover_text(explanation);
     });
     ui.add_space(6.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_rule_handoff_creates_one_unsaved_case_insensitive_draft() {
+        let mut config = ControllerConfig::default();
+        assert!(ensure_exact_rule_draft(&mut config, "worker.exe"));
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].image, "worker.exe");
+        assert_eq!(config.rules[0].mode, RuleMode::Auto);
+        assert_eq!(config.rules[0].profile, WorkloadProfile::Balanced);
+        assert!(!ensure_exact_rule_draft(&mut config, "WORKER.EXE"));
+        assert_eq!(config.rules.len(), 1);
+    }
+
+    #[test]
+    fn rule_handoff_rejects_paths_and_empty_names() {
+        assert!(validate_rule_image(OsString::from("game.exe")).is_ok());
+        assert!(validate_rule_image(OsString::from("C:\\game.exe")).is_err());
+        assert!(validate_rule_image(OsString::from("../game.exe")).is_err());
+        assert!(validate_rule_image(OsString::from("  ")).is_err());
+    }
 }

@@ -4,7 +4,7 @@ param(
     [string]$OutputDirectory,
     [string]$InstallDirectory = "$env:ProgramFiles\WinSched",
     [string]$DataDirectory = "$env:ProgramData\WinSched",
-    [string]$ExpectedVersion = "0.5.1"
+    [string]$ExpectedVersion = "0.6.0"
 )
 
 $ErrorActionPreference = "Stop"

@@ -35,7 +35,7 @@ function Invoke-TrayStage(
         -InteractiveUser $InteractiveUser `
         -InstallDirectory $InstallDirectory `
         -DataDirectory $DataDirectory `
-        -ExpectedVersion "0.5.1"
+        -ExpectedVersion "0.6.0"
     Assert-Stage $Name
 }
 
@@ -99,7 +99,7 @@ Invoke-SettingsStage `
 
 $result = [ordered]@{
     result = "PASS"
-    version = "0.5.1"
+    version = "0.6.0"
     tray_controls = "PASS"
     tray_about_and_status = "PASS"
     settings_controls_and_tooltips = "PASS"

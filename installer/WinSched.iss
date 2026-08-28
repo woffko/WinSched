@@ -1,6 +1,6 @@
 #define AppName "WinSched"
 #ifndef AppVersion
-  #define AppVersion "0.5.1"
+  #define AppVersion "0.6.0"
 #endif
 
 #ifndef PayloadDir
@@ -48,7 +48,7 @@ AllowUNCPath=no
 AllowNetworkDrive=no
 AllowRootDirectory=no
 CloseApplications=yes
-CloseApplicationsFilter=winsched-tray.exe,winsched-settings.exe
+CloseApplicationsFilter=winsched-tray.exe,winsched-monitor.exe,winsched-settings.exe
 RestartApplications=no
 UsePreviousAppDir=no
 UsePreviousTasks=yes
@@ -97,6 +97,7 @@ Type: files; Name: "{group}\WinSched Configuration.lnk"
 [Files]
 Source: "{#PayloadDir}\winsched.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\winsched-service.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PayloadDir}\winsched-monitor.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\winsched-tray.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\winsched-settings.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PayloadDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -110,6 +111,7 @@ Root: HKLM64; Subkey: "Software\WinSched"; ValueType: string; ValueName: "Instal
 
 [Icons]
 Name: "{group}\WinSched"; Filename: "{app}\winsched-tray.exe"; WorkingDir: "{app}"
+Name: "{group}\WinSched Process Monitor"; Filename: "{app}\winsched-monitor.exe"; WorkingDir: "{app}"
 Name: "{group}\WinSched Settings"; Filename: "{app}\winsched-settings.exe"; WorkingDir: "{app}"
 Name: "{group}\WinSched Configuration (Advanced)"; Filename: "{sys}\notepad.exe"; Parameters: """{commonappdata}\WinSched\winsched.toml"""
 Name: "{group}\WinSched Logs"; Filename: "{sys}\notepad.exe"; Parameters: """{commonappdata}\WinSched\winsched.log"""
@@ -206,6 +208,10 @@ begin
   ExecQuiet(
     ExpandConstant('{sys}\taskkill.exe'),
     '/F /IM winsched-settings.exe',
+    ResultCode);
+  ExecQuiet(
+    ExpandConstant('{sys}\taskkill.exe'),
+    '/F /IM winsched-monitor.exe',
     ResultCode);
   Sleep(1000);
 end;
@@ -464,6 +470,7 @@ begin
   DeleteFile(ExpandConstant('{commonappdata}\WinSched\winsched.exe'));
   DeleteFile(ExpandConstant('{commonappdata}\WinSched\winsched-service.exe'));
   DeleteFile(ExpandConstant('{commonappdata}\WinSched\winsched-tray.exe'));
+  DeleteFile(ExpandConstant('{commonappdata}\WinSched\winsched-monitor.exe'));
   DeleteFile(ExpandConstant('{commonappdata}\WinSched\winsched-settings.exe'));
   DeleteFile(ExpandConstant('{commonappdata}\WinSched\install.ps1'));
   DeleteFile(ExpandConstant('{commonappdata}\WinSched\uninstall.ps1'));

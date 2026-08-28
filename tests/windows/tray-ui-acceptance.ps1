@@ -21,6 +21,8 @@ public static class WinSchedMouse {
     public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
     public const uint LEFT_DOWN = 0x0002;
     public const uint LEFT_UP = 0x0004;
+    public const uint RIGHT_DOWN = 0x0008;
+    public const uint RIGHT_UP = 0x0010;
 }
 "@
 
@@ -151,10 +153,30 @@ function Find-TrayIcon {
     return $null
 }
 
+function Invoke-RightClickAutomationElement($Element) {
+    try {
+        $point = $Element.GetClickablePoint()
+    } catch [System.Windows.Automation.NoClickablePointException] {
+        $rectangle = $Element.Current.BoundingRectangle
+        Assert-True ($rectangle.Width -gt 0 -and $rectangle.Height -gt 0) `
+            "tray icon has neither a clickable point nor a usable rectangle"
+        $point = [System.Windows.Point]::new(
+            $rectangle.Left + ($rectangle.Width / 2),
+            $rectangle.Top + ($rectangle.Height / 2)
+        )
+    }
+    [System.Windows.Forms.Cursor]::Position = [System.Drawing.Point]::new(
+        [int][Math]::Round($point.X),
+        [int][Math]::Round($point.Y)
+    )
+    [WinSchedMouse]::mouse_event([WinSchedMouse]::RIGHT_DOWN, 0, 0, 0, [UIntPtr]::Zero)
+    [WinSchedMouse]::mouse_event([WinSchedMouse]::RIGHT_UP, 0, 0, 0, [UIntPtr]::Zero)
+}
+
 function Open-TrayMenu {
     $icon = Find-TrayIcon
     Assert-True ($null -ne $icon) "WinSched notification-area icon was not found through UI Automation"
-    Invoke-AutomationElement $icon
+    Invoke-RightClickAutomationElement $icon
     Start-Sleep -Milliseconds 400
 }
 
@@ -184,9 +206,11 @@ $resultPath = Join-Path $OutputDirectory "tray-ui-result.json"
 $screenshotPath = Join-Path $OutputDirectory "tray-menu.png"
 $iconPath = Join-Path $OutputDirectory "embedded-icon.png"
 $trayPath = Join-Path $InstallDirectory "winsched-tray.exe"
+$monitorPath = Join-Path $InstallDirectory "winsched-monitor.exe"
 
 try {
     Assert-True (Test-Path -LiteralPath $trayPath -PathType Leaf) "installed tray executable missing"
+    Assert-True (Test-Path -LiteralPath $monitorPath -PathType Leaf) "installed monitor executable missing"
     Wait-Condition "WinSched service running" {
         (Get-Service -Name "WinSched" -ErrorAction SilentlyContinue).Status -eq "Running"
     }
@@ -241,6 +265,34 @@ try {
     Assert-True ((Get-Item -LiteralPath $iconPath).Length -gt 100) "extracted tray icon is empty"
 
     Wait-Condition "WinSched tray icon discoverable" { $null -ne (Find-TrayIcon) }
+    $icon = Find-TrayIcon
+    Invoke-AutomationElement $icon
+    Wait-Condition "left tray click opened Process Monitor" {
+        @(
+            Get-Process -Name "winsched-monitor" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -eq $monitorPath -and
+                    $_.SessionId -eq [Diagnostics.Process]::GetCurrentProcess().SessionId }
+        ).Count -eq 1 -and
+            (Test-AutomationNameLike "*WinSched Process Monitor*")
+    } 20
+    $monitor = @(
+        Get-Process -Name "winsched-monitor" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $monitorPath -and
+                $_.SessionId -eq [Diagnostics.Process]::GetCurrentProcess().SessionId }
+    )[0]
+    Invoke-AutomationElement (Find-TrayIcon)
+    Start-Sleep -Seconds 1
+    $monitorProcesses = @(
+        Get-Process -Name "winsched-monitor" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $monitorPath -and
+                $_.SessionId -eq [Diagnostics.Process]::GetCurrentProcess().SessionId }
+    )
+    Assert-True ($monitorProcesses.Count -eq 1) `
+        "second left tray click created another Process Monitor instance"
+    Assert-True ($monitorProcesses[0].Id -eq $monitor.Id) `
+        "second left tray click replaced the existing Process Monitor"
+    $monitor | Stop-Process -Force -ErrorAction SilentlyContinue
+
     Open-TrayMenu
     $expected = @(
         "Disable Scheduling",

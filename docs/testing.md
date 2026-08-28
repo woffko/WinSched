@@ -1,9 +1,63 @@
 # Testing and release validation
 
-This document describes the validation used for WinSched 0.5.0. It separates
-source-level checks, Windows VM acceptance, physical Threadripper acceptance,
-and artifact verification so that a passing narrow test is not presented as
-proof of a broader behavior.
+This document describes current WinSched 0.6.0 validation and retained earlier
+release evidence. It separates source-level checks, Windows VM acceptance,
+physical Threadripper acceptance, and artifact verification so that a passing
+narrow test is not presented as proof of a broader behavior.
+
+## 0.6.0 Process Monitor development validation
+
+Version 0.6.0 adds an on-demand, non-elevated process window while preserving
+the 0.5.1 scheduling policy. Process polling is a focused-window-only activity;
+normal tray and service operation do not start the monitor or write monitoring
+receipts.
+
+| Area | Environment | Current result |
+|---|---|---:|
+| Native workspace tests and Clippy | WSL/Linux | PASS |
+| Windows-target Clippy | WSL/xwin | PASS |
+| PowerShell parser sweep | Windows PowerShell 5.1 | PASS, 37 scripts |
+| Windows-native execution | Windows VM | PASS, 180 tests in 12 executables |
+| Detailed Windows process snapshot | Windows VM | PASS, 72/72 RAM and QoS rows |
+| Active/minimized/resumed polling | Windows VM | PASS, 2 → 2 → 3 snapshots |
+| Monitor single-instance activation | Windows VM | PASS |
+| Tray left click / right-click menu | Windows VM | PASS |
+| Exact-rule handoff to one Settings instance | Windows VM | PASS |
+| Configuration without Apply | Windows VM | PASS, byte-identical |
+| Frozen ZIP and GUI Setup build | WSL + Windows VM | PASS, ZIP `b9392cf1...6802`; Setup `5d4c25bc...ef2a` |
+| Installed 0.5.1 to 0.6.0 upgrade | Windows VM | PASS on Setup `5d4c25bc...ef2a`, byte-identical config and five payload hashes |
+| Repeat-install ACL allowlist regression | Windows VM | PASS, Monitor accepted; injected provision failure exited 9 and rolled back |
+| GUI Setup and lifecycle | Windows VM | PASS, nine stages and final state restoration |
+| Physical Process Monitor smoke | Threadripper host | PENDING |
+
+The first `67dea2da...bd7f` Setup candidate failed safely before uninstall or
+purge because the application ACL allowlist omitted the newly installed
+`winsched-monitor.exe`. Inno Setup returned its standard
+Preparing-to-Install failure code 7, and the lifecycle harness restored the
+original configuration, Scheduling state, and Running service. The corrected
+frozen payload adds Monitor to both allowlists and adds a build-time check that
+evaluates the actual packaged `secure-data.ps1` against every payload file.
+
+The focused repeat-install test on the accepted `5d4c25bc...ef2a` Setup then
+returned the intended custom exit code 9 for the injected invalid configuration,
+published the ERROR receipt, and restored the prior configuration, service
+binary, and SCM fields. The complete lifecycle subsequently passed provision
+rollback, failure receipt, silent preserve, silent purge, clean GUI install,
+GUI preserve uninstall, preserved-data reinstall, GUI purge uninstall, and
+final silent install. The original configuration SHA-256
+`20d98408bef9cf98a4efa5455d786f997e8e47053b5fca2d209a984f8a9fb813`,
+Scheduling state, and Running service were restored with no cleanup errors.
+
+The accepted Setup was also tested independently as an in-place upgrade over
+the accepted 0.5.1 Setup `4c92f9ef...60d3`. The test preserved a marked schema-5
+configuration byte-for-byte, Scheduling, configured mode, and logging level;
+installed Monitor and its shortcut; matched all five installed executable
+hashes to the frozen payload; and restored the original 0.6.0 VM state after
+the comparison.
+
+Detailed evidence and example receipts are in
+[`tests/evidence/2026-08-28-v0.6.0-installer-lifecycle.md`](../tests/evidence/2026-08-28-v0.6.0-installer-lifecycle.md)
+and `tests/evidence/runtime/v0.6.0/`.
 
 ## 0.5.1 development validation
 

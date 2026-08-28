@@ -109,6 +109,7 @@ function Get-PayloadHashes([string]$Directory) {
     foreach ($name in @(
         "winsched.exe",
         "winsched-service.exe",
+        "winsched-monitor.exe",
         "winsched-tray.exe",
         "winsched-settings.exe",
         "README.md"
@@ -251,9 +252,9 @@ profile = "background"
     $newCli = Join-Path $installDirectory 'winsched.exe'
     $normalizedAfterUpgrade = (& $newCli config-check $configPath --json | Out-String) |
         ConvertFrom-Json
-    Assert-True ($LASTEXITCODE -eq 0) "0.5.1 rejected the preserved schema-4 configuration"
+    Assert-True ($LASTEXITCODE -eq 0) "current candidate rejected the preserved schema-4 configuration"
     Assert-True ([int]$normalizedAfterUpgrade.schema_version -eq 5) `
-        "0.5.1 did not normalize the schema-4 configuration to schema 5 in memory"
+        "current candidate did not normalize the schema-4 configuration to schema 5 in memory"
     Assert-True (-not [bool]$normalizedAfterUpgrade.background_efficiency.enabled) `
         "schema-4 upgrade unexpectedly enabled background efficiency"
     Assert-True ([string]$normalizedAfterUpgrade.logging.level -eq 'off') `
@@ -262,7 +263,7 @@ profile = "background"
         $_.image -eq $backgroundImage
     })
     Assert-True ($migratedBackgroundRule.Count -eq 1) `
-        "0.5.1 did not preserve exactly one schema-4 Background rule"
+        "current candidate did not preserve exactly one schema-4 Background rule"
     Assert-True ($migratedBackgroundRule[0].profile -eq 'background') `
         "schema-4 Background rule was incorrectly normalized to another profile"
 
@@ -311,7 +312,7 @@ profile = "background"
     } 30
     $normalizedLegacyTrue = (& $newCli config-check $configPath --json | Out-String) |
         ConvertFrom-Json
-    Assert-True ($LASTEXITCODE -eq 0) "0.5.1 rejected schema-4 logging.enabled=true"
+    Assert-True ($LASTEXITCODE -eq 0) "current candidate rejected schema-4 logging.enabled=true"
     Assert-True ([string]$normalizedLegacyTrue.logging.level -eq "normal") `
         "schema-4 logging.enabled=true did not migrate to normal"
 

@@ -318,6 +318,7 @@ try {
     foreach ($binaryName in @(
         "winsched.exe",
         "winsched-service.exe",
+        "winsched-monitor.exe",
         "winsched-tray.exe",
         "winsched-settings.exe"
     )) {
@@ -332,8 +333,8 @@ try {
         } else {
             [Diagnostics.FileVersionInfo]::GetVersionInfo($binaryPath).ProductVersion.Trim()
         }
-        Assert-True ($version -eq "0.5.1") `
-            "full acceptance requires installed 0.5.1, found $version in $binaryName"
+        Assert-True ($version -eq "0.6.0") `
+            "full acceptance requires installed 0.6.0, found $version in $binaryName"
     }
     Wait-ServiceState "Running"
 
@@ -341,6 +342,7 @@ try {
     Assert-True ($service.StartMode -eq "Auto") "service start mode is not Automatic"
     Assert-True ($service.StartName -eq "LocalSystem") "service account is not LocalSystem"
     Assert-True (Test-Path -LiteralPath $serviceBinary -PathType Leaf) "service binary missing"
+    Assert-True (Test-Path -LiteralPath (Join-Path $InstallDirectory "winsched-monitor.exe")) "monitor binary missing"
     Assert-True (Test-Path -LiteralPath (Join-Path $InstallDirectory "winsched-tray.exe")) "tray binary missing"
     Assert-True (Test-Path -LiteralPath (Join-Path $InstallDirectory "winsched-settings.exe")) "settings binary missing"
     Assert-True (Test-Path -LiteralPath $cliBinary) "CLI binary missing"
@@ -355,6 +357,7 @@ try {
     Assert-True (Test-Path -LiteralPath $startup -PathType Leaf) "tray Startup shortcut missing"
     $startMenu = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\WinSched"
     Assert-True (Test-Path -LiteralPath (Join-Path $startMenu "WinSched.lnk")) "tray Start Menu shortcut missing"
+    Assert-True (Test-Path -LiteralPath (Join-Path $startMenu "WinSched Process Monitor.lnk")) "monitor Start Menu shortcut missing"
     Assert-True (Test-Path -LiteralPath (Join-Path $startMenu "WinSched Settings.lnk")) "settings Start Menu shortcut missing"
     Assert-True (Test-Path -LiteralPath (Join-Path $startMenu "Uninstall WinSched.lnk")) "uninstall shortcut missing"
 

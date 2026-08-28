@@ -1,0 +1,18 @@
+{
+  "result": "FAIL",
+  "evidence_format": "privacy-minimized projection of verified VM receipt and Setup log",
+  "setup_sha256": "67dea2dab237110ea52908ffb3adac2d2871efd88fa2404800ca64d510b2bd7f",
+  "passed_stages": [
+    "provision rollback"
+  ],
+  "failed_stage": "Setup error receipt",
+  "setup_exit_code": 7,
+  "expected_setup_exit_code": 9,
+  "uninstall_or_purge_started": false,
+  "original_config_sha256": "20d98408bef9cf98a4efa5455d786f997e8e47053b5fca2d209a984f8a9fb813",
+  "original_config_restored": true,
+  "original_scheduling_restored": true,
+  "service_running": true,
+  "cleanup_errors": [],
+  "recovery_backup_retained": false
+}

@@ -238,6 +238,14 @@ pub struct ObservedProcess {
     pub exclusion: Option<ExclusionReason>,
 }
 
+/// Additional read-only fields collected only for an active process-monitor window.
+#[derive(Debug, Clone, Serialize)]
+pub struct MonitoredProcess {
+    pub process: ObservedProcess,
+    pub working_set_bytes: Option<u64>,
+    pub efficiency: Option<ProcessEfficiencyState>,
+}
+
 impl ObservedProcess {
     #[must_use]
     pub fn policy_observation(
@@ -635,6 +643,23 @@ pub fn observe_processes(topology: &Topology) -> Result<Vec<ObservedProcess>, Pl
 
 #[cfg(not(windows))]
 pub fn observe_processes(_topology: &Topology) -> Result<Vec<ObservedProcess>, PlatformError> {
+    Err(PlatformError::UnsupportedPlatform)
+}
+
+/// Enumerates processes and adds bounded resource/QoS details for an on-demand monitor refresh.
+#[cfg(windows)]
+pub fn monitor_processes(
+    topology: &Topology,
+    session_id: Option<u32>,
+) -> Result<Vec<MonitoredProcess>, PlatformError> {
+    windows::monitor_processes(topology, session_id).map_err(Into::into)
+}
+
+#[cfg(not(windows))]
+pub fn monitor_processes(
+    _topology: &Topology,
+    _session_id: Option<u32>,
+) -> Result<Vec<MonitoredProcess>, PlatformError> {
     Err(PlatformError::UnsupportedPlatform)
 }
 

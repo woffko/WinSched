@@ -92,9 +92,9 @@ use winsched_core::{
 
 use super::{
     EfficiencyMutationReport, InteractiveActivity, InteractiveStateWake, LaunchReport,
-    MutationReport, ObservedProcess, ProcessEcoQosState, ProcessEfficiencyOwnership,
-    ProcessEfficiencySnapshot, ProcessEfficiencyState, ProcessMemoryPriority, ProcessResourceUsage,
-    ProcessSnapshot, SystemPressureSample, safety,
+    MonitoredProcess, MutationReport, ObservedProcess, ProcessEcoQosState,
+    ProcessEfficiencyOwnership, ProcessEfficiencySnapshot, ProcessEfficiencyState,
+    ProcessMemoryPriority, ProcessResourceUsage, ProcessSnapshot, SystemPressureSample, safety,
 };
 
 const RESUME_THREAD_FAILED: u32 = u32::MAX;
@@ -996,6 +996,53 @@ pub fn observe_processes(topology: &Topology) -> Result<Vec<ObservedProcess>, Pl
     }
     processes.sort_by_key(|process| process.key);
     Ok(processes)
+}
+
+pub fn monitor_processes(
+    topology: &Topology,
+    session_id: Option<u32>,
+) -> Result<Vec<MonitoredProcess>, PlatformError> {
+    let mut processes = observe_processes(topology)?;
+    if let Some(session_id) = session_id {
+        processes.retain(|process| process.session_id == Some(session_id));
+    }
+    Ok(processes
+        .into_iter()
+        .map(|process| {
+            let (working_set_bytes, efficiency) = monitor_process_details(process.key);
+            MonitoredProcess {
+                process,
+                working_set_bytes,
+                efficiency,
+            }
+        })
+        .collect())
+}
+
+fn monitor_process_details(key: ProcessKey) -> (Option<u64>, Option<ProcessEfficiencyState>) {
+    let Ok(process) = open_process(key.pid, false) else {
+        return (None, None);
+    };
+    if verify_process_identity(process.raw(), key).is_err() {
+        return (None, None);
+    }
+    (
+        query_process_working_set(process.raw()),
+        query_process_efficiency(process.raw()).ok(),
+    )
+}
+
+fn query_process_working_set(process: HANDLE) -> Option<u64> {
+    let mut memory = PROCESS_MEMORY_COUNTERS {
+        cb: u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>()).ok()?,
+        ..PROCESS_MEMORY_COUNTERS::default()
+    };
+    // SAFETY: memory is a writable structure of the advertised size and the handle is used only
+    // for a read-only accounting query. Inaccessible processes are represented as unavailable.
+    unsafe { K32GetProcessMemoryInfo(process, &raw mut memory, memory.cb) }
+        .ok()
+        .ok()?;
+    Some(u64::try_from(memory.WorkingSetSize).unwrap_or(u64::MAX))
 }
 
 fn observe_process_entry(topology: &Topology, entry: &PROCESSENTRY32W) -> ObservedProcess {
@@ -2368,8 +2415,8 @@ mod tests {
         let parent = delayed_child_parent();
         let parent_pid = parent.0.id();
         let topology = system_topology().unwrap();
-        let baseline_deadline = Instant::now() + Duration::from_secs(2);
-        let baseline_child = loop {
+        let baseline_deadline = Instant::now() + Duration::from_secs(4);
+        let (baseline_child, baseline) = loop {
             let candidate = observe_processes(&topology)
                 .unwrap()
                 .into_iter()
@@ -2377,8 +2424,10 @@ mod tests {
                     process.parent_pid == parent_pid
                         && process.image_name.eq_ignore_ascii_case("ping.exe")
                 });
-            if let Some(candidate) = candidate {
-                break candidate;
+            if let Some(candidate) = candidate
+                && let Ok(state) = query_process_efficiency_key(candidate.key)
+            {
+                break (candidate, state);
             }
             assert!(
                 Instant::now() < baseline_deadline,
@@ -2386,7 +2435,6 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         };
-        let baseline = query_process_efficiency_key(baseline_child.key).unwrap();
         let before = BTreeSet::from([baseline_child.key]);
         let parent_process = open_efficiency_process(parent_pid, false).unwrap();
         let parent_key = ProcessKey {
@@ -2408,7 +2456,7 @@ mod tests {
         apply_process_efficiency_key(parent_key, original, requested, ownership).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(6);
-        let inherited_child = loop {
+        let (inherited_child, inherited) = loop {
             let candidate = observe_processes(&topology)
                 .unwrap()
                 .into_iter()
@@ -2417,13 +2465,14 @@ mod tests {
                         && process.image_name.eq_ignore_ascii_case("ping.exe")
                         && !before.contains(&process.key)
                 });
-            if let Some(candidate) = candidate {
-                break candidate;
+            if let Some(candidate) = candidate
+                && let Ok(state) = query_process_efficiency_key(candidate.key)
+            {
+                break (candidate, state);
             }
             assert!(Instant::now() < deadline, "delayed child did not start");
             std::thread::sleep(Duration::from_millis(100));
         };
-        let inherited = query_process_efficiency_key(inherited_child.key).unwrap();
         eprintln!(
             "child efficiency after parent apply: parent_original={original:?}, parent_requested={requested:?}, child={inherited:?}"
         );

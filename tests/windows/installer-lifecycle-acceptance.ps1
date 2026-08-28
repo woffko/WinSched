@@ -213,8 +213,8 @@ try {
 
     Write-Host "Lifecycle stage: final silent install"
     Install-Silent
-    Assert-True ((& $cliBinary --version | Out-String).Trim() -eq "winsched 0.5.1") `
-        "final installed CLI version is not 0.5.1"
+    Assert-True ((& $cliBinary --version | Out-String).Trim() -eq "winsched 0.6.0") `
+        "final installed CLI version is not 0.6.0"
     $script:stages["final silent install"] = "PASS"
 } catch {
     $mainError = $_.Exception.ToString()

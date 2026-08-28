@@ -1,0 +1,21 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "setup_sha256": "5d4c25bc3bdf11100bf129aa2ad52b7553194ad5239a0974cce2b0d0646fef2a",
+  "setup_exit_code": 9,
+  "receipt": "ERROR",
+  "configuration_restored": true,
+  "service_restored": true,
+  "service_sha256": "381f334ab9336059cdfc95b30231fda419e957241a38cbf1c87348eee762f862",
+  "restored_fields": [
+    "path_name",
+    "start_mode",
+    "start_name",
+    "display_name",
+    "state",
+    "description",
+    "failure_actions",
+    "failure_flag",
+    "sddl"
+  ]
+}

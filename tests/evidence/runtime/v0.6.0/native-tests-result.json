@@ -1,0 +1,23 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipts",
+  "interactive_session": 1,
+  "executables": 12,
+  "total_passed": 180,
+  "total_failed": 0,
+  "monitor_tests": 3,
+  "settings_handoff_tests": 2,
+  "initial_matrix": {
+    "passed": 179,
+    "failed": 1,
+    "failure": "short-lived characterization child exited between enumeration and identity query"
+  },
+  "targeted_current_binary_rerun": {
+    "passed": 20,
+    "failed": 0,
+    "pid_reuse_and_exit_race_handled": true
+  },
+  "service_was_running": true,
+  "service_state_restored": true,
+  "cleanup_errors": []
+}

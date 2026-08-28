@@ -164,7 +164,7 @@ try {
         Assert-True (Test-Path -LiteralPath $path -PathType Leaf) `
             "V050_UPGRADE_INPUT_MISSING"
     }
-    Assert-True ((Get-ConsoleVersion) -eq "winsched 0.5.1") `
+    Assert-True ((Get-ConsoleVersion) -eq "winsched 0.6.0") `
         "V050_UPGRADE_CURRENT_PREREQUISITE"
     $initialStatus = Read-Status
     Assert-True ($null -ne $initialStatus -and $null -eq $initialStatus.last_error) `
@@ -209,10 +209,10 @@ try {
 } finally {
     if ($null -ne $originalConfigBytes) {
         try {
-            if ((Get-ConsoleVersion) -ne "winsched 0.5.1") {
+            if ((Get-ConsoleVersion) -ne "winsched 0.6.0") {
                 Invoke-Setup $CurrentSetupPath
             }
-            $restore.current_setup_installed = (Get-ConsoleVersion) -eq "winsched 0.5.1"
+            $restore.current_setup_installed = (Get-ConsoleVersion) -eq "winsched 0.6.0"
             $beforeRestore = Read-Status
             $beforePid = if ($null -ne $beforeRestore) { [int]$beforeRestore.service_pid } else { 0 }
             $beforeSequence = if ($null -ne $beforeRestore) {
@@ -248,6 +248,7 @@ try {
             foreach ($name in @(
                 "winsched.exe",
                 "winsched-service.exe",
+                "winsched-monitor.exe",
                 "winsched-tray.exe",
                 "winsched-settings.exe"
             )) {

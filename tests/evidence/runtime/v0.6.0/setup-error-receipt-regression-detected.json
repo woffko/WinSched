@@ -1,0 +1,13 @@
+{
+  "result": "FAIL",
+  "evidence_format": "privacy-minimized projection of verified VM receipt and Setup log",
+  "setup_sha256": "67dea2dab237110ea52908ffb3adac2d2871efd88fa2404800ca64d510b2bd7f",
+  "stage": "PrepareToInstall",
+  "setup_exit_code": 7,
+  "expected_setup_exit_code": 9,
+  "message_category": "application directory hardening rejected a packaged executable",
+  "root_cause": "winsched-monitor.exe was absent from the secure-data application allowlist",
+  "configuration_restored": true,
+  "scheduling_restored": true,
+  "service_restored": true
+}

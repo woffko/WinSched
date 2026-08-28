@@ -26,6 +26,7 @@ mod app {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -34,7 +35,9 @@ mod app {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use tray_icon::menu::{AboutMetadataBuilder, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-    use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+    use tray_icon::{
+        Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    };
     use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -69,6 +72,7 @@ mod app {
     #[derive(Debug, Clone)]
     enum UserEvent {
         Menu(MenuEvent),
+        Tray(TrayIconEvent),
     }
 
     #[derive(Debug, Clone)]
@@ -78,6 +82,7 @@ mod app {
         log: PathBuf,
         status: PathBuf,
         settings: PathBuf,
+        monitor: PathBuf,
     }
 
     struct InstanceLock {
@@ -98,6 +103,7 @@ mod app {
                 log: install_dir.join(LOG_FILE_NAME),
                 status: install_dir.join(STATUS_FILE_NAME),
                 settings: binary_dir.join("winsched-settings.exe"),
+                monitor: binary_dir.join("winsched-monitor.exe"),
                 install_dir,
             }
         }
@@ -300,7 +306,7 @@ mod app {
             let tray = TrayIconBuilder::new()
                 .with_id("winsched-tray")
                 .with_menu(Box::new(menu))
-                .with_menu_on_left_click(true)
+                .with_menu_on_left_click(false)
                 .with_menu_on_right_click(true)
                 .with_tooltip("WinSched: loading service status")
                 .with_icon(icon)
@@ -427,6 +433,25 @@ mod app {
             }
             self.refresh();
         }
+
+        fn handle_tray(&mut self, event: &TrayIconEvent) {
+            let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            else {
+                return;
+            };
+            match launch_monitor(&self.paths.monitor) {
+                Ok(()) => self.action_error = None,
+                Err(error) => {
+                    record_error(&error);
+                    self.action_error = Some(error);
+                }
+            }
+            self.refresh();
+        }
     }
 
     impl ApplicationHandler<UserEvent> for TrayApplication {
@@ -447,6 +472,7 @@ mod app {
         fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
             match event {
                 UserEvent::Menu(event) => self.handle_menu(event_loop, &event),
+                UserEvent::Tray(event) => self.handle_tray(&event),
             }
         }
 
@@ -488,6 +514,10 @@ mod app {
         let proxy = event_loop.create_proxy();
         MenuEvent::set_event_handler(Some(move |event| {
             let _ = proxy.send_event(UserEvent::Menu(event));
+        }));
+        let tray_proxy = event_loop.create_proxy();
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            let _ = tray_proxy.send_event(UserEvent::Tray(event));
         }));
         let mut application = TrayApplication::new(paths);
         event_loop.run_app(&mut application)?;
@@ -653,6 +683,20 @@ mod app {
             ));
         }
         shell_execute("runas", path, path.parent())
+    }
+
+    fn launch_monitor(path: &Path) -> Result<(), String> {
+        if !path.is_file() {
+            return Err(format!(
+                "Process Monitor application is missing: {}",
+                path.display()
+            ));
+        }
+        Command::new(path)
+            .current_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("cannot start Process Monitor: {error}"))
     }
 
     fn shell_execute(

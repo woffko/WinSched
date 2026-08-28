@@ -1,0 +1,10 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of verified VM receipt",
+  "processes": 72,
+  "working_set_available": 72,
+  "efficiency_available": 72,
+  "cpu_set_assignments": 1,
+  "service": "Running",
+  "status_schema": 5
+}

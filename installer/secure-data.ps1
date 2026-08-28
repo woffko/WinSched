@@ -183,9 +183,9 @@ function Get-TreeEntries([string]$Root) {
 
 function Test-AllowedFileName([string]$Name) {
     if ($Purpose -eq "Application") {
-        return $Name -match '^(winsched(-service|-tray|-settings)?\.exe|README\.md|LICENSE|unins[0-9]+\.(exe|dat|msg)|\.winsched-atomic-[0-9]+-[0-9]+\.tmp)$'
+        return $Name -match '^(winsched(-service|-monitor|-tray|-settings)?\.exe|README\.md|LICENSE|unins[0-9]+\.(exe|dat|msg)|\.winsched-atomic-[0-9]+-[0-9]+\.tmp)$'
     }
-    return $Name -match '^(winsched(-service|-tray|-settings)?\.exe|winsched\.toml|winsched-settings\.lock|winsched(-emergency)?\.log(\.(10|[1-9]))?|status\.json|provision-result\.txt|setup-provenance\.txt|(managed-state|background-state|runtime-state)\.(json|bak)|install\.ps1|uninstall\.ps1|secure-data\.ps1|Install WinSched\.cmd|Uninstall WinSched\.cmd|README\.md|LICENSE|SHA256SUMS|\.winsched-atomic-[0-9]+-[0-9]+\.tmp)$'
+    return $Name -match '^(winsched(-service|-monitor|-tray|-settings)?\.exe|winsched\.toml|winsched-settings\.lock|winsched(-emergency)?\.log(\.(10|[1-9]))?|status\.json|provision-result\.txt|setup-provenance\.txt|(managed-state|background-state|runtime-state)\.(json|bak)|install\.ps1|uninstall\.ps1|secure-data\.ps1|Install WinSched\.cmd|Uninstall WinSched\.cmd|README\.md|LICENSE|SHA256SUMS|\.winsched-atomic-[0-9]+-[0-9]+\.tmp)$'
 }
 
 function Test-StaleAtomicFile([string]$Path) {

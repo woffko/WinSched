@@ -22,13 +22,17 @@ User-Mode Scheduling is not used because it is not supported on Windows 11.
   the current mode, service state, managed-process count, last activity, and
   last error. An MTA worker publishes authenticated foreground, visible-window,
   and active-audio veto signals to the service without periodic disk writes.
+- `winsched-monitor.exe` is a non-elevated, on-demand process window. It samples
+  process CPU, memory, priority, CPU Sets, LLC, EcoQoS, memory priority, and
+  effective rule state only while its window is focused and visible.
 - `winsched-settings.exe` is the administrative graphical settings editor. It
   validates every field before atomically replacing the configuration and then
   reports whether the running service accepted the reload. Its Diagnostics page
   runs a bounded passive responsiveness probe in a background worker.
 - `winsched.exe` is the inspection, passive-diagnostics, and manual-control CLI.
 
-The tray menu contains:
+A normal left click on the tray icon opens or focuses Process Monitor. A right
+click opens the tray menu, which contains:
 
 - `Enable Scheduling` / `Disable Scheduling`
 - `Start Service` / `Stop Service`
@@ -56,13 +60,13 @@ it cannot select a process for mutation.
 
 ## Install
 
-WinSched 0.5.1 requires 64-bit Windows 11 22H2 or newer (build 22621+). This
+WinSched 0.6.0 requires 64-bit Windows 11 22H2 or newer (build 22621+). This
 minimum keeps EcoQoS state queries on the supported Windows API baseline used
 by the ownership journal.
 
 The recommended package is `WinSched-<version>-Setup-x64.exe`. Copy it to a
 local Windows drive and run it normally. The wizard requests UAC, installs the
-four executables under `C:\Program Files\WinSched`, stores configuration and
+five executables under `C:\Program Files\WinSched`, stores configuration and
 runtime data under `C:\ProgramData\WinSched`, registers and starts the automatic
 LocalSystem service, creates Start Menu shortcuts, and enables tray autostart by
 default. A desktop shortcut is optional.
@@ -264,6 +268,29 @@ partially updated TOML file. UAC is required because the configuration controls
 a LocalSystem service. `Open Configuration (Advanced)` remains available for
 inspection and manual expert editing.
 
+## Process Monitor
+
+Process Monitor is read-only and runs without elevation. Its one-second process
+snapshot is scheduled only while the window is focused, visible, and not
+minimized or occluded. Losing focus pauses new snapshots; at most the already
+in-flight bounded snapshot may finish. Returning to the window refreshes it
+immediately.
+
+The table can be filtered by image name or PID and shows image, PID, session,
+one-core CPU usage over the latest interval, working set, thread count, Windows
+priority class, CPU Set IDs, LLC domain, EcoQoS, memory priority, effective
+rule/scope, and whether a CPU Set assignment is owned by WinSched or external.
+The default view contains the current interactive session, including processes
+that are visible but safety-excluded from control. Other sessions and system
+processes appear only when explicitly requested.
+
+Right-clicking an eligible process offers `Create exact rule...`; an existing
+exact rule offers `Edit exact rule...`. This launches elevated Settings on the
+Rules page with an unsaved `auto`/`balanced` draft containing only the exact
+executable image name. It never changes the configuration until Apply is
+pressed, and the UI warns that the rule applies to every process with that
+image name.
+
 ## Passive diagnostics
 
 `winsched diagnose` measures the current user session without generating input,
@@ -366,7 +393,7 @@ RC_PATH=/usr/lib/llvm-18/bin/llvm-rc cargo xwin build --workspace --release \
 
 `scripts/build-release.sh` runs formatting, native tests, native and Windows
 Clippy, RustSec audit, release build, and the tray PE import gate. It embeds the
-multi-size CPU icon, stages the four portable executables and verified GUI
+multi-size CPU icon, stages the five portable executables and verified GUI
 installer helper, produces SHA-256 files, and writes a versioned ZIP under
 `dist/`.
 
@@ -386,34 +413,27 @@ machine; a WSL cross-build alone is not release evidence.
 ## Testing and evidence
 
 WinSched uses separate source, Windows VM, and physical Threadripper gates. The
-0.5.1 development branch adds schema-5 normal/trace logging and anonymous
-self-observability. Native tests and both native/Windows-target Clippy gates
-must pass before its Windows VM logging, UI, upgrade, and quiet-I/O matrix. A
-physical passive-click ABBA experiment then determines whether broad CPU Set
-scheduling helps this host; no benefit is inferred from healthy one-sided
-latency measurements or from the invalidated manual-marker run.
-See [0.5.1 efficiency and observability design](docs/efficiency-observability-v0.5.1.md).
+0.6.0 development branch adds Process Monitor without changing the accepted
+0.5.1 scheduling policy. Native tests and native/Windows-target Clippy gates
+precede the exact Windows VM executable, UI, upgrade, and installer lifecycle
+matrix. A passing two-vCPU VM test does not establish physical Threadripper
+performance or complete the separate physical Process Monitor smoke gate.
 
-The released
-final 0.5.0 source, native-Windows, service, tray, Settings, installer, upgrade,
-uninstall, crash-recovery, logging, and quiet-I/O gates passed on the designated
-Windows 11 VM. The previously accepted physical Threadripper topology and
-contention measurements remain a scheduling baseline; they were not repeated
-for the opt-in Background Efficiency feature.
-
-The 0.5.0 summary is:
+The current 0.6.0 summary is:
 
 | Gate | Result |
 |---|---:|
-| Rust workspace tests | 104 PASS |
+| Rust workspace tests | PASS |
 | Native and Windows-target Clippy | PASS |
-| RustSec audit | PASS, 383 dependencies |
-| Windows-native matrix | 152 PASS |
-| Service/runtime and crash recovery | PASS |
-| Tray, Settings, tooltips, and Diagnostics UI | PASS |
-| Setup 0.4.0 to 0.5.0 upgrade and clean install | PASS |
-| GUI and silent preserve/purge uninstall | PASS |
-| Quiet I/O | PASS, 7 status writes in 75 seconds; logs byte-stable |
+| RustSec audit | PASS, 384 dependencies |
+| PowerShell 5.1 parser sweep | PASS, 37 scripts |
+| Windows-native matrix | 180 PASS in 12 executables |
+| Process snapshot and focused-only polling | PASS |
+| Tray, Monitor, Settings, and exact-rule handoff | PASS |
+| Setup 0.5.1 to 0.6.0 upgrade | PASS on exact final Setup, configuration byte-identical |
+| GUI and silent preserve/purge lifecycle | PASS, nine stages and final restoration |
+| Frozen artifacts | ZIP `b9392cf1...6802`; Setup `5d4c25bc...ef2a` |
+| Physical Process Monitor smoke | PENDING |
 | Earlier Threadripper topology/apply/rollback | PASS, retained baseline |
 | Earlier Threadripper p99 / throughput gate | 83.27% lower p99; 15.10% higher throughput |
 

@@ -5,6 +5,7 @@ members = [
   "crates/winsched-core",
   "apps/winsched",
   "apps/winsched-service",
+  "apps/winsched-monitor",
   "apps/winsched-settings",
   "apps/winsched-tray",
   "xtask",
@@ -12,7 +13,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"

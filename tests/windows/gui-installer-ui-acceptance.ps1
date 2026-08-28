@@ -264,6 +264,7 @@ try {
     $service = Get-CimInstance Win32_Service -Filter "Name='WinSched'"
     $config = Get-Content "C:\ProgramData\WinSched\winsched.toml" -Raw
     $settingsPath = "C:\Program Files\WinSched\winsched-settings.exe"
+    $monitorPath = "C:\Program Files\WinSched\winsched-monitor.exe"
     $settingsShortcut = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\WinSched\WinSched Settings.lnk"
     Assert-True ($service.PathName -match "Program Files\\WinSched\\winsched-service.exe") `
         "Service does not run from Program Files"
@@ -273,8 +274,13 @@ try {
     }
     Assert-True (Test-Path -LiteralPath $settingsPath -PathType Leaf) `
         "Settings application is missing"
+    Assert-True (Test-Path -LiteralPath $monitorPath -PathType Leaf) `
+        "Process Monitor application is missing"
     Assert-True (Test-Path -LiteralPath $settingsShortcut -PathType Leaf) `
         "Settings Start Menu shortcut is missing"
+    Assert-True (Test-Path -LiteralPath `
+        "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\WinSched\WinSched Process Monitor.lnk" `
+        -PathType Leaf) "Process Monitor Start Menu shortcut is missing"
     Assert-True (Test-Path "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\WinSched Tray.lnk") `
         "Startup shortcut is missing"
     Assert-True (-not (Test-Path "C:\Users\Public\Desktop\WinSched.lnk")) `
@@ -294,6 +300,7 @@ try {
         installed_sha256 = [ordered]@{
             winsched = (Get-FileHash "C:\Program Files\WinSched\winsched.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
             service = (Get-FileHash "C:\Program Files\WinSched\winsched-service.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+            monitor = (Get-FileHash $monitorPath -Algorithm SHA256).Hash.ToLowerInvariant()
             tray = (Get-FileHash "C:\Program Files\WinSched\winsched-tray.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
             settings = (Get-FileHash $settingsPath -Algorithm SHA256).Hash.ToLowerInvariant()
             readme = (Get-FileHash "C:\Program Files\WinSched\README.md" -Algorithm SHA256).Hash.ToLowerInvariant()

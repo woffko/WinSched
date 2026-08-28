@@ -27,15 +27,18 @@ if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $ProjectRoot "dist\gui-installer"
 }
 
-$payloadFiles = @(
+$applicationPayloadFiles = @(
     "winsched.exe",
     "winsched-service.exe",
+    "winsched-monitor.exe",
     "winsched-tray.exe",
     "winsched-settings.exe",
-    "winsched.toml",
-    "secure-data.ps1",
     "README.md",
     "LICENSE"
+)
+$payloadFiles = $applicationPayloadFiles + @(
+    "winsched.toml",
+    "secure-data.ps1"
 )
 $required = @(
     $ISCC,
@@ -54,6 +57,47 @@ $required = @(
 foreach ($path in $required) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Required GUI installer input is missing: $path"
+    }
+}
+
+# Verify the allowlist embedded in the frozen payload, not merely the source
+# copy. This catches a new executable being packaged without permitting a
+# subsequent Setup run to harden an existing installation containing it.
+$secureDataPath = Join-Path $PayloadDirectory "secure-data.ps1"
+$parseTokens = $null
+$parseErrors = $null
+$secureDataAst = [Management.Automation.Language.Parser]::ParseFile(
+    $secureDataPath,
+    [ref]$parseTokens,
+    [ref]$parseErrors
+)
+if ($parseErrors.Count -ne 0) {
+    throw "Frozen secure-data.ps1 has PowerShell parser errors"
+}
+$allowlistFunction = $secureDataAst.Find(
+    {
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq "Test-AllowedFileName"
+    },
+    $true
+)
+if ($null -eq $allowlistFunction) {
+    throw "Frozen secure-data.ps1 is missing Test-AllowedFileName"
+}
+$allowlistProbe = [scriptblock]::Create(
+    '$Purpose = [string]$args[0]' + [Environment]::NewLine +
+    $allowlistFunction.Extent.Text + [Environment]::NewLine +
+    'Test-AllowedFileName ([string]$args[1])'
+)
+foreach ($fileName in $applicationPayloadFiles) {
+    if (-not (& $allowlistProbe "Application" $fileName)) {
+        throw "Frozen Application allowlist rejects packaged file: $fileName"
+    }
+}
+foreach ($fileName in $payloadFiles) {
+    if (-not (& $allowlistProbe "Data" $fileName)) {
+        throw "Frozen Data allowlist rejects portable payload file: $fileName"
     }
 }
 

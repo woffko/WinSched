@@ -38,6 +38,7 @@ mkdir -p "$stage_dir"
 target_dir="$project_root/target/x86_64-pc-windows-msvc/release"
 cp "$target_dir/winsched.exe" "$stage_dir/"
 cp "$target_dir/winsched-service.exe" "$stage_dir/"
+cp "$target_dir/winsched-monitor.exe" "$stage_dir/"
 cp "$target_dir/winsched-tray.exe" "$stage_dir/"
 cp "$target_dir/winsched-settings.exe" "$stage_dir/"
 cp "$project_root/config/winsched.default.toml" "$stage_dir/winsched.toml"
@@ -47,7 +48,7 @@ cp "$project_root/LICENSE" "$stage_dir/LICENSE"
 
 (
     cd "$stage_dir"
-    sha256sum winsched.exe winsched-service.exe winsched-tray.exe \
+    sha256sum winsched.exe winsched-service.exe winsched-monitor.exe winsched-tray.exe \
         winsched-settings.exe winsched.toml secure-data.ps1 README.md LICENSE > SHA256SUMS
 )
 
