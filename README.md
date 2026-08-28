@@ -433,7 +433,7 @@ The current 0.6.0 summary is:
 | Setup 0.5.1 to 0.6.0 upgrade | PASS on exact final Setup, configuration byte-identical |
 | GUI and silent preserve/purge lifecycle | PASS, nine stages and final restoration |
 | Frozen artifacts | ZIP `b9392cf1...6802`; Setup `5d4c25bc...ef2a` |
-| Physical Process Monitor smoke | PENDING |
+| Physical Process Monitor smoke | PASS on exact Setup, byte-identical config and operator-confirmed UI |
 | Earlier Threadripper topology/apply/rollback | PASS, retained baseline |
 | Earlier Threadripper p99 / throughput gate | 83.27% lower p99; 15.10% higher throughput |
 

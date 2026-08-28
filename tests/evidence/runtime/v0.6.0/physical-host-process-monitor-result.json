@@ -1,0 +1,45 @@
+{
+  "result": "PASS",
+  "evidence_format": "privacy-minimized projection of read-only host checks and operator-confirmed UI smoke",
+  "setup_sha256": "5d4c25bc3bdf11100bf129aa2ad52b7553194ad5239a0974cce2b0d0646fef2a",
+  "previous_version": "0.5.1",
+  "installed_version": "0.6.0",
+  "config_sha256_before": "cbe33a966d8e0138d429210749a809511d7fa6135f09bf3d0efd05982c05518a",
+  "config_sha256_after": "cbe33a966d8e0138d429210749a809511d7fa6135f09bf3d0efd05982c05518a",
+  "config_byte_identical": true,
+  "service": {
+    "state": "Running",
+    "start_mode": "Auto",
+    "account": "LocalSystem",
+    "program_files_path": true
+  },
+  "status": {
+    "schema": 5,
+    "scheduling_enabled": true,
+    "configured_mode": "auto",
+    "logging_level": "off",
+    "last_error": null
+  },
+  "installed_sha256": {
+    "winsched.exe": "d20232a799333148cd3801f556c922da566d3f4efafc9f30f159f087524a3cf2",
+    "winsched-service.exe": "381f334ab9336059cdfc95b30231fda419e957241a38cbf1c87348eee762f862",
+    "winsched-monitor.exe": "33203831323d76902176c2e59bef47bf28cb9ede764698309a9078e7e702c0a7",
+    "winsched-tray.exe": "80c0fb341cb95403a8ce3f8357777c88b9b1fdf1d93e6b853f311783f0ac461b",
+    "winsched-settings.exe": "d25680ec9092bed830d218f32f15ad1488c63df54ed0eac6c88236dd358b52fb"
+  },
+  "shortcuts": {
+    "tray_startup": true,
+    "process_monitor": true,
+    "settings": true
+  },
+  "operator_confirmed": {
+    "tray_left_click_opened_monitor": true,
+    "second_left_click_focused_single_monitor": true,
+    "tray_right_click_menu_preserved": true,
+    "status_header_and_required_columns_visible": true,
+    "exact_rule_draft_opened_settings_without_apply": true,
+    "polling_resumed_after_minimize_restore": true
+  },
+  "automated_input_used": false,
+  "monitor_closed_after_smoke": true
+}

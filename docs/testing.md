@@ -28,7 +28,7 @@ receipts.
 | Installed 0.5.1 to 0.6.0 upgrade | Windows VM | PASS on Setup `5d4c25bc...ef2a`, byte-identical config and five payload hashes |
 | Repeat-install ACL allowlist regression | Windows VM | PASS, Monitor accepted; injected provision failure exited 9 and rolled back |
 | GUI Setup and lifecycle | Windows VM | PASS, nine stages and final state restoration |
-| Physical Process Monitor smoke | Threadripper host | PENDING |
+| Physical Process Monitor smoke | Threadripper host | PASS on exact Setup, byte-identical config and operator-confirmed UI |
 
 The first `67dea2da...bd7f` Setup candidate failed safely before uninstall or
 purge because the application ACL allowlist omitted the newly installed
@@ -58,6 +58,14 @@ the comparison.
 Detailed evidence and example receipts are in
 [`tests/evidence/2026-08-28-v0.6.0-installer-lifecycle.md`](../tests/evidence/2026-08-28-v0.6.0-installer-lifecycle.md)
 and `tests/evidence/runtime/v0.6.0/`.
+
+The same exact Setup passed the final physical-host gate. The 0.5.1 TOML hash
+was unchanged after upgrade, all five installed executable hashes matched the
+frozen payload, SCM remained Running/Automatic/LocalSystem, and the operator
+confirmed the left-click, single-instance, right-click menu, required-column,
+rule-draft-without-Apply, and minimize/restore interactions. No automated input
+was used. See
+[`tests/evidence/2026-08-28-v0.6.0-physical-smoke.md`](../tests/evidence/2026-08-28-v0.6.0-physical-smoke.md).
 
 ## 0.5.1 development validation
 

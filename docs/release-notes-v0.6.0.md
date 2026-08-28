@@ -39,7 +39,7 @@ WinSched 0.6.0 is under development and is not a published release.
 | Installed 0.5.1 → 0.6.0 upgrade | PASS on exact final Setup, byte-identical config and five payload hashes |
 | Repeat-install security allowlist | PASS, Monitor accepted and injected provision failure returned exit 9 with full rollback |
 | Installer/package lifecycle | PASS, nine stages with original config, Scheduling, and Running service restored |
-| Physical-host smoke | PENDING |
+| Physical-host smoke | PASS on exact Setup, byte-identical config, five payload hashes, operator-confirmed Monitor UI |
 
 The first Setup candidate exposed a repeat-install regression before the
 destructive lifecycle began: the application ACL allowlist did not include the
@@ -54,3 +54,12 @@ lifecycle. See
 [0.6.0 installer lifecycle evidence](../tests/evidence/2026-08-28-v0.6.0-installer-lifecycle.md)
 and the privacy-minimized JSON receipts under
 `tests/evidence/runtime/v0.6.0/`.
+
+The exact accepted Setup was then installed over 0.5.1 on the physical
+Threadripper host. Read-only verification found the prior TOML byte-identical,
+all five installed executable hashes exact, the service Running/Automatic as
+LocalSystem, Scheduling enabled in Auto mode, and no status error. The operator
+confirmed tray left-click activation, single-instance focus, the preserved
+right-click menu, required columns, exact-rule draft handoff without Apply, and
+polling resumption after minimize/restore. See
+[physical Process Monitor smoke](../tests/evidence/2026-08-28-v0.6.0-physical-smoke.md).
